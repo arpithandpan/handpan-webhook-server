@@ -99,11 +99,22 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
       }
 
       console.log('Payment saved:', newId, '₹' + payment.amount / 100);
+      // Save notification
+await supabase.from('notifications').insert({
+  type: 'payment',
+  message: `💰 New payment: ₹${payment.amount / 100} from ${payment.customer_name || payment.notes?.name || 'Unknown'} (${newId})`,
+  read: false
+});
     }
 
     if (event.event === 'payment.failed') {
       const payment = event.payload.payment.entity;
       console.log('Payment failed:', payment.id, '₹' + payment.amount / 100);
+      await supabase.from('notifications').insert({
+  type: 'warning',
+  message: `⚠️ Payment failed: ₹${payment.amount / 100} — ID ${payment.id}`,
+  read: false
+});
       // Log failed payment but don't save to payments table
     }
 
