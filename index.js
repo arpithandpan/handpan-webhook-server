@@ -16,14 +16,28 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
 
+// ── HELPERS ──
+
+async function generateId(table, prefix) {
+  const { data } = await supabase
+    .from(table)
+    .select('id')
+    .like('id', `${prefix}-%`)
+    .order('id', { ascending: false })
+    .limit(1);
+  if (data && data.length > 0) {
+    const lastNum = parseInt(data[0].id.replace(`${prefix}-`, ''));
+    return `${prefix}-${String(lastNum + 1).padStart(3, '0')}`;
+  }
+  return `${prefix}-001`;
+}
+
 // ── RAZORPAY WEBHOOK ──
-// Must use raw body for signature verification
 app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
+    // 1. Verify signature
     const signature = req.headers['x-razorpay-signature'];
     const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
-
-    // Verify webhook signature
     const expectedSignature = crypto
       .createHmac('sha256', secret)
       .update(req.body)
@@ -37,85 +51,117 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
     const event = JSON.parse(req.body.toString());
     console.log('Webhook event received:', event.event);
 
+    // ── PAYMENT CAPTURED ──
     if (event.event === 'payment.captured') {
       const payment = event.payload.payment.entity;
 
-      // Get payment page ID to find workshop
-      const paymentPageId = payment.payment_page_id || 
-                            payment.notes?.payment_page_id ||
-                            null;
+      const payerName   = payment.notes?.name || payment.customer_name || 'Unknown';
+      const payerPhone  = payment.contact || '';
+      const payerEmail  = payment.email || '';
+      const amountINR   = payment.amount / 100;
+      const paymentMode = 'Razorpay UPI';
+      const today       = new Date().toISOString().split('T')[0];
 
+      // 2. Find workshop by payment page ID
+      const pageId = payment.notes?.payment_page_id || payment.payment_page_id || null;
       let workshopId = null;
 
-      // Look up workshop by razorpay_page_id
-      if (paymentPageId) {
-        const { data: workshops } = await supabase
+      if (pageId) {
+        const { data: ws } = await supabase
           .from('workshops')
           .select('id')
-          .eq('razorpay_page_id', paymentPageId)
+          .eq('razorpay_page_id', pageId)
+          .single();
+        if (ws) workshopId = ws.id;
+        else console.warn('No workshop found for page ID:', pageId);
+      }
+
+      // 3. Create participant record
+      const participantId = await generateId('participants', 'P');
+      const { error: pErr } = await supabase.from('participants').insert({
+        id: participantId,
+        full_name: payerName,
+        phone: payerPhone,
+        email: payerEmail,
+        workshop_id: workshopId,
+        amount_paid: amountINR,
+        payment_mode: paymentMode,
+        booking_source: 'Razorpay UPI',
+        checked_in: false,
+        date: today,
+        notes: `Auto-created from Razorpay payment ${payment.id}`
+      });
+
+      if (pErr) {
+        console.error('Error creating participant:', pErr);
+      } else {
+        console.log('Participant created:', participantId, payerName);
+      }
+
+      // 4. Increment razorpay_pax on the workshop
+      if (workshopId) {
+        const { data: ws } = await supabase
+          .from('workshops')
+          .select('razorpay_pax, total_pax')
+          .eq('id', workshopId)
           .single();
 
-        if (workshops) {
-          workshopId = workshops.id;
-        } else {
-          console.warn('No workshop found for payment_page_id:', paymentPageId);
+        if (ws) {
+          await supabase
+            .from('workshops')
+            .update({
+              razorpay_pax: (ws.razorpay_pax || 0) + 1,
+              total_pax: (ws.total_pax || 0) + 1
+            })
+            .eq('id', workshopId);
         }
       }
 
-      // Generate sequential payment ID
-      const { data: lastPayment } = await supabase
-        .from('payments')
-        .select('id')
-        .like('id', 'PAY-%')
-        .order('id', { ascending: false })
-        .limit(1);
-
-      let newId = 'PAY-001';
-      if (lastPayment && lastPayment.length > 0) {
-        const lastNum = parseInt(lastPayment[0].id.replace('PAY-', ''));
-        newId = 'PAY-' + String(lastNum + 1).padStart(3, '0');
-      }
-
-      // Save payment to Supabase
-      const { error } = await supabase.from('payments').insert({
-        id: newId,
+      // 5. Create payment record
+      const paymentId = await generateId('payments', 'PAY');
+      const { error: payErr } = await supabase.from('payments').insert({
+        id: paymentId,
         razorpay_payment_id: payment.id,
         reference_id: workshopId,
-        payer_name: payment.customer_name || payment.notes?.name || 'Unknown',
-        email: payment.email,
-        contact: payment.contact,
-        amount: payment.amount / 100, // Razorpay sends paise
-        payment_mode: (payment.method || 'razorpay').toLowerCase(),
+        payer_name: payerName,
+        email: payerEmail,
+        contact: payerPhone,
+        amount: amountINR,
+        payment_mode: paymentMode,
         type: 'income',
         category: 'workshop',
         synced_from_razorpay: true,
-        date: new Date().toISOString().split('T')[0],
+        date: today,
+        description: workshopId ? `Workshop ${workshopId} — ${payerName}` : `Razorpay payment — ${payerName}`,
         raw: payment
       });
 
-      if (error) {
-        console.error('Error saving payment:', error);
+      if (payErr) {
+        console.error('Error saving payment:', payErr);
         return res.status(500).json({ error: 'Failed to save payment' });
       }
 
-      console.log('Payment saved:', newId, '₹' + payment.amount / 100);
-      // Save notification
-await supabase.from('notifications').insert({
-  type: 'payment',
-  message: `💰 New payment: ₹${payment.amount / 100} from ${payment.customer_name || payment.notes?.name || 'Unknown'} (${newId})`,
-  read: false
-});
+      console.log('Payment saved:', paymentId, '₹' + amountINR);
+
+      // 6. Send notification
+      await supabase.from('notifications').insert({
+        type: 'payment',
+        message: `💰 New payment: ₹${amountINR} from ${payerName}${workshopId ? ' (' + workshopId + ')' : ''} — ${paymentId}`,
+        read: false
+      });
     }
 
+    // ── PAYMENT FAILED ──
     if (event.event === 'payment.failed') {
       const payment = event.payload.payment.entity;
+      const payerName = payment.notes?.name || payment.customer_name || 'Unknown';
       console.log('Payment failed:', payment.id, '₹' + payment.amount / 100);
+
       await supabase.from('notifications').insert({
-  type: 'warning',
-  message: `⚠️ Payment failed: ₹${payment.amount / 100} — ID ${payment.id}`,
-  read: false
-});
-      // Log failed payment but don't save to payments table
+        type: 'warning',
+        message: `⚠️ Payment failed: ₹${payment.amount / 100} from ${payerName} — ID ${payment.id}`,
+        read: false
+      });
     }
 
     res.json({ received: true });
