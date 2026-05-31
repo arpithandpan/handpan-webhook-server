@@ -11,6 +11,9 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
+// ── GENERAL PAYMENT PAGE ID ──
+const GENERAL_PAYMENT_PAGE_ID = 'pl_SvxuRdqY2rd7ge';
+
 // ── HEALTH CHECK ──
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
@@ -62,8 +65,49 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
       const paymentMode = 'Razorpay UPI';
       const today       = new Date().toISOString().split('T')[0];
 
-      // 2. Find workshop by payment page ID
+      // 2. Identify which payment page this came from
       const pageId = payment.notes?.payment_page_id || payment.payment_page_id || null;
+      console.log('Payment page ID:', pageId);
+
+      // ── GENERAL PAYMENT (not a workshop) ──
+      if (pageId === GENERAL_PAYMENT_PAGE_ID) {
+        console.log('General payment received from:', payerName, '₹' + amountINR);
+
+        // Save to unassigned_payments table
+        const unassignedId = await generateId('unassigned_payments', 'UP');
+        const { error: upErr } = await supabase.from('unassigned_payments').insert({
+          id: unassignedId,
+          amount: amountINR,
+          payer_name: payerName,
+          payer_phone: payerPhone,
+          payer_email: payerEmail,
+          razorpay_payment_id: payment.id,
+          razorpay_order_id: payment.order_id || null,
+          date: today,
+          status: 'pending',
+          notes: `Auto-created from Razorpay general payment ${payment.id}`
+        });
+
+        if (upErr) {
+          console.error('Error saving unassigned payment:', upErr);
+          return res.status(500).json({ error: 'Failed to save unassigned payment' });
+        }
+
+        console.log('Unassigned payment saved:', unassignedId, '₹' + amountINR, 'from', payerName);
+
+        // Send notification
+        await supabase.from('notifications').insert({
+          type: 'payment',
+          message: `💰 New unassigned payment: ₹${amountINR} from ${payerName} — needs assignment`,
+          read: false
+        });
+
+        return res.json({ received: true });
+      }
+
+      // ── WORKSHOP PAYMENT ──
+
+      // 3. Find workshop by payment page ID
       let workshopId = null;
 
       if (pageId) {
@@ -76,7 +120,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         else console.warn('No workshop found for page ID:', pageId);
       }
 
-      // 3. Create participant record
+      // 4. Create participant record
       const participantId = await generateId('participants', 'P');
       const { error: pErr } = await supabase.from('participants').insert({
         id: participantId,
@@ -98,7 +142,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         console.log('Participant created:', participantId, payerName);
       }
 
-      // 4. Increment razorpay_pax on the workshop
+      // 5. Increment razorpay_pax on the workshop
       if (workshopId) {
         const { data: ws } = await supabase
           .from('workshops')
@@ -117,7 +161,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         }
       }
 
-      // 5. Create payment record
+      // 6. Create payment record
       const paymentId = await generateId('payments', 'PAY');
       const { error: payErr } = await supabase.from('payments').insert({
         id: paymentId,
@@ -143,7 +187,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
 
       console.log('Payment saved:', paymentId, '₹' + amountINR);
 
-      // 6. Send notification
+      // 7. Send notification
       await supabase.from('notifications').insert({
         type: 'payment',
         message: `💰 New payment: ₹${amountINR} from ${payerName}${workshopId ? ' (' + workshopId + ')' : ''} — ${paymentId}`,
