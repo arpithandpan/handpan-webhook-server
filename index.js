@@ -34,6 +34,52 @@ async function generateId(table, prefix) {
   return `${prefix}-001`;
 }
 
+/**
+ * Fallback: match payment to a workshop by date + amount.
+ *
+ * Rules:
+ *  - Workshop must not be archived
+ *  - Payment date must be within 45 days BEFORE the workshop date
+ *    (covers early bookings and same-day payments)
+ *  - Amount must be within 5% of workshop price_per_head
+ *    (handles rounding / convenience fees)
+ *
+ * If multiple match, pick the soonest upcoming workshop.
+ */
+async function findWorkshopByDateAndAmount(amountINR, paymentDateStr) {
+  try {
+    const { data: workshops, error } = await supabase
+      .from('workshops')
+      .select('id, date, price_per_head, venue')
+      .neq('archived', true)
+      .order('date', { ascending: true });
+
+    if (error || !workshops) return null;
+
+    const payDate = new Date(paymentDateStr);
+
+    const matches = workshops.filter(w => {
+      if (!w.date || !w.price_per_head) return false;
+
+      const wsDate   = new Date(w.date);
+      const diffDays = (wsDate - payDate) / (1000 * 60 * 60 * 24);
+
+      // Payment must be within 45 days before (or on) workshop day
+      if (diffDays < 0 || diffDays > 45) return false;
+
+      // Amount must be within 5% of price_per_head
+      const pph       = Number(w.price_per_head);
+      const tolerance = pph * 0.05;
+      return Math.abs(amountINR - pph) <= tolerance;
+    });
+
+    return matches.length ? matches[0] : null;
+  } catch (e) {
+    console.error('findWorkshopByDateAndAmount error:', e.message);
+    return null;
+  }
+}
+
 // ── RAZORPAY WEBHOOK ──
 app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
@@ -65,33 +111,52 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
       const today       = new Date().toISOString().split('T')[0];
 
       // 2. Try to find page ID from multiple possible fields
-      const pageId = payment.notes?.payment_page_id 
-        || payment.payment_page_id 
-        || payment.invoice_id  // Payment Pages sometimes use invoice_id
+      const pageId = payment.notes?.payment_page_id
+        || payment.payment_page_id
+        || payment.invoice_id
         || null;
 
       console.log('Payment page ID:', pageId);
       console.log('Payment notes:', JSON.stringify(payment.notes));
-      console.log('Payment description:', payment.description);
+      console.log('Amount (INR):', amountINR);
 
-      // 3. Try to find a matching workshop
+      // 3. Try to find matching workshop — first by page ID, then by date+amount
       let workshopId = null;
+      let matchMethod = null;
 
+      // 3a. Match by razorpay_page_id stored on workshop
       if (pageId && pageId !== GENERAL_PAYMENT_PAGE_ID) {
         const { data: ws } = await supabase
           .from('workshops')
           .select('id')
           .eq('razorpay_page_id', pageId)
           .single();
-        if (ws) workshopId = ws.id;
-        else console.warn('No workshop found for page ID:', pageId);
+
+        if (ws) {
+          workshopId  = ws.id;
+          matchMethod = 'page_id';
+          console.log('Workshop matched by page ID:', workshopId);
+        } else {
+          console.warn('No workshop found for page ID:', pageId, '— trying date+amount fallback');
+        }
       }
 
-      // 4. If page ID is the general page OR no workshop found → save as unassigned
-      const isGeneral = pageId === GENERAL_PAYMENT_PAGE_ID || (!workshopId && !pageId) || (!workshopId && pageId);
+      // 3b. Fallback: match by date + amount if no page ID match
+      if (!workshopId && pageId !== GENERAL_PAYMENT_PAGE_ID) {
+        const matched = await findWorkshopByDateAndAmount(amountINR, today);
+        if (matched) {
+          workshopId  = matched.id;
+          matchMethod = 'date_amount';
+          console.log(`Workshop matched by date+amount fallback: ${workshopId} (${matched.venue})`);
+        }
+      }
+
+      // 4. Route to unassigned if general page OR no workshop match found
+      const isGeneral = pageId === GENERAL_PAYMENT_PAGE_ID || !workshopId;
 
       if (isGeneral) {
-        console.log('Routing to unassigned payments:', payerName, '₹' + amountINR);
+        console.log('Routing to unassigned payments:', payerName, '₹' + amountINR,
+          pageId === GENERAL_PAYMENT_PAGE_ID ? '(general page)' : '(no workshop match)');
 
         const unassignedId = await generateId('unassigned_payments', 'UP');
         const { error: upErr } = await supabase.from('unassigned_payments').insert({
@@ -116,14 +181,14 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
 
         await supabase.from('notifications').insert({
           type: 'payment',
-          message: `💰 New unassigned payment: ₹${amountINR} from ${payerName} — needs assignment`,
+          message: `💸 New unassigned payment: ₹${amountINR} from ${payerName} — needs assignment`,
           read: false
         });
 
-        return res.json({ received: true });
+        return res.json({ received: true, routed: 'unassigned', id: unassignedId });
       }
 
-      // 5. Workshop payment flow
+      // 5. Workshop payment flow — create participant
       const participantId = await generateId('participants', 'P');
       const { error: pErr } = await supabase.from('participants').insert({
         id: participantId,
@@ -135,7 +200,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         booking_source: 'Razorpay UPI',
         checked_in: false,
         date: today,
-        notes: `Auto-created from Razorpay payment ${payment.id}`
+        notes: `Auto-created via Razorpay webhook (matched by ${matchMethod}). Payment ID: ${payment.id}`
       });
 
       if (pErr) {
@@ -144,23 +209,30 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         console.log('Participant created:', participantId, payerName);
       }
 
-      // 6. Increment razorpay_pax on the workshop
-      if (workshopId) {
-        const { data: ws } = await supabase
-          .from('workshops')
-          .select('razorpay_pax, total_pax')
-          .eq('id', workshopId)
-          .single();
+      // 6. Increment razorpay_pax and update workshop revenue
+      const { data: ws } = await supabase
+        .from('workshops')
+        .select('razorpay_pax, total_pax, total_revenue, total_expense')
+        .eq('id', workshopId)
+        .single();
 
-        if (ws) {
-          await supabase
-            .from('workshops')
-            .update({
-              razorpay_pax: (ws.razorpay_pax || 0) + 1,
-              total_pax: (ws.total_pax || 0) + 1
-            })
-            .eq('id', workshopId);
-        }
+      if (ws) {
+        const newRzpPax   = (ws.razorpay_pax   || 0) + 1;
+        const newTotalPax = (ws.total_pax       || 0) + 1;
+        const newRevenue  = (ws.total_revenue   || 0) + amountINR;
+        const newProfit   = newRevenue - (ws.total_expense || 0);
+        const newMargin   = newRevenue ? newProfit / newRevenue : 0;
+
+        await supabase
+          .from('workshops')
+          .update({
+            razorpay_pax:  newRzpPax,
+            total_pax:     newTotalPax,
+            total_revenue: newRevenue,
+            net_profit:    newProfit,
+            margin:        newMargin
+          })
+          .eq('id', workshopId);
       }
 
       // 7. Create payment record
@@ -176,7 +248,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         category: 'workshop',
         synced_from_razorpay: true,
         date: today,
-        description: workshopId ? `Workshop ${workshopId} — ${payerName}` : `Razorpay payment — ${payerName}`
+        description: `Workshop ${workshopId} — ${payerName}`
       });
 
       if (payErr) {
@@ -188,9 +260,11 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
 
       await supabase.from('notifications').insert({
         type: 'payment',
-        message: `💰 New payment: ₹${amountINR} from ${payerName}${workshopId ? ' (' + workshopId + ')' : ''} — ${paymentId}`,
+        message: `✅ Workshop payment: ₹${amountINR} from ${payerName} → ${workshopId} (${matchMethod})`,
         read: false
       });
+
+      return res.json({ received: true, routed: 'workshop', workshopId, participantId, paymentId });
     }
 
     // ── PAYMENT FAILED ──
