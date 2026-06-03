@@ -133,6 +133,34 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
       const paymentMode = 'Razorpay UPI';
       const today       = new Date().toISOString().split('T')[0];
 
+      // Parse custom Payment Page notes into readable format
+      const noteParts = [];
+      const notes = payment.notes || {};
+      // Bringing own handpan
+      const bringingOwn = notes['handpans_will_be_provided_bringing_your_own?(yes/no)']
+        || notes['handpans_will_be_provided._bringing_your_own?_(yes/no)']
+        || notes['bringing_your_own'];
+      if (bringingOwn) noteParts.push('Bringing own handpan: ' + bringingOwn);
+      // Photo/video consent
+      const photoOk = notes['okay_to_take_your_photo/video_at_the_workshop?(yes/no)']
+        || notes['okay_to_take_your_photo/video_at_the_workshop?_(yes/no)']
+        || notes['photo_video_consent'];
+      if (photoOk) noteParts.push('Photo/video OK: ' + photoOk);
+      // Any other custom notes keys (excluding name and payment_page_id)
+      const skipKeys = ['name', 'payment_page_id', 'upi_app_name'];
+      Object.entries(notes).forEach(([k, v]) => {
+        if (!skipKeys.includes(k) && k !== 'handpans_will_be_provided_bringing_your_own?(yes/no)'
+          && k !== 'handpans_will_be_provided._bringing_your_own?_(yes/no)'
+          && k !== 'okay_to_take_your_photo/video_at_the_workshop?(yes/no)'
+          && k !== 'okay_to_take_your_photo/video_at_the_workshop?_(yes/no)'
+          && !noteParts.some(p => p.includes(String(v)))) {
+          // Format key: replace underscores with spaces, capitalise
+          const label = k.replace(/_/g, ' ').replace(/\(.*?\)/g, '').trim();
+          noteParts.push(label + ': ' + v);
+        }
+      });
+      const customNotes = noteParts.length ? noteParts.join(' | ') : null;
+
       console.log('Processing payment ID:', payment.id, '₹' + amountINR, 'from', payerName);
 
       // 2. Try to find page ID from multiple possible fields
@@ -245,7 +273,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         booking_source: 'Razorpay UPI',
         checked_in: false,
         date: today,
-        notes: `Auto-created via Razorpay webhook (matched by ${matchMethod}). Payment ID: ${payment.id}`
+        notes: (customNotes ? customNotes + ' | ' : '') + `Auto-created via Razorpay webhook (matched by ${matchMethod}). Payment ID: ${payment.id}`
       });
 
       if (pErr) {
