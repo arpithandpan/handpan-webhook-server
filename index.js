@@ -35,16 +35,41 @@ async function generateId(table, prefix) {
 }
 
 /**
+ * Idempotency check — returns true if this Razorpay payment ID has already
+ * been processed (exists in payments table). Prevents duplicate inserts when
+ * Razorpay retries the same webhook event.
+ */
+async function isAlreadyProcessed(razorpayPaymentId) {
+  const { data, error } = await supabase
+    .from('payments')
+    .select('id')
+    .eq('razorpay_payment_id', razorpayPaymentId)
+    .limit(1);
+  if (error) {
+    console.warn('Idempotency check error:', error.message);
+    return false; // fail open — better to process than to silently skip
+  }
+  return data && data.length > 0;
+}
+
+/**
+ * Same check for unassigned_payments table.
+ */
+async function isAlreadyUnassigned(razorpayPaymentId) {
+  const { data, error } = await supabase
+    .from('unassigned_payments')
+    .select('id')
+    .eq('razorpay_payment_id', razorpayPaymentId)
+    .limit(1);
+  if (error) {
+    console.warn('Unassigned idempotency check error:', error.message);
+    return false;
+  }
+  return data && data.length > 0;
+}
+
+/**
  * Fallback: match payment to a workshop by date + amount.
- *
- * Rules:
- *  - Workshop must not be archived
- *  - Payment date must be within 45 days BEFORE the workshop date
- *    (covers early bookings and same-day payments)
- *  - Amount must be within 5% of workshop price_per_head
- *    (handles rounding / convenience fees)
- *
- * If multiple match, pick the soonest upcoming workshop.
  */
 async function findWorkshopByDateAndAmount(amountINR, paymentDateStr) {
   try {
@@ -64,10 +89,8 @@ async function findWorkshopByDateAndAmount(amountINR, paymentDateStr) {
       const wsDate   = new Date(w.date);
       const diffDays = (wsDate - payDate) / (1000 * 60 * 60 * 24);
 
-      // Payment must be within 45 days before (or on) workshop day
       if (diffDays < 0 || diffDays > 45) return false;
 
-      // Amount must be within 5% of price_per_head
       const pph       = Number(w.price_per_head);
       const tolerance = pph * 0.05;
       return Math.abs(amountINR - pph) <= tolerance;
@@ -110,6 +133,8 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
       const paymentMode = 'Razorpay UPI';
       const today       = new Date().toISOString().split('T')[0];
 
+      console.log('Processing payment ID:', payment.id, '₹' + amountINR, 'from', payerName);
+
       // 2. Try to find page ID from multiple possible fields
       const pageId = payment.notes?.payment_page_id
         || payment.payment_page_id
@@ -120,12 +145,31 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
       console.log('Payment notes:', JSON.stringify(payment.notes));
       console.log('Amount (INR):', amountINR);
 
+      // ── IDEMPOTENCY CHECK ──
+      // If this payment ID was already processed, skip entirely and return 200
+      // so Razorpay stops retrying. This is the fix for duplicate participants.
+      const isGeneral = pageId === GENERAL_PAYMENT_PAGE_ID;
+
+      if (isGeneral) {
+        const alreadyUnassigned = await isAlreadyUnassigned(payment.id);
+        if (alreadyUnassigned) {
+          console.log('Duplicate unassigned webhook — skipping:', payment.id);
+          return res.json({ received: true, skipped: 'duplicate', payment_id: payment.id });
+        }
+      } else {
+        const alreadyProcessed = await isAlreadyProcessed(payment.id);
+        if (alreadyProcessed) {
+          console.log('Duplicate workshop payment webhook — skipping:', payment.id);
+          return res.json({ received: true, skipped: 'duplicate', payment_id: payment.id });
+        }
+      }
+
       // 3. Try to find matching workshop — first by page ID, then by date+amount
       let workshopId = null;
       let matchMethod = null;
 
       // 3a. Match by razorpay_page_id stored on workshop
-      if (pageId && pageId !== GENERAL_PAYMENT_PAGE_ID) {
+      if (pageId && !isGeneral) {
         const { data: ws } = await supabase
           .from('workshops')
           .select('id')
@@ -142,7 +186,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
       }
 
       // 3b. Fallback: match by date + amount if no page ID match
-      if (!workshopId && pageId !== GENERAL_PAYMENT_PAGE_ID) {
+      if (!workshopId && !isGeneral) {
         const matched = await findWorkshopByDateAndAmount(amountINR, today);
         if (matched) {
           workshopId  = matched.id;
@@ -152,11 +196,11 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
       }
 
       // 4. Route to unassigned if general page OR no workshop match found
-      const isGeneral = pageId === GENERAL_PAYMENT_PAGE_ID || !workshopId;
+      const routeToUnassigned = isGeneral || !workshopId;
 
-      if (isGeneral) {
+      if (routeToUnassigned) {
         console.log('Routing to unassigned payments:', payerName, '₹' + amountINR,
-          pageId === GENERAL_PAYMENT_PAGE_ID ? '(general page)' : '(no workshop match)');
+          isGeneral ? '(general page)' : '(no workshop match)');
 
         const unassignedId = await generateId('unassigned_payments', 'UP');
         const { error: upErr } = await supabase.from('unassigned_payments').insert({
