@@ -237,6 +237,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
       const { error: pErr } = await supabase.from('participants').insert({
         id: participantId,
         full_name: payerName,
+        razorpay_name: payerName,
         phone: payerPhone,
         workshop_id: workshopId,
         amount_paid: amountINR,
