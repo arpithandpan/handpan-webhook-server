@@ -285,6 +285,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         date: today,
         bringing_own_handpan: bringingOwn || null,
         photo_video_consent: photoOk || null,
+        razorpay_payment_id: payment.id || null,
         notes: `Auto-created via Razorpay webhook (matched by ${matchMethod}). Payment ID: ${payment.id}`
       });
 
