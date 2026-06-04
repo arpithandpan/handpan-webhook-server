@@ -141,12 +141,22 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         || notes['handpans_will_be_provided_bringing_your_own?(yes/no)']
         || notes['handpans_will_be_provided._bringing_your_own?_(yes/no)']
         || notes['bringing_your_own'];
-      if (bringingOwn) noteParts.push('Bringing own handpan: ' + bringingOwn);
+      // Normalise yes/no answers to clean "Yes" / "No"
+      function normaliseYesNo(val) {
+        if (!val) return null;
+        const v = val.toString().trim().toLowerCase();
+        if (['yes', 'y', 'yeah', 'yep', 'yup', 'true', '1', 'ok', 'okay'].includes(v)) return 'Yes';
+        if (['no', 'n', 'nope', 'nah', 'false', '0'].includes(v)) return 'No';
+        return val.trim(); // keep original if unrecognised
+      }
+      const bringingOwnNorm = normaliseYesNo(bringingOwn);
+      if (bringingOwnNorm) noteParts.push('Bringing own handpan: ' + bringingOwnNorm);
       // Photo/video consent - try all known key variants
       const photoOk = notes['okay_to_take_your_photo/video_at_the_workshop?_(yes/no)']
         || notes['okay_to_take_your_photo/video_at_the_workshop?(yes/no)']
         || notes['photo_video_consent'];
-      if (photoOk) noteParts.push('Photo/video OK: ' + photoOk);
+      const photoOkNorm = normaliseYesNo(photoOk);
+      if (photoOkNorm) noteParts.push('Photo/video OK: ' + photoOkNorm);
       // Any other custom notes keys (excluding name and payment_page_id)
       const skipKeys = ['name', 'payment_page_id', 'upi_app_name'];
       Object.entries(notes).forEach(([k, v]) => {
@@ -275,8 +285,8 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         booking_source: 'Razorpay UPI',
         checked_in: false,
         date: today,
-        bringing_own_handpan: bringingOwn || null,
-        photo_video_consent: photoOk || null,
+        bringing_own_handpan: bringingOwnNorm || null,
+        photo_video_consent: photoOkNorm || null,
         notes: `Auto-created via Razorpay webhook (matched by ${matchMethod}). Payment ID: ${payment.id}`
       });
 
