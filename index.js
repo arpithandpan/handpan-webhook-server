@@ -149,14 +149,12 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         if (['no', 'n', 'nope', 'nah', 'false', '0'].includes(v)) return 'No';
         return val.trim(); // keep original if unrecognised
       }
-      const bringingOwnNorm = normaliseYesNo(bringingOwn);
-      if (bringingOwnNorm) noteParts.push('Bringing own handpan: ' + bringingOwnNorm);
+      if (bringingOwn) noteParts.push('Bringing own handpan: ' + bringingOwn);
       // Photo/video consent - try all known key variants
       const photoOk = notes['okay_to_take_your_photo/video_at_the_workshop?_(yes/no)']
         || notes['okay_to_take_your_photo/video_at_the_workshop?(yes/no)']
         || notes['photo_video_consent'];
-      const photoOkNorm = normaliseYesNo(photoOk);
-      if (photoOkNorm) noteParts.push('Photo/video OK: ' + photoOkNorm);
+      if (photoOk) noteParts.push('Photo/video OK: ' + photoOk);
       // Any other custom notes keys (excluding name and payment_page_id)
       const skipKeys = ['name', 'payment_page_id', 'upi_app_name'];
       Object.entries(notes).forEach(([k, v]) => {
@@ -285,8 +283,8 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         booking_source: 'Razorpay UPI',
         checked_in: false,
         date: today,
-        bringing_own_handpan: bringingOwnNorm || null,
-        photo_video_consent: photoOkNorm || null,
+        bringing_own_handpan: bringingOwn || null,
+        photo_video_consent: photoOk || null,
         notes: `Auto-created via Razorpay webhook (matched by ${matchMethod}). Payment ID: ${payment.id}`
       });
 
