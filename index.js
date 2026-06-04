@@ -136,14 +136,15 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
       // Parse custom Payment Page notes into readable format
       const noteParts = [];
       const notes = payment.notes || {};
-      // Bringing own handpan
-      const bringingOwn = notes['handpans_will_be_provided_bringing_your_own?(yes/no)']
+      // Bringing own handpan - try all known key variants
+      const bringingOwn = notes['handpans_will_be_provided_bringing_your_own?_(yes/no)']
+        || notes['handpans_will_be_provided_bringing_your_own?(yes/no)']
         || notes['handpans_will_be_provided._bringing_your_own?_(yes/no)']
         || notes['bringing_your_own'];
       if (bringingOwn) noteParts.push('Bringing own handpan: ' + bringingOwn);
-      // Photo/video consent
-      const photoOk = notes['okay_to_take_your_photo/video_at_the_workshop?(yes/no)']
-        || notes['okay_to_take_your_photo/video_at_the_workshop?_(yes/no)']
+      // Photo/video consent - try all known key variants
+      const photoOk = notes['okay_to_take_your_photo/video_at_the_workshop?_(yes/no)']
+        || notes['okay_to_take_your_photo/video_at_the_workshop?(yes/no)']
         || notes['photo_video_consent'];
       if (photoOk) noteParts.push('Photo/video OK: ' + photoOk);
       // Any other custom notes keys (excluding name and payment_page_id)
@@ -267,13 +268,16 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         full_name: payerName,
         razorpay_name: payerName,
         phone: payerPhone,
+        email: payerEmail || null,
         workshop_id: workshopId,
         amount_paid: amountINR,
         payment_mode: paymentMode,
         booking_source: 'Razorpay UPI',
         checked_in: false,
         date: today,
-        notes: (customNotes ? customNotes + ' | ' : '') + `Auto-created via Razorpay webhook (matched by ${matchMethod}). Payment ID: ${payment.id}`
+        bringing_own_handpan: bringingOwn || null,
+        photo_video_consent: photoOk || null,
+        notes: `Auto-created via Razorpay webhook (matched by ${matchMethod}). Payment ID: ${payment.id}`
       });
 
       if (pErr) {
