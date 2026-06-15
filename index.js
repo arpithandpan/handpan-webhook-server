@@ -14,6 +14,12 @@ const supabase = createClient(
 // ── GENERAL PAYMENT PAGE ID ──
 const GENERAL_PAYMENT_PAGE_ID = 'pl_SvxuRdqY2rd7ge';
 
+// ── TICKET PRICING (used by /api/create-payment-link) ──
+// Kept here, not trusted from the client, so the amount charged always
+// matches these prices regardless of what the frontend sends.
+const PRICE_PARTICIPANT = 2000;
+const PRICE_OBSERVER = 500;
+
 // ── HEALTH CHECK ──
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
@@ -64,6 +70,17 @@ function normaliseYesNo(val) {
   return val.trim();
 }
 
+// ── COUNT TOTAL PEOPLE ON A PARTICIPANT ROW ──
+// Legacy rows (from the old Payment Page flow) don't have participant_count /
+// observer_count set, so we fall back to "1 participant, 0 observers" — the
+// same assumption the old code made implicitly with its "+1 pax" logic.
+function rowPeopleCounts(row) {
+  return {
+    participantCount: row.participant_count ?? 1,
+    observerCount: row.observer_count ?? 0,
+  };
+}
+
 // ── EXTRACT ALL FIELDS FROM PAYMENT ──
 // This is the single source of truth for what we capture from Razorpay.
 // All fields are extracted here. Adding a new field in future = just add it here.
@@ -77,22 +94,36 @@ function extractPaymentFields(payment) {
   const amount = payment.amount / 100;
 
   // Custom note fields — try all known key variants
-  const bringingOwn = notes['handpans_will_be_provided_bringing_your_own?_(yes/no)']
+  const bringingOwn = notes.bringingOwnHandpan
+    || notes['handpans_will_be_provided_bringing_your_own?_(yes/no)']
     || notes['handpans_will_be_provided_bringing_your_own?(yes/no)']
     || notes['handpans_will_be_provided._bringing_your_own?_(yes/no)']
     || notes['bringing_your_own']
     || null;
 
-  const photoConsent = notes['okay_to_take_your_photo/video_at_the_workshop?_(yes/no)']
+  const photoConsent = notes.photoConsent
+    || notes['okay_to_take_your_photo/video_at_the_workshop?_(yes/no)']
     || notes['okay_to_take_your_photo/video_at_the_workshop?(yes/no)']
     || notes['photo_video_consent']
     || null;
 
-  // Page ID
+  // Page ID (used by the old Payment Page matching flow)
   const pageId = notes.payment_page_id
     || payment.payment_page_id
     || payment.invoice_id
     || null;
+
+  // NEW: workshop + ticket info, set by /api/create-payment-link for
+  // bookings made through book-preview.html. Won't be present on payments
+  // from manually-created Payment Pages — that's fine, those fall back to
+  // page_id / date+amount matching below, same as before.
+  const workshopIdFromNotes = notes.workshopId || null;
+  const participantCount = notes.participants !== undefined
+    ? (parseInt(notes.participants, 10) || 0)
+    : null;
+  const observerCount = notes.observers !== undefined
+    ? (parseInt(notes.observers, 10) || 0)
+    : null;
 
   return {
     name,
@@ -104,10 +135,23 @@ function extractPaymentFields(payment) {
     photoConsent,       // raw value as typed by user
     bringingOwnNorm: normaliseYesNo(bringingOwn),   // normalised for filters
     photoConsentNorm: normaliseYesNo(photoConsent), // normalised for filters
+    workshopIdFromNotes,
+    participantCount,   // null if not present (old-flow payment)
+    observerCount,       // null if not present (old-flow payment)
   };
 }
 
 // ── WORKSHOP MATCHING ──
+async function findWorkshopById(workshopId) {
+  if (!workshopId) return null;
+  const { data } = await supabase
+    .from('workshops')
+    .select('id')
+    .eq('id', workshopId)
+    .single();
+  return data ? data.id : null;
+}
+
 async function findWorkshopByPageId(pageId) {
   if (!pageId) return null;
   const { data } = await supabase
@@ -147,8 +191,13 @@ async function findWorkshopByDateAndAmount(amountINR, paymentDateStr) {
 // This function saves all known fields + the full raw Razorpay payment object.
 // Even if new columns are added to Supabase later, the raw_payload always has everything.
 async function saveParticipant(participantId, fields, workshopId, matchMethod, rawPayment) {
-  const { name, phone, email, amount, bringingOwn, photoConsent, bringingOwnNorm, photoConsentNorm } = fields;
+  const { name, phone, email, amount, bringingOwn, photoConsent } = fields;
   const today = new Date().toISOString().split('T')[0];
+
+  // Default to "1 participant, 0 observers" for old-flow payments where
+  // notes.participants / notes.observers weren't set.
+  const participantCount = fields.participantCount ?? 1;
+  const observerCount = fields.observerCount ?? 0;
 
   const record = {
     id: participantId,
@@ -158,6 +207,8 @@ async function saveParticipant(participantId, fields, workshopId, matchMethod, r
     email: email || null,
     workshop_id: workshopId,
     amount_paid: amount,
+    participant_count: participantCount,
+    observer_count: observerCount,
     payment_mode: 'Razorpay UPI',
     booking_source: 'Razorpay UPI',
     checked_in: false,
@@ -185,6 +236,178 @@ async function saveParticipant(participantId, fields, workshopId, matchMethod, r
   console.log('Participant saved:', participantId, name, '— all fields captured');
   return { success: true };
 }
+
+// ── NEW: CREATE PAYMENT LINK ──
+// Called by book-preview.html when someone taps "Reserve my spot".
+// Creates a Razorpay Payment Link for the exact amount (computed here, not
+// trusted from the client) and stashes workshopId + ticket counts in notes
+// so the webhook below can match and count this booking accurately.
+app.post('/api/create-payment-link', express.json(), async (req, res) => {
+  try {
+    const {
+      workshopId, participants, observers,
+      name, phone, email,
+      bringingOwnHandpan, photoConsent
+    } = req.body || {};
+
+    if (!workshopId || !name || !phone || !email) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const pCount = Number(participants) || 0;
+    const oCount = Number(observers) || 0;
+    if (pCount + oCount <= 0) {
+      return res.status(400).json({ error: 'At least one ticket is required' });
+    }
+
+    // 1. Look up the workshop and its capacity (if set)
+    const { data: workshop, error: wsError } = await supabase
+      .from('workshops')
+      .select('id, participant_capacity, observer_capacity')
+      .eq('id', workshopId)
+      .single();
+
+    if (wsError || !workshop) {
+      return res.status(404).json({ error: 'Workshop not found' });
+    }
+
+    // 2. If capacity is configured, re-check availability before charging.
+    // This is the server-side guard against the race condition where two
+    // people both see "1 spot left" and try to book it at the same time.
+    if (workshop.participant_capacity != null || workshop.observer_capacity != null) {
+      const { data: existing, error: existingErr } = await supabase
+        .from('participants')
+        .select('participant_count, observer_count')
+        .eq('workshop_id', workshopId);
+
+      if (existingErr) {
+        console.error('Availability check error:', existingErr.message);
+        return res.status(500).json({ error: 'Failed to check availability' });
+      }
+
+      let participantsSold = 0;
+      let observersSold = 0;
+      for (const row of (existing || [])) {
+        const counts = rowPeopleCounts(row);
+        participantsSold += counts.participantCount;
+        observersSold += counts.observerCount;
+      }
+
+      if (workshop.participant_capacity != null
+          && participantsSold + pCount > workshop.participant_capacity) {
+        return res.status(409).json({ error: 'Not enough participant slots remaining' });
+      }
+      if (workshop.observer_capacity != null
+          && observersSold + oCount > workshop.observer_capacity) {
+        return res.status(409).json({ error: 'Not enough audience pass slots remaining' });
+      }
+    }
+
+    // 3. Compute the amount server-side from fixed prices
+    const amountRupees = pCount * PRICE_PARTICIPANT + oCount * PRICE_OBSERVER;
+    const amountPaise = amountRupees * 100;
+
+    const ticketSummary = `${pCount} participant${pCount === 1 ? '' : 's'}`
+      + (oCount ? `, ${oCount} audience pass${oCount === 1 ? '' : 'es'}` : '');
+
+    // 4. Create the Razorpay Payment Link
+    const auth = Buffer.from(
+      `${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`
+    ).toString('base64');
+
+    const rzpRes = await fetch('https://api.razorpay.com/v1/payment_links', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        amount: amountPaise,
+        currency: 'INR',
+        description: `${workshopId} — ${ticketSummary}`,
+        customer: { name, contact: phone, email },
+        notify: { sms: true, email: true },
+        reminder_enable: true,
+        notes: {
+          workshopId,
+          participants: String(pCount),
+          observers: String(oCount),
+          name,
+          phone,
+          email,
+          bringingOwnHandpan: bringingOwnHandpan || '',
+          photoConsent: photoConsent || ''
+        }
+      })
+    });
+
+    const rzpData = await rzpRes.json();
+
+    if (!rzpRes.ok) {
+      console.error('Razorpay payment link error:', rzpData);
+      return res.status(502).json({
+        error: 'Failed to create payment link',
+        detail: rzpData.error?.description || 'Unknown error'
+      });
+    }
+
+    return res.json({ short_url: rzpData.short_url, id: rzpData.id });
+  } catch (err) {
+    console.error('create-payment-link error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── NEW: WORKSHOP AVAILABILITY ──
+// Called by book-preview.html on page load to know how many participant /
+// audience pass slots are left for a given workshop.
+app.get('/api/workshop/:id/availability', async (req, res) => {
+  try {
+    const workshopId = req.params.id;
+
+    const { data: workshop, error: wsError } = await supabase
+      .from('workshops')
+      .select('id, participant_capacity, observer_capacity')
+      .eq('id', workshopId)
+      .single();
+
+    if (wsError || !workshop) {
+      return res.status(404).json({ error: 'Workshop not found' });
+    }
+
+    const { data: rows, error } = await supabase
+      .from('participants')
+      .select('participant_count, observer_count')
+      .eq('workshop_id', workshopId);
+
+    if (error) {
+      console.error('Availability query error:', error.message);
+      return res.status(500).json({ error: 'Failed to fetch availability' });
+    }
+
+    let participantsSold = 0;
+    let observersSold = 0;
+    for (const row of (rows || [])) {
+      const counts = rowPeopleCounts(row);
+      participantsSold += counts.participantCount;
+      observersSold += counts.observerCount;
+    }
+
+    const result = { workshopId, participantsSold, observersSold };
+
+    if (workshop.participant_capacity != null) {
+      result.participantsRemaining = Math.max(0, workshop.participant_capacity - participantsSold);
+    }
+    if (workshop.observer_capacity != null) {
+      result.observersRemaining = Math.max(0, workshop.observer_capacity - observersSold);
+    }
+
+    return res.json(result);
+  } catch (err) {
+    console.error('availability error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 // ── RAZORPAY WEBHOOK ──
 app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), async (req, res) => {
@@ -263,16 +486,31 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
       let workshopId = null;
       let matchMethod = null;
 
-      workshopId = await findWorkshopByPageId(fields.pageId);
-      if (workshopId) {
-        matchMethod = 'page_id';
-        console.log('Workshop matched by page_id:', workshopId);
-      } else {
-        const matched = await findWorkshopByDateAndAmount(fields.amount, today);
-        if (matched) {
-          workshopId = matched.id;
-          matchMethod = 'date_amount';
-          console.log('Workshop matched by date+amount:', workshopId);
+      // NEW: try a direct match via workshopId stashed in notes by
+      // /api/create-payment-link. This is the most reliable match, and is
+      // checked first. Old-flow payments (from manually-created Payment
+      // Pages) won't have this, so they fall through to the checks below
+      // exactly as before.
+      if (fields.workshopIdFromNotes) {
+        workshopId = await findWorkshopById(fields.workshopIdFromNotes);
+        if (workshopId) {
+          matchMethod = 'notes_workshop_id';
+          console.log('Workshop matched by notes.workshopId:', workshopId);
+        }
+      }
+
+      if (!workshopId) {
+        workshopId = await findWorkshopByPageId(fields.pageId);
+        if (workshopId) {
+          matchMethod = 'page_id';
+          console.log('Workshop matched by page_id:', workshopId);
+        } else {
+          const matched = await findWorkshopByDateAndAmount(fields.amount, today);
+          if (matched) {
+            workshopId = matched.id;
+            matchMethod = 'date_amount';
+            console.log('Workshop matched by date+amount:', workshopId);
+          }
         }
       }
 
@@ -309,6 +547,10 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
       }
 
       // 7. Update workshop stats
+      // NEW: pax increment now reflects the actual number of people on this
+      // booking (participants + observers), not always +1.
+      const paxIncrement = (fields.participantCount ?? 1) + (fields.observerCount ?? 0);
+
       const { data: ws } = await supabase
         .from('workshops')
         .select('razorpay_pax, total_pax, total_revenue, total_expense')
@@ -316,8 +558,8 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         .single();
 
       if (ws) {
-        const newRzpPax   = (ws.razorpay_pax || 0) + 1;
-        const newTotalPax = (ws.total_pax || 0) + 1;
+        const newRzpPax   = (ws.razorpay_pax || 0) + paxIncrement;
+        const newTotalPax = (ws.total_pax || 0) + paxIncrement;
         const newRevenue  = (ws.total_revenue || 0) + fields.amount;
         const newProfit   = newRevenue - (ws.total_expense || 0);
         const newMargin   = newRevenue ? newProfit / newRevenue : 0;
