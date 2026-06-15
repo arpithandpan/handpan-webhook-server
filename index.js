@@ -5,6 +5,19 @@ const { createClient } = require('@supabase/supabase-js');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// ── CORS ──
+// book-preview.html calls /api/create-payment-link and /api/workshop/:id/availability
+// directly from the browser, from a different origin than this server, so we need to
+// allow that. This is just response headers, doesn't affect the Razorpay webhook route
+// (which reads the raw body separately) or any other logic.
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
 // ── SUPABASE ──
 const supabase = createClient(
   process.env.SUPABASE_URL,
