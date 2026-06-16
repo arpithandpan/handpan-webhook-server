@@ -447,6 +447,55 @@ app.get('/api/workshop/:id/availability', async (req, res) => {
   }
 });
 
+// ── WAITLIST SIGNUP ──
+// Called by book.html when someone on a sold-out workshop submits the
+// "which month works for you" prompt. Always source: 'Website' here — the
+// dashboard's manual-entry form writes to Supabase directly like every
+// other section does, it doesn't go through this endpoint.
+app.post('/api/waitlist', express.json(), async (req, res) => {
+  try {
+    const { name, phone, email, preferredMonth } = req.body || {};
+
+    if (!name || !phone) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const waitlistId = await generateId('workshop_waitlist', 'WL');
+
+    const { error } = await supabase.from('workshop_waitlist').insert({
+      id: waitlistId,
+      full_name: name,
+      phone,
+      email: email || null,
+      preferred_month: preferredMonth || null,
+      source: 'Website',
+      contacted: false
+    });
+
+    if (error) {
+      console.error('Error saving waitlist entry:', error.message);
+      return res.status(500).json({ error: 'Failed to save waitlist entry' });
+    }
+
+    let monthLabel = 'a future workshop';
+    if (preferredMonth) {
+      const d = new Date(`${preferredMonth}T00:00:00`);
+      if (!isNaN(d)) monthLabel = d.toLocaleDateString('en-IN', { month: 'long', year: 'numeric' });
+    }
+
+    await supabase.from('notifications').insert({
+      type: 'info',
+      message: `📋 New waitlist signup: ${name} — interested in ${monthLabel}`,
+      read: false
+    });
+
+    return res.json({ id: waitlistId });
+  } catch (err) {
+    console.error('waitlist error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ── RAZORPAY WEBHOOK ──
 app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
