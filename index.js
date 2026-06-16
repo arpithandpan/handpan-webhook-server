@@ -6,7 +6,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ── CORS ──
-// book-preview.html calls /api/create-payment-link and /api/workshop/:id/availability
+// book.html calls /api/create-payment-link and /api/workshop/:id/availability
 // directly from the browser, from a different origin than this server, so we need to
 // allow that. This is just response headers, doesn't affect the Razorpay webhook route
 // (which reads the raw body separately) or any other logic.
@@ -27,11 +27,11 @@ const supabase = createClient(
 // ── GENERAL PAYMENT PAGE ID ──
 const GENERAL_PAYMENT_PAGE_ID = 'pl_SvxuRdqY2rd7ge';
 
-// ── TICKET PRICING (used by /api/create-payment-link) ──
-// Kept here, not trusted from the client, so the amount charged always
-// matches these prices regardless of what the frontend sends.
-const PRICE_PARTICIPANT = 2000;
-const PRICE_OBSERVER = 500;
+// ── TICKET PRICING ──
+// Pricing now lives per-workshop on the workshops table (price_per_head for
+// participants, observer_price for audience passes), set from the dashboard.
+// Never trusted from the client — /api/create-payment-link always looks up
+// the workshop's own prices in Supabase before computing the charge.
 
 // ── HEALTH CHECK ──
 app.get('/health', (req, res) => {
@@ -127,7 +127,7 @@ function extractPaymentFields(payment) {
     || null;
 
   // NEW: workshop + ticket info, set by /api/create-payment-link for
-  // bookings made through book-preview.html. Won't be present on payments
+  // bookings made through book.html. Won't be present on payments
   // from manually-created Payment Pages — that's fine, those fall back to
   // page_id / date+amount matching below, same as before.
   const workshopIdFromNotes = notes.workshopId || null;
@@ -250,8 +250,8 @@ async function saveParticipant(participantId, fields, workshopId, matchMethod, r
   return { success: true };
 }
 
-// ── NEW: CREATE PAYMENT LINK ──
-// Called by book-preview.html when someone taps "Reserve my spot".
+// ── CREATE PAYMENT LINK ──
+// Called by book.html when someone taps "Reserve my spot".
 // Creates a Razorpay Payment Link for the exact amount (computed here, not
 // trusted from the client) and stashes workshopId + ticket counts in notes
 // so the webhook below can match and count this booking accurately.
@@ -273,14 +273,14 @@ app.post('/api/create-payment-link', express.json(), async (req, res) => {
       return res.status(400).json({ error: 'At least one ticket is required' });
     }
 
-    // 1. Look up the workshop and its capacity (if set)
+    // 1. Look up the workshop, its capacity (if set), and its prices
     const { data: workshop, error: wsError } = await supabase
       .from('workshops')
-      .select('id, participant_capacity, observer_capacity')
+      .select('id, participant_capacity, observer_capacity, price_per_head, observer_price, archived')
       .eq('id', workshopId)
       .single();
 
-    if (wsError || !workshop) {
+    if (wsError || !workshop || workshop.archived) {
       return res.status(404).json({ error: 'Workshop not found' });
     }
 
@@ -316,8 +316,21 @@ app.post('/api/create-payment-link', express.json(), async (req, res) => {
       }
     }
 
-    // 3. Compute the amount server-side from fixed prices
-    const amountRupees = pCount * PRICE_PARTICIPANT + oCount * PRICE_OBSERVER;
+    // 3. Compute the amount server-side from this workshop's own prices —
+    // never trust an amount from the client, and never fall back to a
+    // guessed price. If a price isn't set for a ticket type someone's
+    // actually trying to buy, fail clearly instead of charging ₹0 for it.
+    const participantPrice = Number(workshop.price_per_head) || 0;
+    const observerPrice = Number(workshop.observer_price) || 0;
+
+    if (pCount > 0 && participantPrice <= 0) {
+      return res.status(400).json({ error: 'Participant price is not set for this workshop yet' });
+    }
+    if (oCount > 0 && observerPrice <= 0) {
+      return res.status(400).json({ error: 'Audience pass price is not set for this workshop yet' });
+    }
+
+    const amountRupees = pCount * participantPrice + oCount * observerPrice;
     const amountPaise = amountRupees * 100;
 
     const ticketSummary = `${pCount} participant${pCount === 1 ? '' : 's'}`
@@ -371,20 +384,22 @@ app.post('/api/create-payment-link', express.json(), async (req, res) => {
   }
 });
 
-// ── NEW: WORKSHOP AVAILABILITY ──
-// Called by book-preview.html on page load to know how many participant /
-// audience pass slots are left for a given workshop.
+// ── WORKSHOP INFO + AVAILABILITY ──
+// Called by book.html on page load. Returns everything the page needs to
+// render itself for this workshop: date, time, venue, prices, and how many
+// participant / audience pass slots are left. book.html no longer hardcodes
+// any of this — it's a single template that works for any workshop ID.
 app.get('/api/workshop/:id/availability', async (req, res) => {
   try {
     const workshopId = req.params.id;
 
     const { data: workshop, error: wsError } = await supabase
       .from('workshops')
-      .select('id, participant_capacity, observer_capacity')
+      .select('id, date, venue, workshop_time, venue_map_url, price_per_head, observer_price, participant_capacity, observer_capacity, archived')
       .eq('id', workshopId)
       .single();
 
-    if (wsError || !workshop) {
+    if (wsError || !workshop || workshop.archived) {
       return res.status(404).json({ error: 'Workshop not found' });
     }
 
@@ -406,7 +421,17 @@ app.get('/api/workshop/:id/availability', async (req, res) => {
       observersSold += counts.observerCount;
     }
 
-    const result = { workshopId, participantsSold, observersSold };
+    const result = {
+      workshopId,
+      date: workshop.date,
+      time: workshop.workshop_time || null,
+      venue: workshop.venue || null,
+      venueMapUrl: workshop.venue_map_url || null,
+      participantPrice: workshop.price_per_head != null ? Number(workshop.price_per_head) : null,
+      observerPrice: workshop.observer_price != null ? Number(workshop.observer_price) : null,
+      participantsSold,
+      observersSold
+    };
 
     if (workshop.participant_capacity != null) {
       result.participantsRemaining = Math.max(0, workshop.participant_capacity - participantsSold);
