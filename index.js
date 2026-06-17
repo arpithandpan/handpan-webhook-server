@@ -53,6 +53,31 @@ async function generateId(table, prefix) {
   return `${prefix}-001`;
 }
 
+// generateId() looks up the current max each time it's called, so calling
+// it N times back-to-back before anything is actually inserted hands back
+// the same id N times over — nothing in between bumps the max. This
+// queries the max once and builds the rest of the sequence locally, which
+// is what inserting a whole group of people in one go needs.
+async function generateSequentialIds(table, prefix, count) {
+  const { data } = await supabase
+    .from(table)
+    .select('id')
+    .like('id', `${prefix}-%`)
+    .order('id', { ascending: false })
+    .limit(1);
+
+  let nextNum = 1;
+  if (data && data.length > 0) {
+    nextNum = parseInt(data[0].id.replace(`${prefix}-`, '')) + 1;
+  }
+
+  const ids = [];
+  for (let i = 0; i < count; i++) {
+    ids.push(`${prefix}-${String(nextNum + i).padStart(3, '0')}`);
+  }
+  return ids;
+}
+
 // ── IDEMPOTENCY CHECKS ──
 async function isAlreadyProcessed(razorpayPaymentId) {
   const { data, error } = await supabase
@@ -138,6 +163,28 @@ function extractPaymentFields(payment) {
     ? (parseInt(notes.observers, 10) || 0)
     : null;
 
+  // NEW: guest names for additional participants, the handpan-count
+  // breakdown for a group, and the per-head price used to charge this
+  // booking — all stashed in notes by /api/create-payment-link so the
+  // webhook can build one row per person without re-querying anything.
+  let guestNames = [];
+  if (notes.guestNames !== undefined) {
+    try {
+      const parsed = JSON.parse(notes.guestNames);
+      if (Array.isArray(parsed)) guestNames = parsed;
+    } catch (e) {
+      // malformed — fall back to no guest names rather than failing the whole webhook
+    }
+  }
+
+  const ownHandpanCount = notes.ownHandpanCount !== undefined
+    ? (parseInt(notes.ownHandpanCount, 10) || 0)
+    : null;
+
+  const participantPrice = notes.participantPrice !== undefined
+    ? (parseFloat(notes.participantPrice) || null)
+    : null;
+
   return {
     name,
     phone,
@@ -151,6 +198,9 @@ function extractPaymentFields(payment) {
     workshopIdFromNotes,
     participantCount,   // null if not present (old-flow payment)
     observerCount,       // null if not present (old-flow payment)
+    guestNames,          // [] if not present
+    ownHandpanCount,      // null if not present (old-flow payment)
+    participantPrice,    // null if not present (old-flow payment)
   };
 }
 
@@ -250,6 +300,81 @@ async function saveParticipant(participantId, fields, workshopId, matchMethod, r
   return { success: true };
 }
 
+// ── BUILD ONE ROW PER PERSON FOR A NEW-FLOW BOOKING ──
+// Bookings made through book.html always set notes.participants, which is
+// what tells us we have real per-person data to split out. This builds one
+// row for the lead and one for each remaining ticket, filling any blank
+// guest name with a placeholder Arpit can rename in person. Pure function,
+// no DB calls, so it's easy to test directly with different inputs.
+function buildParticipantRows(ids, fields, workshopId, matchMethod, rawPayment, today) {
+  const pCount = fields.participantCount ?? 1;
+  const oCount = fields.observerCount ?? 0;
+  const guestNamesRaw = Array.isArray(fields.guestNames) ? fields.guestNames : [];
+
+  // The lead, then one entry per remaining ticket. Guest numbering starts
+  // at 2 since the lead is implicitly person 1.
+  const names = [fields.name];
+  for (let i = 0; i < pCount - 1; i++) {
+    const provided = (guestNamesRaw[i] || '').toString().trim();
+    names.push(provided || `${fields.name}'s Guest ${i + 2}`);
+  }
+
+  // The handpan question is a group-level aggregate, shown identically on
+  // every card from this booking — plain Yes/No for a solo booking, or
+  // "X of Y" once there's more than one ticket.
+  let handpanDisplay;
+  if (pCount <= 1) {
+    handpanDisplay = fields.bringingOwn || null;
+  } else {
+    const ownCount = fields.ownHandpanCount != null ? fields.ownHandpanCount : 0;
+    handpanDisplay = `${ownCount} of ${pCount}`;
+  }
+
+  return names.map((name, idx) => {
+    const isLead = idx === 0;
+    return {
+      id: ids[idx],
+      full_name: name,
+      razorpay_name: isLead ? fields.name : null,
+      phone: fields.phone || null,
+      email: fields.email || null,
+      workshop_id: workshopId,
+      amount_paid: fields.participantPrice != null ? fields.participantPrice : fields.amount,
+      participant_count: 1,
+      observer_count: isLead ? oCount : 0,
+      payment_mode: 'Razorpay UPI',
+      booking_source: 'Razorpay UPI',
+      checked_in: false,
+      date: today,
+      bringing_own_handpan: handpanDisplay,
+      photo_video_consent: fields.photoConsent || null,
+      razorpay_payment_id: rawPayment.id || null,
+      lead_name: isLead ? null : fields.name,
+      guest_count: isLead ? (names.length - 1) : null,
+      raw_payload: rawPayment, // full Razorpay payment object — never lose data
+      notes: `Auto-created via Razorpay webhook (matched by ${matchMethod}). Payment ID: ${rawPayment.id}. Person ${idx + 1} of ${names.length}.`
+    };
+  });
+}
+
+// ── SAVE A WHOLE GROUP OF PEOPLE FROM ONE BOOKING ──
+async function saveParticipantGroup(rows) {
+  const { error } = await supabase.from('participants').insert(rows);
+
+  if (error) {
+    console.error('Error saving participant group:', error.message);
+    await supabase.from('notifications').insert({
+      type: 'warning',
+      message: `⚠️ Failed to save ${rows.length} participant row(s) for ${rows[0]?.full_name || 'unknown'} — Payment ${rows[0]?.razorpay_payment_id}. Error: ${error.message}`,
+      read: false
+    });
+    return { success: false, error: error.message };
+  }
+
+  console.log('Participant group saved:', rows.length, 'rows —', rows.map(r => r.id).join(', '));
+  return { success: true };
+}
+
 // ── CREATE PAYMENT LINK ──
 // Called by book.html when someone taps "Reserve my spot".
 // Creates a Razorpay Payment Link for the exact amount (computed here, not
@@ -260,7 +385,8 @@ app.post('/api/create-payment-link', express.json(), async (req, res) => {
     const {
       workshopId, participants, observers,
       name, phone, email,
-      bringingOwnHandpan, photoConsent
+      bringingOwnHandpan, photoConsent,
+      guestNames, ownHandpanCount
     } = req.body || {};
 
     if (!workshopId || !name || !phone || !email) {
@@ -364,7 +490,10 @@ app.post('/api/create-payment-link', express.json(), async (req, res) => {
           phone,
           email,
           bringingOwnHandpan: bringingOwnHandpan || '',
-          photoConsent: photoConsent || ''
+          photoConsent: photoConsent || '',
+          guestNames: JSON.stringify(Array.isArray(guestNames) ? guestNames.filter(n => (n || '').toString().trim()) : []),
+          ownHandpanCount: String(ownHandpanCount != null ? ownHandpanCount : 0),
+          participantPrice: String(participantPrice)
         }
       })
     });
@@ -627,12 +756,29 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         return res.json({ received: true, routed: 'unassigned_no_match', id: unassignedId });
       }
 
-      // 6. Save participant with full payload
-      const participantId = await generateId('participants', 'P');
-      const result = await saveParticipant(participantId, fields, workshopId, matchMethod, payment);
+      // 6. Save participant(s) with full payload — one row per person for
+      // new-flow bookings (which always carry notes.participants), or the
+      // original single row for old-flow Payment Page payments that don't
+      // have per-person data to split out.
+      let participantIds;
+      if (fields.participantCount != null) {
+        const pCount = fields.participantCount ?? 1;
+        const ids = await generateSequentialIds('participants', 'P', pCount);
+        const rows = buildParticipantRows(ids, fields, workshopId, matchMethod, payment, today);
+        const result = await saveParticipantGroup(rows);
 
-      if (!result.success) {
-        return res.status(500).json({ error: 'Failed to save participant', detail: result.error });
+        if (!result.success) {
+          return res.status(500).json({ error: 'Failed to save participants', detail: result.error });
+        }
+        participantIds = ids;
+      } else {
+        const participantId = await generateId('participants', 'P');
+        const result = await saveParticipant(participantId, fields, workshopId, matchMethod, payment);
+
+        if (!result.success) {
+          return res.status(500).json({ error: 'Failed to save participant', detail: result.error });
+        }
+        participantIds = [participantId];
       }
 
       // 7. Update workshop stats
@@ -688,7 +834,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         read: false
       });
 
-      return res.json({ received: true, routed: 'workshop', workshopId, participantId, paymentId });
+      return res.json({ received: true, routed: 'workshop', workshopId, participantIds, paymentId });
     }
 
     // ── PAYMENT FAILED ──
