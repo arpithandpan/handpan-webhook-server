@@ -316,7 +316,7 @@ function buildParticipantRows(ids, fields, workshopId, matchMethod, rawPayment, 
   const names = [fields.name];
   for (let i = 0; i < pCount - 1; i++) {
     const provided = (guestNamesRaw[i] || '').toString().trim();
-    names.push(provided || `${fields.name}'s Guest ${i + 2}`);
+    names.push(provided || `${fields.name}'s Guest ${i + 1}`);
   }
 
   // The handpan question is a group-level aggregate, shown identically on
