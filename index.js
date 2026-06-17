@@ -354,6 +354,8 @@ app.post('/api/create-payment-link', express.json(), async (req, res) => {
         customer: { name, contact: phone, email },
         notify: { sms: true, email: true },
         reminder_enable: true,
+        callback_url: `https://arpitpandey.com/pages/book?ws=${encodeURIComponent(workshopId)}`,
+        callback_method: 'get',
         notes: {
           workshopId,
           participants: String(pCount),
