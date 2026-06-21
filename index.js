@@ -781,31 +781,9 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         participantIds = [participantId];
       }
 
-      // 7. Update workshop stats
-      // NEW: pax increment now reflects the actual number of people on this
-      // booking (participants + observers), not always +1.
-      const paxIncrement = (fields.participantCount ?? 1) + (fields.observerCount ?? 0);
-
-      const { data: ws } = await supabase
-        .from('workshops')
-        .select('razorpay_pax, total_pax, total_revenue, total_expense')
-        .eq('id', workshopId)
-        .single();
-
-      if (ws) {
-        const newRzpPax   = (ws.razorpay_pax || 0) + paxIncrement;
-        const newTotalPax = (ws.total_pax || 0) + paxIncrement;
-        const newRevenue  = (ws.total_revenue || 0) + fields.amount;
-        const newProfit   = newRevenue - (ws.total_expense || 0);
-        const newMargin   = newRevenue ? newProfit / newRevenue : 0;
-        await supabase.from('workshops').update({
-          razorpay_pax: newRzpPax,
-          total_pax: newTotalPax,
-          total_revenue: newRevenue,
-          net_profit: newProfit,
-          margin: newMargin
-        }).eq('id', workshopId);
-      }
+      // Workshop stats (pax / revenue / profit / margin) are now recomputed
+      // automatically by a database trigger whenever participants or payments
+      // change. Nothing to update here.
 
       // 8. Save payment record
       const paymentId = await generateId('payments', 'PAY');
