@@ -139,12 +139,6 @@ function extractPaymentFields(payment) {
     || notes['bringing_your_own']
     || null;
 
-  const photoConsent = notes.photoConsent
-    || notes['okay_to_take_your_photo/video_at_the_workshop?_(yes/no)']
-    || notes['okay_to_take_your_photo/video_at_the_workshop?(yes/no)']
-    || notes['photo_video_consent']
-    || null;
-
   // Page ID (used by the old Payment Page matching flow)
   const pageId = notes.payment_page_id
     || payment.payment_page_id
@@ -192,9 +186,7 @@ function extractPaymentFields(payment) {
     amount,
     pageId,
     bringingOwn,        // raw value as typed by user
-    photoConsent,       // raw value as typed by user
     bringingOwnNorm: normaliseYesNo(bringingOwn),   // normalised for filters
-    photoConsentNorm: normaliseYesNo(photoConsent), // normalised for filters
     workshopIdFromNotes,
     participantCount,   // null if not present (old-flow payment)
     observerCount,       // null if not present (old-flow payment)
@@ -254,7 +246,7 @@ async function findWorkshopByDateAndAmount(amountINR, paymentDateStr) {
 // This function saves all known fields + the full raw Razorpay payment object.
 // Even if new columns are added to Supabase later, the raw_payload always has everything.
 async function saveParticipant(participantId, fields, workshopId, matchMethod, rawPayment) {
-  const { name, phone, email, amount, bringingOwn, photoConsent } = fields;
+  const { name, phone, email, amount, bringingOwn } = fields;
   const today = new Date().toISOString().split('T')[0];
 
   // Default to "1 participant, 0 observers" for old-flow payments where
@@ -277,7 +269,6 @@ async function saveParticipant(participantId, fields, workshopId, matchMethod, r
     checked_in: false,
     date: today,
     bringing_own_handpan: bringingOwn || null,
-    photo_video_consent: photoConsent || null,
     razorpay_payment_id: rawPayment.id || null,
     raw_payload: rawPayment, // full Razorpay payment object — never lose data
     notes: `Auto-created via Razorpay webhook (matched by ${matchMethod}). Payment ID: ${rawPayment.id}`
@@ -347,7 +338,6 @@ function buildParticipantRows(ids, fields, workshopId, matchMethod, rawPayment, 
       checked_in: false,
       date: today,
       bringing_own_handpan: handpanDisplay,
-      photo_video_consent: fields.photoConsent || null,
       razorpay_payment_id: rawPayment.id || null,
       lead_name: isLead ? null : fields.name,
       guest_count: isLead ? (names.length - 1) : null,
@@ -385,7 +375,7 @@ app.post('/api/create-payment-link', express.json(), async (req, res) => {
     const {
       workshopId, participants, observers,
       name, phone, email,
-      bringingOwnHandpan, photoConsent,
+      bringingOwnHandpan,
       guestNames, ownHandpanCount
     } = req.body || {};
 
@@ -490,7 +480,6 @@ app.post('/api/create-payment-link', express.json(), async (req, res) => {
           phone,
           email,
           bringingOwnHandpan: bringingOwnHandpan || '',
-          photoConsent: photoConsent || '',
           guestNames: JSON.stringify(Array.isArray(guestNames) ? guestNames.filter(n => (n || '').toString().trim()) : []),
           ownHandpanCount: String(ownHandpanCount != null ? ownHandpanCount : 0),
           participantPrice: String(participantPrice)
