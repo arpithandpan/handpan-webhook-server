@@ -379,7 +379,7 @@ app.post('/api/create-payment-link', express.json(), async (req, res) => {
       guestNames, ownHandpanCount
     } = req.body || {};
 
-    if (!workshopId || !name || !phone || !email) {
+    if (!workshopId || !name || !phone) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
@@ -467,8 +467,8 @@ app.post('/api/create-payment-link', express.json(), async (req, res) => {
         amount: amountPaise,
         currency: 'INR',
         description: `${workshopId} — ${ticketSummary}`,
-        customer: { name, contact: phone, email },
-        notify: { sms: true, email: true },
+        customer: email ? { name, contact: phone, email } : { name, contact: phone },
+        notify: { sms: true, email: !!email },
         reminder_enable: true,
         callback_url: `https://arpitpandey.com/pages/book?ws=${encodeURIComponent(workshopId)}`,
         callback_method: 'get',
@@ -478,7 +478,7 @@ app.post('/api/create-payment-link', express.json(), async (req, res) => {
           observers: String(oCount),
           name,
           phone,
-          email,
+          email: email || '',
           bringingOwnHandpan: bringingOwnHandpan || '',
           guestNames: JSON.stringify(Array.isArray(guestNames) ? guestNames.filter(n => (n || '').toString().trim()) : []),
           ownHandpanCount: String(ownHandpanCount != null ? ownHandpanCount : 0),
