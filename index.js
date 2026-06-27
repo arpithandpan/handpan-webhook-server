@@ -775,7 +775,16 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
       // change. Nothing to update here.
 
       // 8. Save payment record
-      const paymentId = await generateId('payments', 'PAY');
+      const { data: payNum, error: payNumErr } = await supabase.rpc('next_payment_number');
+      if (payNumErr || payNum == null) {
+        console.error('Error getting payment number:', payNumErr?.message);
+        await supabase.from('notifications').insert({
+          type: 'warning',
+          message: `⚠️ Could not generate payment number for ${fields.name} — Payment ${payment.id}. Booking saved but payment record missing.`,
+          read: false
+        });
+      }
+      const paymentId = payNum != null ? `PAY-${String(payNum).padStart(3, '0')}` : `PAY-${Date.now()}`;
       const { error: payErr } = await supabase.from('payments').insert({
         id: paymentId,
         razorpay_payment_id: payment.id,
@@ -792,6 +801,11 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
 
       if (payErr) {
         console.error('Error saving payment record:', payErr.message);
+        await supabase.from('notifications').insert({
+          type: 'warning',
+          message: `⚠️ Payment record failed for ${fields.name} (${workshopId}) — ₹${fields.amount}. Error: ${payErr.message}`,
+          read: false
+        });
       }
 
       // 9. Success notification
