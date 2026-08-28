@@ -128,7 +128,16 @@ function extractPaymentFields(payment) {
   // Core fields
   const name   = notes.name || payment.customer_name || 'Unknown';
   const phone  = payment.contact || null;
-  const email  = payment.email || null;
+  // Email: prefer the address the person actually typed on book.html, which
+  // /api/create-payment-link stashes in notes.email. payment.email is
+  // Razorpay's own field and it comes back as the literal string
+  // 'void@razorpay.com' when Razorpay didn't collect one — that placeholder
+  // is truthy, so reading it first silently overwrote every real address.
+  const notesEmail = (notes.email || '').toString().trim();
+  const rzpEmail   = (payment.email || '').toString().trim();
+  const email = notesEmail
+    || (rzpEmail.toLowerCase() === 'void@razorpay.com' ? null : rzpEmail)
+    || null;
   const amount = payment.amount / 100;
 
   // Custom note fields — try all known key variants
