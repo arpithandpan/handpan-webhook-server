@@ -401,12 +401,18 @@ app.post('/api/create-payment-link', express.json(), async (req, res) => {
     // 1. Look up the workshop, its capacity (if set), and its prices
     const { data: workshop, error: wsError } = await supabase
       .from('workshops')
-      .select('id, participant_capacity, observer_capacity, price_per_head, observer_price, archived')
+      .select('id, participant_capacity, observer_capacity, price_per_head, observer_price, archived, cancelled')
       .eq('id', workshopId)
       .single();
 
     if (wsError || !workshop || workshop.archived) {
       return res.status(404).json({ error: 'Workshop not found' });
+    }
+
+    // A cancelled workshop stays visible in the dashboard rather than being
+    // archived, so it has to be closed to bookings explicitly here.
+    if (workshop.cancelled) {
+      return res.status(410).json({ error: 'This workshop has been cancelled' });
     }
 
     // 2. If capacity is configured, re-check availability before charging.
@@ -524,12 +530,18 @@ app.get('/api/workshop/:id/availability', async (req, res) => {
 
     const { data: workshop, error: wsError } = await supabase
       .from('workshops')
-      .select('id, date, venue, workshop_time, venue_map_url, price_per_head, observer_price, participant_capacity, observer_capacity, archived')
+      .select('id, date, venue, workshop_time, venue_map_url, price_per_head, observer_price, participant_capacity, observer_capacity, archived, cancelled')
       .eq('id', workshopId)
       .single();
 
     if (wsError || !workshop || workshop.archived) {
       return res.status(404).json({ error: 'Workshop not found' });
+    }
+
+    // A cancelled workshop stays visible in the dashboard rather than being
+    // archived, so it has to be closed to bookings explicitly here.
+    if (workshop.cancelled) {
+      return res.status(410).json({ error: 'This workshop has been cancelled' });
     }
 
     const { data: rows, error } = await supabase
