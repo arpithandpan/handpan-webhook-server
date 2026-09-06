@@ -852,7 +852,8 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         const studentName = student?.full_name || payment.notes.name || fields.name;
         const classes = request?.classes ?? (parseInt(payment.notes.classes, 10) || null);
         const label = payment.notes.label || (classes ? `Fee for ${classes} classes` : 'Class fee');
-        const monthLabel = new Date().toLocaleDateString('en-IN', { month: 'short', year: 'numeric' }).replace(' ', '-');
+        const _d = new Date();
+        const monthLabel = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][_d.getMonth()] + '-' + _d.getFullYear();
         const symbol = { INR: '₹', USD: '$', EUR: '€', GBP: '£' }[currency] || (currency + ' ');
 
         const feeId = await generateId('fee_payments', 'FP');
@@ -864,7 +865,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
           classes,
           amount: amountMajor,
           currency,
-          payment_mode: isINR ? 'Razorpay' : 'Razorpay International',
+          payment_mode: isINR ? 'Razorpay UPI' : 'Razorpay International',
           paid: true,
           payment_date: today,
           razorpay_payment_id: payment.id,
@@ -901,7 +902,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
             reference_id: studentId,
             payer_name: studentName,
             amount: amountMajor,
-            payment_mode: 'Razorpay',
+            payment_mode: 'Razorpay UPI',
             type: 'income',
             category: 'classes',
             synced_from_razorpay: true,
