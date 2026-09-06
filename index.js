@@ -904,7 +904,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
             amount: amountMajor,
             payment_mode: 'Razorpay UPI',
             type: 'income',
-            category: 'classes',
+            category: 'class',
             synced_from_razorpay: true,
             date: today,
             description: `${label} — ${studentName} (${feeId})`
