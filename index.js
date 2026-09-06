@@ -78,43 +78,51 @@ async function generateSequentialIds(table, prefix, count) {
   return ids;
 }
 
-// ── RESOLVE STUDENT FEE ──
-// Single source of truth for the pay page. Amount is never accepted from
-// the client; both student routes below call this.
-async function resolveStudentFee(studentId) {
-  if (!studentId) return { error: 'not_found' };
+// ── RESOLVE FEE REQUEST ──
+// Single source of truth for the pay page. Amount and currency come from the
+// fee_requests row, never from the client.
+async function resolveFeeRequest(requestId) {
+  if (!requestId) return { error: 'not_found' };
 
-  const { data: s, error } = await supabase
-    .from('students')
-    .select('id, full_name, email, phone, status, level, archived, currency, program_fee, program_name, sessions, monthly_fee')
-    .eq('id', studentId)
+  const { data: r, error } = await supabase
+    .from('fee_requests')
+    .select('id, student_id, classes, amount, currency, note, status, paid_at, razorpay_payment_id')
+    .eq('id', requestId)
     .single();
 
-  if (error || !s || s.archived) return { error: 'not_found' };
-  if (s.status === 'Archived') return { error: 'not_found' };
+  if (error || !r) return { error: 'not_found' };
+  if (r.status === 'cancelled') return { error: 'not_found' };
 
-  // program_fee wins. Existing monthly students who don't have it set fall
-  // back to monthly_fee so the same page works for them without any re-entry.
-  const usingProgramFee = s.program_fee != null && Number(s.program_fee) > 0;
-  const amount = usingProgramFee ? Number(s.program_fee) : Number(s.monthly_fee) || 0;
-  if (amount <= 0) return { error: 'no_fee' };
+  const { data: s } = await supabase
+    .from('students')
+    .select('id, full_name, email, phone, level, archived')
+    .eq('id', r.student_id)
+    .single();
 
-  const currency = (s.currency || 'INR').toUpperCase();
-  const programName = s.program_name
-    || (usingProgramFee ? '12 Week Handpan Program' : 'Monthly handpan classes');
-  const feeLabel = usingProgramFee ? 'Program fee' : 'Monthly fee';
+  if (!s || s.archived) return { error: 'not_found' };
+
+  const amount = Number(r.amount) || 0;
+  if (amount <= 0) return { error: 'not_found' };
+
+  const classes = parseInt(r.classes, 10) || 0;
+  const label = classes === 1 ? 'Fee for 1 class' : `Fee for ${classes} classes`;
 
   return {
+    request: r,
     student: s,
     fee: {
+      requestId: r.id,
       studentId: s.id,
       name: s.full_name,
       level: s.level || null,
-      programName,
-      feeLabel,
-      sessions: s.sessions || null,
+      classes,
+      label,
+      note: r.note || null,
       amount,
-      currency
+      currency: (r.currency || 'INR').toUpperCase(),
+      status: r.status,
+      paidAt: r.paid_at || null,
+      paymentId: r.razorpay_payment_id || null
     }
   };
 }
@@ -629,41 +637,38 @@ app.get('/api/workshop/:id/availability', async (req, res) => {
   }
 });
 
-// ── STUDENT FEE INFO ──
-// Called by pay.html on page load. Returns only what the page needs to
-// render: name, program, amount, currency. Phone/email are never sent out.
-app.get('/api/student/:id/fee', async (req, res) => {
+// ── FEE REQUEST INFO ──
+// Called by pay.html on load. Returns only what the page needs.
+app.get('/api/fee-request/:id', async (req, res) => {
   try {
-    const result = await resolveStudentFee(req.params.id);
-    if (result.error === 'not_found') return res.status(404).json({ error: 'Student not found' });
-    if (result.error === 'no_fee') return res.status(404).json({ error: 'No fee set for this student yet' });
+    const result = await resolveFeeRequest(req.params.id);
+    if (result.error) return res.status(404).json({ error: 'Fee request not found' });
     return res.json(result.fee);
   } catch (err) {
-    console.error('student fee error:', err);
+    console.error('fee-request error:', err);
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// ── CREATE STUDENT PAYMENT LINK ──
-// Called by pay.html when the student taps Pay. Creates a Razorpay Payment
-// Link in the student's own currency for the amount stored in Supabase, and
-// stashes studentId in notes so the webhook can route it without guessing.
-app.post('/api/create-student-payment-link', express.json(), async (req, res) => {
+// ── CREATE FEE PAYMENT LINK ──
+// Called by pay.html on Pay. Creates a Razorpay Payment Link for exactly this
+// request, in its currency, and stashes requestId in notes for the webhook.
+app.post('/api/create-fee-payment-link', express.json(), async (req, res) => {
   try {
-    const { studentId } = req.body || {};
-    const result = await resolveStudentFee(studentId);
-    if (result.error) return res.status(404).json({ error: 'Student not found or no fee set' });
+    const { requestId } = req.body || {};
+    const result = await resolveFeeRequest(requestId);
+    if (result.error) return res.status(404).json({ error: 'Fee request not found' });
 
-    const { student, fee } = result;
+    const { request, student, fee } = result;
+    if (request.status === 'paid') {
+      return res.status(409).json({ error: 'This fee has already been paid' });
+    }
+
     const isINR = fee.currency === 'INR';
-
-    // Razorpay wants the smallest unit: paise for INR, cents for USD/EUR/etc.
-    const amountMinor = Math.round(fee.amount * 100);
+    const amountMinor = Math.round(fee.amount * 100);   // paise or cents
 
     const customer = { name: student.full_name };
     if (student.email) customer.email = student.email;
-    // Razorpay's SMS reminders are India-only. For international students
-    // we still pass the contact if we have it, but don't try to SMS them.
     if (student.phone) customer.contact = student.phone;
 
     const auth = Buffer.from(
@@ -679,38 +684,43 @@ app.post('/api/create-student-payment-link', express.json(), async (req, res) =>
       body: JSON.stringify({
         amount: amountMinor,
         currency: fee.currency,
-        description: `${fee.programName} — ${student.full_name} (${student.id})`,
+        description: `${fee.label} — ${student.full_name} (${request.id})`,
         customer,
         notify: { sms: isINR && !!student.phone, email: !!student.email },
         reminder_enable: false,
-        callback_url: `https://arpitpandey.com/pages/pay?s=${encodeURIComponent(student.id)}`,
+        callback_url: `https://arpitpandey.com/pages/pay?r=${encodeURIComponent(request.id)}`,
         callback_method: 'get',
         notes: {
-          kind: 'student_fee',
+          kind: 'fee_request',
+          requestId: request.id,
           studentId: student.id,
           name: student.full_name,
           email: student.email || '',
-          programName: fee.programName,
-          feeLabel: fee.feeLabel,
+          classes: String(fee.classes),
+          label: fee.label,
           currency: fee.currency,
-          amount: String(fee.amount),
-          sessions: fee.sessions != null ? String(fee.sessions) : ''
+          amount: String(fee.amount)
         }
       })
     });
 
     const rzpData = await rzpRes.json();
     if (!rzpRes.ok) {
-      console.error('Razorpay student payment link error:', rzpData);
+      console.error('Razorpay fee payment link error:', rzpData);
       return res.status(502).json({
         error: 'Failed to create payment link',
         detail: rzpData.error?.description || 'Unknown error'
       });
     }
 
+    // Remember which link belongs to this request (handy for support).
+    await supabase.from('fee_requests')
+      .update({ razorpay_link_id: rzpData.id })
+      .eq('id', request.id);
+
     return res.json({ short_url: rzpData.short_url, id: rzpData.id });
   } catch (err) {
-    console.error('create-student-payment-link error:', err);
+    console.error('create-fee-payment-link error:', err);
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -807,78 +817,88 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         }
       }
 
-      // ── STUDENT FEE PAYMENT (from pay.html) ──
-      // Payment Links created by /api/create-student-payment-link carry
-      // notes.kind = 'student_fee'. These are online-class fees, not workshop
-      // bookings, so they skip all the workshop matching below and land in
-      // fee_payments directly. Returns early on purpose.
-      if (payment.notes && payment.notes.kind === 'student_fee') {
-        const studentId = payment.notes.studentId || null;
+      // ── FEE REQUEST PAYMENT (from pay.html) ──
+      // Payment Links created by /api/create-fee-payment-link carry
+      // notes.kind = 'fee_request'. Class fees, not workshop bookings, so
+      // they skip the workshop matching below. Returns early on purpose.
+      if (payment.notes && payment.notes.kind === 'fee_request') {
+        const requestId = payment.notes.requestId || null;
         const currency = (payment.currency || payment.notes.currency || 'INR').toUpperCase();
         const amountMajor = payment.amount / 100;   // paise → rupees, cents → dollars
         const isINR = currency === 'INR';
 
-        // Belt-and-braces idempotency on our own unique index.
+        // Idempotency on our own unique index.
         const { data: dup } = await supabase
           .from('fee_payments')
           .select('id')
           .eq('razorpay_payment_id', payment.id)
           .limit(1);
         if (dup && dup.length > 0) {
-          console.log('Duplicate student fee payment — skipping:', payment.id);
+          console.log('Duplicate fee request payment — skipping:', payment.id);
           return res.json({ received: true, skipped: 'duplicate' });
         }
 
-        const { data: student } = await supabase
-          .from('students')
-          .select('id, full_name, sessions')
-          .eq('id', studentId)
+        const { data: request } = await supabase
+          .from('fee_requests')
+          .select('id, student_id, classes, note')
+          .eq('id', requestId)
           .single();
 
+        const studentId = request?.student_id || payment.notes.studentId || null;
+        const { data: student } = studentId
+          ? await supabase.from('students').select('id, full_name').eq('id', studentId).single()
+          : { data: null };
+
         const studentName = student?.full_name || payment.notes.name || fields.name;
-        const sessions = parseInt(payment.notes.sessions, 10) || student?.sessions || null;
+        const classes = request?.classes ?? (parseInt(payment.notes.classes, 10) || null);
+        const label = payment.notes.label || (classes ? `Fee for ${classes} classes` : 'Class fee');
         const monthLabel = new Date().toLocaleDateString('en-IN', { month: 'short', year: 'numeric' }).replace(' ', '-');
         const symbol = { INR: '₹', USD: '$', EUR: '€', GBP: '£' }[currency] || (currency + ' ');
 
         const feeId = await generateId('fee_payments', 'FP');
         const { error: feeErr } = await supabase.from('fee_payments').insert({
           id: feeId,
-          student_id: student?.id || studentId,
+          student_id: studentId,
           student_name: studentName,
           month: monthLabel,
-          classes: sessions,
+          classes,
           amount: amountMajor,
           currency,
           payment_mode: isINR ? 'Razorpay' : 'Razorpay International',
           paid: true,
           payment_date: today,
           razorpay_payment_id: payment.id,
-          description: `${payment.notes.programName || 'Handpan classes'} · paid via pay page · ${payment.id}`
+          description: `${label}${request?.note ? ' · ' + request.note : ''} · ${requestId} · ${payment.id}`
         });
 
         if (feeErr) {
           console.error('Error saving fee payment:', feeErr.message);
           await supabase.from('notifications').insert({
             type: 'warning',
-            message: `⚠️ Failed to save fee payment for ${studentName} — Payment ${payment.id}. Error: ${feeErr.message}`,
+            message: `⚠️ Failed to save fee payment for ${studentName} — ${requestId} / ${payment.id}. Error: ${feeErr.message}`,
             read: false
           });
           return res.status(500).json({ error: 'Failed to save fee payment', detail: feeErr.message });
         }
 
-        // The income ledger (payments table) is in rupees. INR fees go in
-        // directly. Foreign-currency fees are NOT inserted here — Razorpay's
-        // INR settlement amount (after its FX) isn't in the webhook, and
-        // putting "499" in an INR ledger would understate revenue by ~80x.
-        // Arpit adds that row from the settlement report; the notification
-        // below reminds him.
+        // Mark the request paid so the link can't be used twice.
+        if (requestId) {
+          await supabase.from('fee_requests')
+            .update({ status: 'paid', paid_at: new Date().toISOString(), razorpay_payment_id: payment.id, fee_payment_id: feeId })
+            .eq('id', requestId);
+        }
+
+        // Income ledger (payments table) is in rupees. INR goes straight in.
+        // Foreign currency is NOT inserted — Razorpay's INR settlement amount
+        // isn't in the webhook, and "499" in a rupee ledger would be wrong.
+        // The notification reminds Arpit to add it from the settlement report.
         if (isINR) {
           const { data: payNum } = await supabase.rpc('next_payment_number');
           const paymentId = payNum != null ? `PAY-${String(payNum).padStart(3, '0')}` : `PAY-${Date.now()}`;
           const { error: payErr } = await supabase.from('payments').insert({
             id: paymentId,
             razorpay_payment_id: payment.id,
-            reference_id: student?.id || studentId,
+            reference_id: studentId,
             payer_name: studentName,
             amount: amountMajor,
             payment_mode: 'Razorpay',
@@ -886,7 +906,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
             category: 'classes',
             synced_from_razorpay: true,
             date: today,
-            description: `Class fee ${feeId} — ${studentName}`
+            description: `${label} — ${studentName} (${feeId})`
           });
           if (payErr) console.error('Error saving payment record:', payErr.message);
         }
@@ -894,12 +914,12 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         await supabase.from('notifications').insert({
           type: 'payment',
           message: isINR
-            ? `✅ Fee received: ₹${amountMajor} from ${studentName} (${feeId})`
-            : `🌍 International fee received: ${symbol}${amountMajor} ${currency} from ${studentName} (${feeId}). Add the INR settlement to Payments once Razorpay settles, and issue the EXP invoice.`,
+            ? `✅ Fee received: ₹${amountMajor} from ${studentName} — ${label} (${feeId})`
+            : `🌍 International fee received: ${symbol}${amountMajor} ${currency} from ${studentName} — ${label} (${feeId}). Add the INR settlement to Payments once Razorpay settles, and issue the EXP invoice.`,
           read: false
         });
 
-        return res.json({ received: true, routed: 'student_fee', feeId });
+        return res.json({ received: true, routed: 'fee_request', requestId, feeId });
       }
 
       // 3. Route general payments to unassigned
