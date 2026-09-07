@@ -19,6 +19,18 @@ app.use((req, res, next) => {
   next();
 });
 
+// ── DATES (IST) ──
+// Railway runs in UTC. Anything that is "today" or "this month" for the
+// business must use India time, or it is wrong between midnight and 5:30 AM.
+function nowIST() { return new Date(Date.now() + 5.5 * 60 * 60 * 1000); }
+function todayISTDate() { return nowIST().toISOString().slice(0, 10); }
+function monthYM(d) { return d.toISOString().slice(0, 7); }              // 'YYYY-MM'
+function monthLong(ym) {                                                  // 'YYYY-MM' → 'September 2026'
+  const m = String(ym || '').match(/^(\d{4})-(\d{2})$/); if (!m) return '';
+  const names = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  return names[Number(m[2]) - 1] + ' ' + m[1];
+}
+
 // ── SUPABASE ──
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -87,7 +99,7 @@ async function resolveFeeRequest(requestId) {
 
   const { data: r, error } = await supabase
     .from('fee_requests')
-    .select('id, student_id, classes, amount, currency, note, status, paid_at, razorpay_payment_id')
+    .select('id, student_id, classes, amount, currency, month, note, status, paid_at, razorpay_payment_id')
     .eq('id', requestId)
     .single();
 
@@ -118,6 +130,8 @@ async function resolveFeeRequest(requestId) {
       level: s.level || null,
       classes,
       label,
+      month: r.month || null,
+      monthLabel: monthLong(r.month),
       note: r.note || null,
       amount,
       currency: (r.currency || 'INR').toUpperCase(),
@@ -306,7 +320,7 @@ async function findWorkshopByDateAndAmount(amountINR, paymentDateStr) {
 // Even if new columns are added to Supabase later, the raw_payload always has everything.
 async function saveParticipant(participantId, fields, workshopId, matchMethod, rawPayment) {
   const { name, phone, email, amount, bringingOwn } = fields;
-  const today = new Date().toISOString().split('T')[0];
+  const today = todayISTDate();
 
   // Default to "1 participant, 0 observers" for old-flow payments where
   // notes.participants / notes.observers weren't set.
@@ -876,7 +890,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
     if (event.event === 'payment.captured') {
       const payment = event.payload.payment.entity;
       const fields = extractPaymentFields(payment);
-      const today = new Date().toISOString().split('T')[0];
+      const today = todayISTDate();
 
       console.log('Payment:', payment.id, '₹' + fields.amount, 'from', fields.name);
       console.log('Notes:', JSON.stringify(payment.notes));
@@ -919,7 +933,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
 
         const { data: request } = await supabase
           .from('fee_requests')
-          .select('id, student_id, classes, note')
+          .select('id, student_id, classes, month, note')
           .eq('id', requestId)
           .single();
 
@@ -931,8 +945,10 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         const studentName = student?.full_name || payment.notes.name || fields.name;
         const classes = request?.classes ?? (parseInt(payment.notes.classes, 10) || null);
         const label = payment.notes.label || (classes ? `Fee for ${classes} classes` : 'Class fee');
-        const _d = new Date();
-        const monthLabel = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][_d.getMonth()] + '-' + _d.getFullYear();
+        // Fee month comes from the request (chosen when the link was made).
+        // Old links without one fall back to the current month in India.
+        const feeMonth = (request?.month && /^\d{4}-\d{2}$/.test(request.month)) ? request.month : monthYM(nowIST());
+        const monthLabel = feeMonth;
         const symbol = { INR: '₹', USD: '$', EUR: '€', GBP: '£' }[currency] || (currency + ' ');
 
         const feeId = await generateId('fee_payments', 'FP');
@@ -1002,7 +1018,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         // Auto invoice: number, row, PDF, storage, email. Never throws; any
         // failure becomes a dashboard notification and the fee stays saved.
         const invoice = await invoiceFeePayment(supabase, {
-          feeId, studentName, student, classes: classes || 0, amountMajor, currency, payment, today
+          feeId, studentName, student, classes: classes || 0, amountMajor, currency, payment, today, feeMonth
         });
 
         return res.json({ received: true, routed: 'fee_request', requestId, feeId, invoice });
