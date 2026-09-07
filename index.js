@@ -1,6 +1,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
+const { invoiceWorkshopBooking, invoiceFeePayment } = require('./invoice-service');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -846,7 +847,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
 
         const studentId = request?.student_id || payment.notes.studentId || null;
         const { data: student } = studentId
-          ? await supabase.from('students').select('id, full_name').eq('id', studentId).single()
+          ? await supabase.from('students').select('id, full_name, email, phone, country').eq('id', studentId).single()
           : { data: null };
 
         const studentName = student?.full_name || payment.notes.name || fields.name;
@@ -916,11 +917,17 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
           type: 'payment',
           message: isINR
             ? `✅ Fee received: ₹${amountMajor} from ${studentName} — ${label} (${feeId})`
-            : `🌍 International fee received: ${symbol}${amountMajor} ${currency} from ${studentName} — ${label} (${feeId}). Add the INR settlement to Payments once Razorpay settles, and issue the EXP invoice.`,
+            : `🌍 International fee received: ${symbol}${amountMajor} ${currency} from ${studentName} — ${label} (${feeId}). Add the INR settlement to Payments once Razorpay settles.`,
           read: false
         });
 
-        return res.json({ received: true, routed: 'fee_request', requestId, feeId });
+        // Auto invoice: number, row, PDF, storage, email. Never throws; any
+        // failure becomes a dashboard notification and the fee stays saved.
+        const invoice = await invoiceFeePayment(supabase, {
+          feeId, studentName, student, classes: classes || 0, amountMajor, currency, payment, today
+        });
+
+        return res.json({ received: true, routed: 'fee_request', requestId, feeId, invoice });
       }
 
       // 3. Route general payments to unassigned
@@ -1079,7 +1086,13 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         read: false
       });
 
-      return res.json({ received: true, routed: 'workshop', workshopId, participantIds, paymentId });
+      // 10. Auto invoice to the lead for the whole booking. Never throws; any
+      // failure becomes a dashboard notification and the booking stays saved.
+      const invoice = await invoiceWorkshopBooking(supabase, {
+        workshopId, fields, payment, participantIds, today
+      });
+
+      return res.json({ received: true, routed: 'workshop', workshopId, participantIds, paymentId, invoice });
     }
 
     // ── PAYMENT FAILED ──
