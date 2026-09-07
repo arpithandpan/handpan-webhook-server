@@ -1,7 +1,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
-const { invoiceWorkshopBooking, invoiceFeePayment } = require('./invoice-service');
+const { invoiceWorkshopBooking, invoiceFeePayment, invoiceFromRow, getPdf, renderAndStore, emailInvoice, pdfFilename, buildInvoicePdf } = require('./invoice-service');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -14,7 +14,7 @@ const PORT = process.env.PORT || 3000;
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
@@ -687,7 +687,8 @@ app.post('/api/create-fee-payment-link', express.json(), async (req, res) => {
         currency: fee.currency,
         description: `${fee.label} — ${student.full_name} (${request.id})`,
         customer,
-        notify: { sms: isINR && !!student.phone, email: !!student.email },
+        // Student is already on pay.html, no need for Razorpay's payment requested SMS/email
+        notify: { sms: false, email: false },
         reminder_enable: false,
         callback_url: `https://arpitpandey.com/pages/pay?r=${encodeURIComponent(request.id)}`,
         callback_method: 'get',
@@ -772,6 +773,83 @@ app.post('/api/waitlist', express.json(), async (req, res) => {
   } catch (err) {
     console.error('waitlist error:', err);
     return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── DASHBOARD INVOICE ENDPOINTS ──
+// Called by dashboard.html with the logged-in user's Supabase token. The
+// token is verified against Supabase Auth; only a non-viewer account may
+// render or send invoices. No separate secret to manage.
+const VIEWER_EMAILS = (process.env.DASHBOARD_VIEWER_EMAILS || 'arpitbam@gmail.com')
+  .split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
+
+async function requireAdmin(req, res, next) {
+  try {
+    const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+    if (!token) return res.status(401).json({ error: 'Sign in required' });
+    const { data, error } = await supabase.auth.getUser(token);
+    const email = (data?.user?.email || '').toLowerCase();
+    if (error || !email) return res.status(401).json({ error: 'Session expired, sign in again' });
+    if (VIEWER_EMAILS.includes(email)) return res.status(403).json({ error: 'Viewer access only' });
+    req.adminEmail = email;
+    next();
+  } catch (e) {
+    console.error('requireAdmin error:', e.message);
+    return res.status(401).json({ error: 'Could not verify session' });
+  }
+}
+
+async function loadInvoiceRow(id) {
+  const { data, error } = await supabase.from('invoices').select('*').eq('id', id).single();
+  if (error || !data) return null;
+  return data;
+}
+
+// PDF for an existing invoice: stored file if present, otherwise rendered now.
+app.get('/api/invoice/:id/pdf', requireAdmin, async (req, res) => {
+  try {
+    const row = await loadInvoiceRow(req.params.id);
+    if (!row) return res.status(404).json({ error: 'Invoice not found' });
+    const fresh = req.query.fresh === '1' || row.cancelled;   // cancelled: always re-render so the watermark shows
+    const { pdf } = fresh ? await renderAndStore(supabase, row) : await getPdf(supabase, row);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'inline; filename="' + pdfFilename(row) + '"');
+    return res.send(pdf);
+  } catch (err) {
+    console.error('invoice pdf error:', err);
+    return res.status(500).json({ error: err.message || 'Could not build the PDF' });
+  }
+});
+
+// Send (or resend) an existing invoice by email. Body may carry { to } to override.
+app.post('/api/invoice/:id/send', requireAdmin, express.json(), async (req, res) => {
+  try {
+    const row = await loadInvoiceRow(req.params.id);
+    if (!row) return res.status(404).json({ error: 'Invoice not found' });
+    if (row.cancelled) return res.status(409).json({ error: 'This invoice is cancelled' });
+    const { pdf } = await renderAndStore(supabase, row);   // always current data
+    const to = await emailInvoice(supabase, row, pdf, req.body?.to);
+    await supabase.from('notifications').insert({ type: 'info', message: `🧾 Invoice ${pdfFilename(row).split('_')[0]} sent to ${to} (${row.billed_name})`, read: false });
+    return res.json({ ok: true, to });
+  } catch (err) {
+    console.error('invoice send error:', err);
+    try { await supabase.from('invoices').update({ email_error: err.message }).eq('id', req.params.id); } catch (e) {}
+    return res.status(500).json({ error: err.message || 'Could not send the invoice' });
+  }
+});
+
+// Preview an unsaved invoice from the editor. Body is a row-shaped object.
+app.post('/api/invoice/preview', requireAdmin, express.json({ limit: '200kb' }), async (req, res) => {
+  try {
+    const body = req.body || {};
+    const row = { ...body, invoice_number: Number(body.invoice_number) || 0, id: body.id || 'preview' };
+    const pdf = await buildInvoicePdf(invoiceFromRow(row));
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'inline; filename="preview.pdf"');
+    return res.send(pdf);
+  } catch (err) {
+    console.error('invoice preview error:', err);
+    return res.status(500).json({ error: err.message || 'Could not build the preview' });
   }
 });
 
