@@ -240,9 +240,10 @@ function buildInvoicePdf(inv) {
     if (inv.servicePeriod) meta.push(['Period', inv.servicePeriod]);
     doc.fontSize(10.5);
     let valW = 0; meta.forEach(m => { doc.font('B'); valW = Math.max(valW, doc.widthOfString(m[1])); });
+    valW = Math.ceil(valW) + 4;   // a little slack so the widest value never wraps
     const valX = R - valW;
     meta.forEach((m, i) => {
-      doc.font('R').fillColor(T.muted).text(m[0], valX - 58, y + 33 + i * 15.5, { width: 52, align: 'right' });
+      doc.font('R').fillColor(T.muted).text(m[0], valX - 60, y + 33 + i * 15.5, { width: 54, align: 'right' });
       doc.font('B').fillColor(T.ink).text(m[1], valX, y + 33 + i * 15.5, { width: valW });
     });
     y = MY + 33 + Math.max(hdr.length, meta.length) * 15.5 + 12;

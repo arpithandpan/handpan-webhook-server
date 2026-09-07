@@ -18,6 +18,10 @@ function monthLabel(iso) {
   if (isNaN(d)) return '';
   return MONTHS[d.getMonth()] + ' ' + d.getFullYear();
 }
+// Server runs in UTC. Invoice and payment dates should be India's date.
+function todayIST() {
+  return new Date(Date.now() + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
 function fmtNo(n) { return 'INV-' + String(n).padStart(3, '0'); }
 function slug(s) { return (s || 'invoice').replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-|-$/g, '') || 'invoice'; }
 function esc(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
@@ -89,7 +93,7 @@ async function createAndSendInvoice(supabase, job) {
       return { skipped: 'exists', invoiceNumber: existing[0].invoice_number };
     }
 
-    const today = new Date().toISOString().slice(0, 10);
+    const today = todayIST();
     const currency = (job.currency || 'INR').toUpperCase();
     const lines = (job.lines || []).map(l => ({ desc: l.desc, qty: Number(l.qty) || 1, rate: Number(l.rate) || 0 }));
     const total = Math.round(lines.reduce((a, l) => a + l.qty * l.rate, 0) * 100) / 100;
@@ -210,7 +214,7 @@ async function invoiceWorkshopBooking(supabase, { workshopId, fields, payment, p
   const oCount = fields.observerCount ?? 0;
   const pPrice = fields.participantPrice != null ? fields.participantPrice : Number(ws?.price_per_head) || 0;
   const oPrice = Number(ws?.observer_price) || 0;
-  const period = monthLabel(ws?.date) || monthLabel(today);
+  const period = monthLabel(ws?.date) || monthLabel(todayIST());
 
   const lines = [];
   if (pCount > 0) lines.push({ desc: 'Handpan Workshop, ' + period, qty: pCount, rate: pPrice });
@@ -229,7 +233,7 @@ async function invoiceWorkshopBooking(supabase, { workshopId, fields, payment, p
     razorpayPaymentId: payment.id,
     billed: { name: fields.name, email: fields.email, phone: fields.phone },
     currency: 'INR',
-    paymentDate: today,
+    paymentDate: todayIST(),
     paymentMode: 'Razorpay UPI',
     servicePeriod: period,
     lines
@@ -254,9 +258,9 @@ async function invoiceFeePayment(supabase, { feeId, studentName, student, classe
     razorpayPaymentId: payment.id,
     billed: { name: studentName, email: student?.email || payment.notes?.email || null, phone: student?.phone || null, country: student?.country || '' },
     currency,
-    paymentDate: today,
+    paymentDate: todayIST(),
     paymentMode: currency === 'INR' ? 'Razorpay UPI' : 'Razorpay International',
-    servicePeriod: monthLabel(today),
+    servicePeriod: monthLabel(todayIST()),
     lines
   });
 }
