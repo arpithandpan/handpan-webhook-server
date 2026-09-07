@@ -66,6 +66,64 @@ async function sendViaResend({ to, subject, text, html, filename, pdfBuffer }) {
   return data.id || null;
 }
 
+// ── Shared helpers used by both the webhook flow and the dashboard endpoints ──
+
+// Map an invoices table row to what buildInvoicePdf expects.
+function invoiceFromRow(r) {
+  const lines = (r.line_items || []).map(l => ({ desc: l.desc || l.description || '', sub: l.sub || '', qty: Number(l.qty) || 1, rate: Number(l.rate) || 0 }));
+  const status = r.cancelled ? 'cancelled' : (r.payment_received_date ? 'paid' : 'due');
+  return {
+    number: fmtNo(r.invoice_number),
+    date: r.invoice_date,
+    status,
+    dueDate: r.due_date || undefined,
+    cancelledAt: r.cancelled_at ? String(r.cancelled_at).slice(0, 10) : '',
+    currency: (r.currency || 'INR').toUpperCase(),
+    billed: {
+      name: r.billed_name || '', company: r.billed_company || '', address: r.billed_address || r.billed_city || '',
+      state: r.billed_state || '', country: r.billed_country || '', email: r.billed_email || '', phone: r.billed_phone || '',
+      gstin: r.billed_gstin || ''
+    },
+    servicePeriod: r.service_period || '',
+    payment: { date: r.payment_received_date || '', mode: r.payment_mode || '', ref: r.payment_reference || '' },
+    amountPaid: Number(r.amount_paid) || 0,
+    lines,
+    notes: r.notes || '',
+    showPan: !!r.show_pan || !!r.pan, showBank: !!r.show_bank, showAddress: !!r.show_address
+  };
+}
+function pdfFilename(r) { return fmtNo(r.invoice_number) + '_' + slug(r.billed_name) + '.pdf'; }
+function pdfStoragePath(r) { return String(r.invoice_date || todayIST()).slice(0, 4) + '/' + pdfFilename(r); }
+
+// Render the PDF for a row and store it. Returns { pdf, path }.
+async function renderAndStore(supabase, row) {
+  const pdf = await buildInvoicePdf(invoiceFromRow(row));
+  const path = pdfStoragePath(row);
+  const { error } = await supabase.storage.from(BUCKET).upload(path, pdf, { contentType: 'application/pdf', upsert: true });
+  if (error) throw new Error('Storage upload failed: ' + error.message);
+  await supabase.from('invoices').update({ pdf_path: path }).eq('id', row.id);
+  return { pdf, path };
+}
+
+// Fetch the stored PDF for a row, or render (and store) it if missing.
+async function getPdf(supabase, row) {
+  if (row.pdf_path) {
+    const { data, error } = await supabase.storage.from(BUCKET).download(row.pdf_path);
+    if (!error && data) return { pdf: Buffer.from(await data.arrayBuffer()), path: row.pdf_path };
+  }
+  return renderAndStore(supabase, row);
+}
+
+// Email a row's PDF. Returns the address it went to. Throws on failure.
+async function emailInvoice(supabase, row, pdf, to) {
+  const addr = (to || row.billed_email || '').trim();
+  if (!addr) throw new Error('No email address on this invoice');
+  const no = fmtNo(row.invoice_number);
+  await sendViaResend({ to: addr, subject: 'Your invoice from Arpit Pandey (' + no + ')', text: emailText(no), html: emailHtml(no), filename: pdfFilename(row), pdfBuffer: pdf });
+  await supabase.from('invoices').update({ sent: true, sent_at: new Date().toISOString(), email_sent_to: addr, email_error: null }).eq('id', row.id);
+  return addr;
+}
+
 /**
  * Create, store and email one invoice.
  *
@@ -265,4 +323,4 @@ async function invoiceFeePayment(supabase, { feeId, studentName, student, classe
   });
 }
 
-module.exports = { createAndSendInvoice, invoiceWorkshopBooking, invoiceFeePayment };
+module.exports = { createAndSendInvoice, invoiceWorkshopBooking, invoiceFeePayment, invoiceFromRow, renderAndStore, getPdf, emailInvoice, pdfFilename, buildInvoicePdf };
