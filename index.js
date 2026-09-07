@@ -1018,7 +1018,8 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         // Auto invoice: number, row, PDF, storage, email. Never throws; any
         // failure becomes a dashboard notification and the fee stays saved.
         const invoice = await invoiceFeePayment(supabase, {
-          feeId, studentName, student, classes: classes || 0, amountMajor, currency, payment, today, feeMonth
+          feeId, studentName, student, classes: classes || 0, amountMajor, currency, payment, today, feeMonth,
+          payerEmail: fields.email || null   // what the student typed on Razorpay's page, if the student row has no email
         });
 
         return res.json({ received: true, routed: 'fee_request', requestId, feeId, invoice });
