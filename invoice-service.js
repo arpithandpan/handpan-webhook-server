@@ -89,13 +89,6 @@ async function createAndSendInvoice(supabase, job) {
       return { skipped: 'exists', invoiceNumber: existing[0].invoice_number };
     }
 
-    // 1. Reserve the next number from the shared atomic counter.
-    const { data: num, error: numErr } = await supabase.rpc('next_invoice_number');
-    const invoiceNumber = Number(Array.isArray(num) ? num[0] : num);
-    if (numErr || !(invoiceNumber > 0)) throw new Error('Could not reserve invoice number: ' + (numErr?.message || 'empty'));
-    const no = fmtNo(invoiceNumber);
-
-    // 2. Build the row.
     const today = new Date().toISOString().slice(0, 10);
     const currency = (job.currency || 'INR').toUpperCase();
     const lines = (job.lines || []).map(l => ({ desc: l.desc, qty: Number(l.qty) || 1, rate: Number(l.rate) || 0 }));
@@ -103,7 +96,7 @@ async function createAndSendInvoice(supabase, job) {
     const words = amountInWords(total, currency);
 
     const row = {
-      invoice_number: invoiceNumber,
+      invoice_number: null,
       invoice_date: today,
       source_table: job.sourceTable || null,
       source_id: job.sourceId || null,
@@ -123,12 +116,33 @@ async function createAndSendInvoice(supabase, job) {
       sent: false
     };
 
-    const { data: inserted, error: insErr } = await supabase.from('invoices').insert(row).select('id').single();
-    if (insErr) {
-      if (insErr.code === '23505') { console.log('Invoice race for', tag, 'already inserted'); return { skipped: 'exists' }; }
-      throw new Error('Insert failed: ' + insErr.message);
+    // 1 + 2. Reserve a number from the shared atomic counter and insert.
+    // If the number is already taken (counter drifted behind the table),
+    // take the next one and try again, a few times. A duplicate on
+    // payment_reference means another webhook delivery beat us: skip.
+    let invoiceId = null, invoiceNumber = null, no = null;
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      const { data: num, error: numErr } = await supabase.rpc('next_invoice_number');
+      invoiceNumber = Number(Array.isArray(num) ? num[0] : num);
+      if (numErr || !(invoiceNumber > 0)) throw new Error('Could not reserve invoice number: ' + (numErr?.message || 'empty'));
+      no = fmtNo(invoiceNumber);
+      row.invoice_number = invoiceNumber;
+
+      const { data: inserted, error: insErr } = await supabase.from('invoices').insert(row).select('id').single();
+      if (!insErr) { invoiceId = inserted.id; break; }
+
+      const msg = (insErr.message || '') + ' ' + (insErr.details || '');
+      if (insErr.code === '23505' && /payment_reference/.test(msg)) {
+        console.log('Invoice already created by another delivery for', tag);
+        return { skipped: 'exists' };
+      }
+      if (insErr.code === '23505' && /invoice_number/.test(msg)) {
+        console.warn('Invoice number', no, 'already taken, retrying (attempt ' + attempt + ')');
+        continue;
+      }
+      throw new Error('Insert failed: ' + insErr.message + (insErr.details ? ' (' + insErr.details + ')' : ''));
     }
-    const invoiceId = inserted.id;
+    if (!invoiceId) throw new Error('Could not find a free invoice number after 5 attempts');
 
     // 3. PDF.
     const pdf = await buildInvoicePdf({
