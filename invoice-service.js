@@ -299,7 +299,7 @@ async function invoiceWorkshopBooking(supabase, { workshopId, fields, payment, p
 }
 
 // Class fee from pay.html, INR or foreign currency.
-async function invoiceFeePayment(supabase, { feeId, studentName, student, classes, amountMajor, currency, payment, today, feeMonth }) {
+async function invoiceFeePayment(supabase, { feeId, studentName, student, classes, amountMajor, currency, payment, today, feeMonth, payerEmail }) {
   // Show qty = classes only when the per-class rate divides cleanly, so the
   // invoice total always equals exactly what was paid. Otherwise one line at
   // the full amount with the class count in the description.
@@ -314,7 +314,7 @@ async function invoiceFeePayment(supabase, { feeId, studentName, student, classe
     sourceTable: 'fee_payments',
     sourceId: feeId,
     razorpayPaymentId: payment.id,
-    billed: { name: studentName, email: student?.email || payment.notes?.email || null, phone: student?.phone || null, country: student?.country || '' },
+    billed: { name: studentName, email: student?.email || payment.notes?.email || payerEmail || null, phone: student?.phone || payment.contact || null, country: student?.country || '' },
     currency,
     paymentDate: todayIST(),
     paymentMode: currency === 'INR' ? 'Razorpay UPI' : 'Razorpay International',
