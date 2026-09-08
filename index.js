@@ -127,6 +127,8 @@ async function resolveFeeRequest(requestId) {
       requestId: r.id,
       studentId: s.id,
       name: s.full_name,
+      email: s.email || '',
+      phone: s.phone || '',
       level: s.level || null,
       classes,
       label,
@@ -741,6 +743,89 @@ app.post('/api/create-fee-payment-link', express.json(), async (req, res) => {
   }
 });
 
+// ── CREATE FEE ORDER (Razorpay Checkout popup) ──
+// Called by pay.html on Pay. Creates a Razorpay Order for this request and
+// returns what checkout.js needs. The popup opens on pay.html itself with the
+// student's name, phone and email prefilled, so nothing is typed twice.
+// Phone and email may have been corrected on the page; they go into notes
+// and are used for the invoice (student row on file is CC'd).
+app.post('/api/create-fee-order', express.json(), async (req, res) => {
+  try {
+    const { requestId, phone, email } = req.body || {};
+    const result = await resolveFeeRequest(requestId);
+    if (result.error) return res.status(404).json({ error: 'Fee request not found' });
+
+    const { request, student, fee } = result;
+    if (request.status === 'paid') {
+      return res.status(409).json({ error: 'This fee has already been paid' });
+    }
+    if (request.status === 'cancelled') {
+      return res.status(410).json({ error: 'This payment link was cancelled' });
+    }
+
+    const payerEmail = String(email || student.email || '').trim();
+    const payerPhone = String(phone || student.phone || '').trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(payerEmail)) {
+      return res.status(400).json({ error: 'Enter a valid email address' });
+    }
+    if (payerPhone.replace(/\D/g, '').length < 8) {
+      return res.status(400).json({ error: 'Enter a valid phone number' });
+    }
+
+    const amountMinor = Math.round(fee.amount * 100);
+    const notes = {
+      kind: 'fee_request',
+      requestId: request.id,
+      studentId: student.id,
+      name: student.full_name,
+      email: payerEmail,
+      phone: payerPhone,
+      classes: String(fee.classes),
+      label: fee.label,
+      currency: fee.currency,
+      amount: String(fee.amount),
+      month: request.month || ''
+    };
+
+    const auth = Buffer.from(
+      `${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`
+    ).toString('base64');
+
+    const rzpRes = await fetch('https://api.razorpay.com/v1/orders', {
+      method: 'POST',
+      headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        amount: amountMinor,
+        currency: fee.currency,
+        receipt: request.id,
+        notes
+      })
+    });
+    const order = await rzpRes.json();
+    if (!rzpRes.ok) {
+      console.error('Razorpay fee order error:', order);
+      return res.status(502).json({ error: 'Failed to start payment', detail: order.error?.description || 'Unknown error' });
+    }
+
+    await supabase.from('fee_requests').update({ razorpay_order_id: order.id }).eq('id', request.id);
+
+    return res.json({
+      orderId: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      keyId: process.env.RAZORPAY_KEY_ID,
+      name: student.full_name,
+      email: payerEmail,
+      phone: payerPhone,
+      description: `${fee.label} — ${student.full_name}`,
+      notes
+    });
+  } catch (err) {
+    console.error('create-fee-order error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ── WAITLIST SIGNUP ──
 // Called by book.html when someone on a sold-out workshop submits the
 // "which month works for you" prompt. Always source: 'Website' here — the
@@ -889,6 +974,16 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
     // ── PAYMENT CAPTURED ──
     if (event.event === 'payment.captured') {
       const payment = event.payload.payment.entity;
+      // Checkout (Orders API) payments: notes live on the order. Copy them
+      // onto the payment if checkout.js did not pass them through.
+      if ((!payment.notes || !Object.keys(payment.notes).length) && payment.order_id) {
+        try {
+          const auth = Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString('base64');
+          const oRes = await fetch(`https://api.razorpay.com/v1/orders/${payment.order_id}`, { headers: { 'Authorization': `Basic ${auth}` } });
+          const order = await oRes.json();
+          if (oRes.ok && order.notes && Object.keys(order.notes).length) payment.notes = order.notes;
+        } catch (e) { console.error('order notes fetch failed:', e.message); }
+      }
       const fields = extractPaymentFields(payment);
       const today = todayISTDate();
 
@@ -1017,9 +1112,20 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
 
         // Auto invoice: number, row, PDF, storage, email. Never throws; any
         // failure becomes a dashboard notification and the fee stays saved.
+        // Email and phone typed on pay.html (notes) or on Razorpay's page (fields).
+        const payerEmail = (payment.notes.email || fields.email || '').trim() || null;
+        const payerPhone = (payment.notes.phone || fields.phone || '').trim() || null;
+        if (student && payerEmail && student.email && payerEmail.toLowerCase() !== String(student.email).toLowerCase()) {
+          await supabase.from('notifications').insert({
+            type: 'info',
+            message: `✉️ ${studentName} paid ${feeId} with a different email: ${payerEmail} (on file: ${student.email}). Update the student if this is their new address.`,
+            read: false
+          });
+        }
+
         const invoice = await invoiceFeePayment(supabase, {
           feeId, studentName, student, classes: classes || 0, amountMajor, currency, payment, today, feeMonth,
-          payerEmail: fields.email || null   // what the student typed on Razorpay's page, if the student row has no email
+          payerEmail, payerPhone
         });
 
         return res.json({ received: true, routed: 'fee_request', requestId, feeId, invoice });

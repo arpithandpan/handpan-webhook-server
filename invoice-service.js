@@ -46,14 +46,16 @@ function emailHtml(no) {
     + '</div>';
 }
 
-async function sendViaResend({ to, subject, text, html, filename, pdfBuffer }) {
+async function sendViaResend({ to, cc, subject, text, html, filename, pdfBuffer }) {
   if (!RESEND_API_KEY) throw new Error('RESEND_API_KEY is not set');
+  const ccList = (Array.isArray(cc) ? cc : (cc ? [cc] : [])).filter(a => a && a.toLowerCase() !== String(to).toLowerCase());
   const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: { 'Authorization': 'Bearer ' + RESEND_API_KEY, 'Content-Type': 'application/json' },
     body: JSON.stringify({
       from: BIZ.name + ' <' + FROM_EMAIL + '>',
       to: [to],
+      ...(ccList.length ? { cc: ccList } : {}),
       reply_to: REPLY_TO,
       subject,
       text,
@@ -239,16 +241,19 @@ async function createAndSendInvoice(supabase, job) {
     }
 
     try {
+      const cc = (job.cc || []).filter(a => a && a.toLowerCase() !== String(row.billed_email).toLowerCase());
       await sendViaResend({
         to: row.billed_email,
+        cc,
         subject: 'Your invoice from Arpit Pandey (' + no + ')',
         text: emailText(no),
         html: emailHtml(no),
         filename,
         pdfBuffer: pdf
       });
-      await supabase.from('invoices').update({ sent: true, sent_at: new Date().toISOString(), email_sent_to: row.billed_email, email_error: null }).eq('id', invoiceId);
-      await notify(supabase, 'info', `🧾 Invoice ${no} sent to ${row.billed_email} (${row.billed_name})`);
+      const sentTo = [row.billed_email].concat(cc).join(', ');
+      await supabase.from('invoices').update({ sent: true, sent_at: new Date().toISOString(), email_sent_to: sentTo, email_error: null }).eq('id', invoiceId);
+      await notify(supabase, 'info', `🧾 Invoice ${no} sent to ${sentTo} (${row.billed_name})`);
       return { invoiceId, invoiceNumber, emailed: true };
     } catch (e) {
       console.error('Invoice email failed:', e.message);
@@ -299,7 +304,7 @@ async function invoiceWorkshopBooking(supabase, { workshopId, fields, payment, p
 }
 
 // Class fee from pay.html, INR or foreign currency.
-async function invoiceFeePayment(supabase, { feeId, studentName, student, classes, amountMajor, currency, payment, today, feeMonth, payerEmail }) {
+async function invoiceFeePayment(supabase, { feeId, studentName, student, classes, amountMajor, currency, payment, today, feeMonth, payerEmail, payerPhone }) {
   // Show qty = classes only when the per-class rate divides cleanly, so the
   // invoice total always equals exactly what was paid. Otherwise one line at
   // the full amount with the class count in the description.
@@ -314,7 +319,10 @@ async function invoiceFeePayment(supabase, { feeId, studentName, student, classe
     sourceTable: 'fee_payments',
     sourceId: feeId,
     razorpayPaymentId: payment.id,
-    billed: { name: studentName, email: student?.email || payment.notes?.email || payerEmail || null, phone: student?.phone || payment.contact || null, country: student?.country || '' },
+    // The address typed at payment time wins (it may be a parent paying). The
+    // student's address on file is copied in, so nothing is lost either way.
+    billed: { name: studentName, email: payerEmail || payment.notes?.email || student?.email || null, phone: payerPhone || payment.notes?.phone || student?.phone || payment.contact || null, country: student?.country || '' },
+    cc: student?.email ? [student.email] : [],
     currency,
     paymentDate: todayIST(),
     paymentMode: currency === 'INR' ? 'Razorpay UPI' : 'Razorpay International',
