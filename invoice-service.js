@@ -137,7 +137,7 @@ async function emailInvoice(supabase, row, pdf, to) {
  *   currency: 'INR',
  *   paymentDate: 'YYYY-MM-DD',
  *   paymentMode: 'Razorpay UPI',
- *   servicePeriod: 'September 2026',
+ *   servicePeriod: 'September 2026' | null   (workshops only; class fees carry none)
  *   lines: [{ desc, qty, rate }]
  * }
  */
@@ -215,7 +215,7 @@ async function createAndSendInvoice(supabase, job) {
       status: 'paid',
       currency,
       billed: { name: row.billed_name, email: row.billed_email, phone: row.billed_phone, country: job.billed.country || '' },
-      servicePeriod: row.service_period,
+      servicePeriod: row.service_period || '',
       payment: { date: row.payment_received_date, mode: row.payment_mode, ref: row.payment_reference },
       lines
     });
@@ -304,6 +304,10 @@ async function invoiceWorkshopBooking(supabase, { workshopId, fields, payment, p
 }
 
 // Class fee from pay.html, INR or foreign currency.
+// No service period on these: classes can be rescheduled and stretch past a
+// month, so the invoice states only what was bought (the class count). The
+// month chosen on the fee request still lives in fee_requests / fee_payments
+// for Arpit's own records; it is not shown to the student anywhere.
 async function invoiceFeePayment(supabase, { feeId, studentName, student, classes, amountMajor, currency, payment, today, feeMonth, payerEmail, payerPhone }) {
   // Show qty = classes only when the per-class rate divides cleanly, so the
   // invoice total always equals exactly what was paid. Otherwise one line at
@@ -326,8 +330,7 @@ async function invoiceFeePayment(supabase, { feeId, studentName, student, classe
     currency,
     paymentDate: todayIST(),
     paymentMode: currency === 'INR' ? 'Razorpay UPI' : 'Razorpay International',
-    // Service period is the month the fee is for, not the month it was paid.
-    servicePeriod: (feeMonth && /^\d{4}-\d{2}$/.test(feeMonth)) ? monthLabel(feeMonth + '-01') : monthLabel(todayIST()),
+    servicePeriod: null,
     lines
   });
 }
