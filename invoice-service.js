@@ -33,12 +33,12 @@ async function notify(supabase, type, message) {
 
 // ── email copy ──
 function emailText(no) {
-  return 'Hi,\n\nPlease find attached your invoice ' + no + '.\n\nThank you for being part of the journey.\n\nWarm regards,\nArpit Pandey\nhttps://arpitpandey.com/\nhttps://www.instagram.com/pandeyarpit';
+  return 'Hi,\n\nPlease find attached your invoice.\n\nThank you for being part of the journey.\n\nWarm regards,\nArpit Pandey\nhttps://arpitpandey.com/\nhttps://www.instagram.com/pandeyarpit';
 }
 function emailHtml(no) {
   return '<div style="font-family:Helvetica,Arial,sans-serif;font-size:15px;line-height:1.6;color:#1a1a1a;">'
     + '<p>Hi,</p>'
-    + '<p>Please find attached your invoice <strong>' + esc(no) + '</strong>.</p>'
+    + '<p>Please find attached your invoice.</p>'
     + '<p>Thank you for being part of the journey.</p>'
     + '<p>Warm regards,<br>Arpit Pandey<br>'
     + '<a href="https://arpitpandey.com/" style="color:#500018;">arpitpandey.com</a> · '
