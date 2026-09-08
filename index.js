@@ -585,6 +585,146 @@ app.post('/api/create-payment-link', express.json(), async (req, res) => {
   }
 });
 
+// ── CREATE BOOKING ORDER (Razorpay Checkout popup) ──
+// Called by book.html on "Reserve my spot". Same checks and the same
+// server-side price maths as /api/create-payment-link, but it creates a
+// Razorpay Order instead of a Payment Link and returns what checkout.js
+// needs. The popup opens on book.html itself with name, phone and email
+// prefilled. Notes are identical to the payment-link flow, so the webhook
+// below handles the payment without any changes (it already copies order
+// notes onto the payment when checkout.js does not pass them through).
+// /api/create-payment-link stays as the fallback when checkout.js fails
+// to load in the browser.
+app.post('/api/create-booking-order', express.json(), async (req, res) => {
+  try {
+    const {
+      workshopId, participants, observers,
+      name, phone, email,
+      bringingOwnHandpan,
+      guestNames, ownHandpanCount
+    } = req.body || {};
+
+    if (!workshopId || !name || !phone) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const pCount = Number(participants) || 0;
+    const oCount = Number(observers) || 0;
+    if (pCount + oCount <= 0) {
+      return res.status(400).json({ error: 'At least one ticket is required' });
+    }
+
+    const { data: workshop, error: wsError } = await supabase
+      .from('workshops')
+      .select('id, date, venue, participant_capacity, observer_capacity, price_per_head, observer_price, archived, cancelled')
+      .eq('id', workshopId)
+      .single();
+
+    if (wsError || !workshop || workshop.archived) {
+      return res.status(404).json({ error: 'Workshop not found' });
+    }
+    if (workshop.cancelled) {
+      return res.status(410).json({ error: 'This workshop has been cancelled' });
+    }
+
+    // Capacity re-check right before charging (race guard).
+    if (workshop.participant_capacity != null || workshop.observer_capacity != null) {
+      const { data: existing, error: existingErr } = await supabase
+        .from('participants')
+        .select('participant_count, observer_count')
+        .eq('workshop_id', workshopId);
+
+      if (existingErr) {
+        console.error('Availability check error:', existingErr.message);
+        return res.status(500).json({ error: 'Failed to check availability' });
+      }
+
+      let participantsSold = 0;
+      let observersSold = 0;
+      for (const row of (existing || [])) {
+        const counts = rowPeopleCounts(row);
+        participantsSold += counts.participantCount;
+        observersSold += counts.observerCount;
+      }
+
+      if (workshop.participant_capacity != null
+          && participantsSold + pCount > workshop.participant_capacity) {
+        return res.status(409).json({ error: 'Not enough participant slots remaining' });
+      }
+      if (workshop.observer_capacity != null
+          && observersSold + oCount > workshop.observer_capacity) {
+        return res.status(409).json({ error: 'Not enough audience pass slots remaining' });
+      }
+    }
+
+    const participantPrice = Number(workshop.price_per_head) || 0;
+    const observerPrice = Number(workshop.observer_price) || 0;
+
+    if (pCount > 0 && participantPrice <= 0) {
+      return res.status(400).json({ error: 'Participant price is not set for this workshop yet' });
+    }
+    if (oCount > 0 && observerPrice <= 0) {
+      return res.status(400).json({ error: 'Audience pass price is not set for this workshop yet' });
+    }
+
+    const amountRupees = pCount * participantPrice + oCount * observerPrice;
+    const amountPaise = Math.round(amountRupees * 100);
+
+    const ticketSummary = `${pCount} participant${pCount === 1 ? '' : 's'}`
+      + (oCount ? `, ${oCount} audience pass${oCount === 1 ? '' : 'es'}` : '');
+
+    const cleanEmail = String(email || '').trim();
+    const notes = {
+      workshopId,
+      participants: String(pCount),
+      observers: String(oCount),
+      name,
+      phone,
+      email: cleanEmail,
+      bringingOwnHandpan: bringingOwnHandpan || '',
+      guestNames: JSON.stringify(Array.isArray(guestNames) ? guestNames.filter(n => (n || '').toString().trim()) : []),
+      ownHandpanCount: String(ownHandpanCount != null ? ownHandpanCount : 0),
+      participantPrice: String(participantPrice)
+    };
+
+    const auth = Buffer.from(
+      `${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`
+    ).toString('base64');
+
+    const rzpRes = await fetch('https://api.razorpay.com/v1/orders', {
+      method: 'POST',
+      headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        amount: amountPaise,
+        currency: 'INR',
+        // Razorpay caps receipt at 40 chars. Workshop id + phone digits keeps it unique enough for support lookups.
+        receipt: `${workshopId}-${String(phone).replace(/\D/g, '').slice(-10)}`.slice(0, 40),
+        notes
+      })
+    });
+    const order = await rzpRes.json();
+    if (!rzpRes.ok) {
+      console.error('Razorpay booking order error:', order);
+      return res.status(502).json({ error: 'Failed to start payment', detail: order.error?.description || 'Unknown error' });
+    }
+
+    return res.json({
+      orderId: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      keyId: process.env.RAZORPAY_KEY_ID,
+      name,
+      email: cleanEmail,
+      phone,
+      description: `Handpan workshop · ${ticketSummary}`,
+      notes
+    });
+  } catch (err) {
+    console.error('create-booking-order error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ── WORKSHOP INFO + AVAILABILITY ──
 // Called by book.html on page load. Returns everything the page needs to
 // render itself for this workshop: date, time, venue, prices, and how many
@@ -1000,7 +1140,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         }
       } else {
         if (await isAlreadyProcessed(payment.id)) {
-          console.log('Duplicate workshop payment — skipping:', payment.id);
+          console.log('Duplicate payment — skipping:', payment.id);
           return res.json({ received: true, skipped: 'duplicate' });
         }
       }
