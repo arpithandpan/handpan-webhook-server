@@ -1033,9 +1033,13 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
           .single();
 
         const studentId = request?.student_id || payment.notes.studentId || null;
-        const { data: student } = studentId
-          ? await supabase.from('students').select('id, full_name, email, phone, country').eq('id', studentId).single()
-          : { data: null };
+        let student = null;
+        if (studentId) {
+          const { data: sRow, error: sErr } = await supabase.from('students').select('*').eq('id', studentId).maybeSingle();
+          if (sErr) console.error('student lookup failed:', studentId, sErr.message);
+          student = sRow || null;
+        }
+        console.log('Fee student:', studentId, student ? (student.email || 'no email') : 'NOT FOUND');
 
         const studentName = student?.full_name || payment.notes.name || fields.name;
         const classes = request?.classes ?? (parseInt(payment.notes.classes, 10) || null);
