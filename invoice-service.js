@@ -9,6 +9,7 @@ const { buildInvoicePdf, amountInWords, BIZ } = require('./invoice-pdf');
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const FROM_EMAIL = process.env.INVOICE_FROM_EMAIL || 'invoices@arpitpandey.com';
 const REPLY_TO = process.env.INVOICE_REPLY_TO || BIZ.email;
+const ADMIN_BCC = (process.env.INVOICE_ADMIN_BCC || 'arpithandpan@gmail.com').trim();
 const BUCKET = 'invoices';
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
@@ -48,7 +49,10 @@ function emailHtml(no) {
 
 async function sendViaResend({ to, cc, subject, text, html, filename, pdfBuffer }) {
   if (!RESEND_API_KEY) throw new Error('RESEND_API_KEY is not set');
-  const ccList = (Array.isArray(cc) ? cc : (cc ? [cc] : [])).filter(a => a && a.toLowerCase() !== String(to).toLowerCase());
+  const toLower = String(to).toLowerCase();
+  const ccList = (Array.isArray(cc) ? cc : (cc ? [cc] : [])).filter(a => a && a.toLowerCase() !== toLower);
+  const ccLower = ccList.map(a => a.toLowerCase());
+  const bccList = ADMIN_BCC && ADMIN_BCC.toLowerCase() !== toLower && !ccLower.includes(ADMIN_BCC.toLowerCase()) ? [ADMIN_BCC] : [];
   const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: { 'Authorization': 'Bearer ' + RESEND_API_KEY, 'Content-Type': 'application/json' },
@@ -56,6 +60,7 @@ async function sendViaResend({ to, cc, subject, text, html, filename, pdfBuffer 
       from: BIZ.name + ' <' + FROM_EMAIL + '>',
       to: [to],
       ...(ccList.length ? { cc: ccList } : {}),
+      ...(bccList.length ? { bcc: bccList } : {}),
       reply_to: REPLY_TO,
       subject,
       text,
