@@ -1191,6 +1191,11 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         const symbol = { INR: '₹', USD: '$', EUR: '€', GBP: '£' }[currency] || (currency + ' ');
 
         const feeId = await generateId('fee_payments', 'FP');
+
+        // ── FEE PAYMENT INSERT ──
+        // ignoreDuplicates: true means a webhook retry that hits the unique
+        // constraint on razorpay_payment_id silently skips instead of
+        // throwing, so the handler returns success and Razorpay stops retrying.
         const { error: feeErr } = await supabase.from('fee_payments').insert({
           id: feeId,
           student_id: studentId,
@@ -1204,7 +1209,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
           payment_date: today,
           razorpay_payment_id: payment.id,
           description: `${label}${request?.note ? ' · ' + request.note : ''} · ${requestId} · ${payment.id}`
-        });
+        }, { onConflict: 'razorpay_payment_id', ignoreDuplicates: true });
 
         if (feeErr) {
           console.error('Error saving fee payment:', feeErr.message);
