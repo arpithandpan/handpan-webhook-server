@@ -173,6 +173,7 @@ async function createAndSendInvoice(supabase, job) {
       billed_email: job.billed.email || null,
       billed_phone: job.billed.phone || null,
       billed_city: null,
+      billed_country: (job.billed.country || '').trim() || null,
       payment_received_date: job.paymentDate || today,
       payment_mode: job.paymentMode || 'Razorpay UPI',
       payment_reference: job.razorpayPaymentId || null,
@@ -219,7 +220,7 @@ async function createAndSendInvoice(supabase, job) {
       date: today,
       status: 'paid',
       currency,
-      billed: { name: row.billed_name, email: row.billed_email, phone: row.billed_phone, country: job.billed.country || '' },
+      billed: { name: row.billed_name, email: row.billed_email, phone: row.billed_phone, country: row.billed_country || '' },
       servicePeriod: row.service_period || '',
       payment: { date: row.payment_received_date, mode: row.payment_mode, ref: row.payment_reference },
       lines
@@ -313,6 +314,23 @@ async function invoiceWorkshopBooking(supabase, { workshopId, fields, payment, p
 // month, so the invoice states only what was bought (the class count). The
 // month chosen on the fee request still lives in fee_requests / fee_payments
 // for Arpit's own records; it is not shown to the student anywhere.
+// Country for the invoice. The student row can carry a stale 'India' (the add
+// form's default) for someone abroad, so for a foreign-currency payment the
+// dial code on the phone decides when the stored country is blank or India.
+const DIAL_COUNTRY = [['+971','United Arab Emirates'],['+977','Nepal'],['+353','Ireland'],['+41','Switzerland'],['+44','UK'],['+49','Germany'],['+33','France'],['+31','Netherlands'],['+61','Australia'],['+64','New Zealand'],['+65','Singapore'],['+81','Japan'],['+82','South Korea'],['+86','China'],['+1','USA']];
+function countryFromDial(phone) {
+  const p = String(phone || '').replace(/[\s-]/g, '');
+  if (!p.startsWith('+')) return '';
+  const hit = DIAL_COUNTRY.find(([d]) => p.startsWith(d));
+  return hit ? hit[1] : '';
+}
+function invoiceCountry(student, phone, currency) {
+  const stored = String(student?.country || '').trim();
+  if (currency === 'INR') return stored;
+  if (stored && !/india/i.test(stored)) return stored;
+  return countryFromDial(phone) || countryFromDial(student?.phone) || '';
+}
+
 async function invoiceFeePayment(supabase, { feeId, studentName, student, classes, amountMajor, currency, payment, today, feeMonth, payerEmail, payerPhone }) {
   // Show qty = classes only when the per-class rate divides cleanly, so the
   // invoice total always equals exactly what was paid. Otherwise one line at
@@ -330,7 +348,7 @@ async function invoiceFeePayment(supabase, { feeId, studentName, student, classe
     razorpayPaymentId: payment.id,
     // The address typed at payment time wins (it may be a parent paying). The
     // student's address on file is copied in, so nothing is lost either way.
-    billed: { name: studentName, email: payerEmail || payment.notes?.email || student?.email || null, phone: payerPhone || payment.notes?.phone || student?.phone || payment.contact || null, country: student?.country || '' },
+    billed: { name: studentName, email: payerEmail || payment.notes?.email || student?.email || null, phone: payerPhone || payment.notes?.phone || student?.phone || payment.contact || null, country: invoiceCountry(student, payerPhone || payment.notes?.phone || payment.contact, (currency || 'INR').toUpperCase()) },
     cc: student?.email ? [student.email] : [],
     currency,
     paymentDate: todayIST(),
