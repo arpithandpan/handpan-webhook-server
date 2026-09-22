@@ -49,6 +49,7 @@ const CURRENCY = {
   USD: { sym: '$', word: 'US Dollars', minor: 'Cents', locale: 'en-US' },
   EUR: { sym: '\u20AC', word: 'Euros', minor: 'Cents', locale: 'en-IE' },
   GBP: { sym: '\u00A3', word: 'Pounds', minor: 'Pence', locale: 'en-GB' },
+  CHF: { sym: 'CHF ', word: 'Swiss Francs', minor: 'Rappen', locale: 'de-CH' },
   AUD: { sym: 'A$', word: 'Australian Dollars', minor: 'Cents', locale: 'en-AU' },
   CAD: { sym: 'C$', word: 'Canadian Dollars', minor: 'Cents', locale: 'en-CA' },
   SGD: { sym: 'S$', word: 'Singapore Dollars', minor: 'Cents', locale: 'en-SG' },
