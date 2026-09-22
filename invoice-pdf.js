@@ -239,13 +239,14 @@ function buildInvoicePdf(inv) {
     const meta = [['No', inv.number], ['Date', longDate(inv.date)]];
     if (status === 'due' && dueDate) meta.push(['Due', longDate(dueDate)]);
     if (inv.servicePeriod) meta.push(['Period', inv.servicePeriod]);
+    // Same layout as the PAYMENT block below: "Label:  Value" hugging the right edge.
     doc.fontSize(10.5);
-    let valW = 0; meta.forEach(m => { doc.font('B'); valW = Math.max(valW, doc.widthOfString(m[1])); });
-    valW = Math.ceil(valW) + 4;   // a little slack so the widest value never wraps
-    const valX = R - valW;
     meta.forEach((m, i) => {
-      doc.font('R').fillColor(T.muted).text(m[0], valX - 60, y + 33 + i * 15.5, { width: 54, align: 'right' });
-      doc.font('B').fillColor(T.ink).text(m[1], valX, y + 33 + i * 15.5, { width: valW, align: 'right' });
+      const my = y + 33 + i * 15.5;
+      doc.font('R'); const kw = doc.widthOfString(m[0] + ':  ');
+      doc.font('B'); const vw = doc.widthOfString(m[1]);
+      doc.font('R').fillColor(T.muted).text(m[0] + ':  ', R - kw - vw, my, { lineBreak: false });
+      doc.font('B').fillColor(T.ink).text(m[1], R - vw, my, { lineBreak: false });
     });
     y = MY + 33 + Math.max(hdr.length, meta.length) * 15.5 + 12;
     doc.moveTo(L, y).lineTo(R, y).lineWidth(1.1).strokeColor(T.rule).stroke();
@@ -270,9 +271,9 @@ function buildInvoicePdf(inv) {
     doc.font('B').fontSize(8.5).fillColor(T.muted).text(status === 'due' ? 'PAY TO' : 'PAYMENT', rx, y, { width: rw, align: 'right', characterSpacing: 0.6 });
     let ry = y + 14;
     const kv = (k, v) => {
-      doc.font('R').fontSize(10.5).fillColor(T.muted); const kw = doc.widthOfString(k + '  ');
+      doc.font('R').fontSize(10.5).fillColor(T.muted); const kw = doc.widthOfString(k + ':  ');
       doc.font('M').fillColor(T.ink); const vw = doc.widthOfString(v);
-      doc.font('R').fillColor(T.muted).text(k + '  ', R - kw - vw, ry, { lineBreak: false });
+      doc.font('R').fillColor(T.muted).text(k + ':  ', R - kw - vw, ry, { lineBreak: false });
       doc.font('M').fillColor(T.ink).text(v, R - vw, ry, { lineBreak: false });
       ry += 15.5;
     };
