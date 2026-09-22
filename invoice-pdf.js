@@ -245,7 +245,7 @@ function buildInvoicePdf(inv) {
     const valX = R - valW;
     meta.forEach((m, i) => {
       doc.font('R').fillColor(T.muted).text(m[0], valX - 60, y + 33 + i * 15.5, { width: 54, align: 'right' });
-      doc.font('B').fillColor(T.ink).text(m[1], valX, y + 33 + i * 15.5, { width: valW });
+      doc.font('B').fillColor(T.ink).text(m[1], valX, y + 33 + i * 15.5, { width: valW, align: 'right' });
     });
     y = MY + 33 + Math.max(hdr.length, meta.length) * 15.5 + 12;
     doc.moveTo(L, y).lineTo(R, y).lineWidth(1.1).strokeColor(T.rule).stroke();
