@@ -528,7 +528,7 @@ app.post('/api/create-payment-link', express.json(), async (req, res) => {
     }
 
     const amountRupees = pCount * participantPrice + oCount * observerPrice;
-    const amountPaise = amountRupees * 100;
+    const amountPaise = Math.round(amountRupees * 100);
 
     const ticketSummary = `${pCount} participant${pCount === 1 ? '' : 's'}`
       + (oCount ? `, ${oCount} audience pass${oCount === 1 ? '' : 'es'}` : '');
@@ -561,7 +561,7 @@ app.post('/api/create-payment-link', express.json(), async (req, res) => {
           phone,
           email: email || '',
           bringingOwnHandpan: bringingOwnHandpan || '',
-          guestNames: JSON.stringify(Array.isArray(guestNames) ? guestNames.filter(n => (n || '').toString().trim()) : []),
+          guestNames: JSON.stringify(Array.isArray(guestNames) ? guestNames.map(n => (n || '').toString().trim()) : []),
           ownHandpanCount: String(ownHandpanCount != null ? ownHandpanCount : 0),
           participantPrice: String(participantPrice)
         }
@@ -682,7 +682,7 @@ app.post('/api/create-booking-order', express.json(), async (req, res) => {
       phone,
       email: cleanEmail,
       bringingOwnHandpan: bringingOwnHandpan || '',
-      guestNames: JSON.stringify(Array.isArray(guestNames) ? guestNames.filter(n => (n || '').toString().trim()) : []),
+      guestNames: JSON.stringify(Array.isArray(guestNames) ? guestNames.map(n => (n || '').toString().trim()) : []),
       ownHandpanCount: String(ownHandpanCount != null ? ownHandpanCount : 0),
       participantPrice: String(participantPrice)
     };
@@ -901,6 +901,21 @@ app.post('/api/create-fee-order', express.json(), async (req, res) => {
     }
     if (request.status === 'cancelled') {
       return res.status(410).json({ error: 'This payment link was cancelled' });
+    }
+
+    // The request only flips to 'paid' when the webhook lands. If the student
+    // refreshes in that window, do not let them pay twice: ask Razorpay
+    // whether the previous order already has a captured payment.
+    const { data: reqRow } = await supabase.from('fee_requests').select('razorpay_order_id').eq('id', request.id).maybeSingle();
+    if (reqRow?.razorpay_order_id) {
+      try {
+        const authChk = Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString('base64');
+        const pRes = await fetch(`https://api.razorpay.com/v1/orders/${reqRow.razorpay_order_id}/payments`, { headers: { 'Authorization': `Basic ${authChk}` } });
+        const pData = await pRes.json();
+        if (pRes.ok && Array.isArray(pData.items) && pData.items.some(p => p.status === 'captured')) {
+          return res.status(409).json({ error: 'This fee has already been paid' });
+        }
+      } catch (e) { console.warn('order payments check failed:', e.message); }
     }
 
     const payerEmail = String(email || student.email || '').trim();
@@ -1188,7 +1203,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         // Old links without one fall back to the current month in India.
         const feeMonth = (request?.month && /^\d{4}-\d{2}$/.test(request.month)) ? request.month : monthYM(nowIST());
         const monthLabel = feeMonth;
-        const symbol = { INR: '₹', USD: '$', EUR: '€', GBP: '£' }[currency] || (currency + ' ');
+        const symbol = { INR: '₹', USD: '$', EUR: '€', GBP: '£', CHF: 'CHF ', AUD: 'A$', SGD: 'S$', AED: 'AED ' }[currency] || (currency + ' ');
 
         const feeId = await generateId('fee_payments', 'FP');
 
