@@ -99,7 +99,7 @@ async function resolveFeeRequest(requestId) {
 
   const { data: r, error } = await supabase
     .from('fee_requests')
-    .select('id, student_id, classes, amount, currency, month, note, status, paid_at, razorpay_payment_id')
+    .select('id, student_id, classes, amount, currency, month, note, status, paid_at, razorpay_payment_id, list_amount, discount_pct')
     .eq('id', requestId)
     .single();
 
@@ -120,6 +120,11 @@ async function resolveFeeRequest(requestId) {
   const classes = parseInt(r.classes, 10) || 0;
   const label = classes === 1 ? 'Fee for 1 class' : `Fee for ${classes} classes`;
 
+  // Package discount: list_amount is the full price before discount. Only
+  // shown when it is actually higher than what is being charged.
+  const listAmount = Number(r.list_amount) || 0;
+  const hasDiscount = listAmount > amount;
+
   return {
     request: r,
     student: s,
@@ -136,6 +141,9 @@ async function resolveFeeRequest(requestId) {
       monthLabel: monthLong(r.month),
       note: r.note || null,
       amount,
+      listAmount: hasDiscount ? listAmount : null,
+      discountAmount: hasDiscount ? Math.round((listAmount - amount) * 100) / 100 : null,
+      discountPct: hasDiscount && Number(r.discount_pct) > 0 ? Number(r.discount_pct) : null,
       currency: (r.currency || 'INR').toUpperCase(),
       status: r.status,
       paidAt: r.paid_at || null,
@@ -1183,7 +1191,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
 
         const { data: request } = await supabase
           .from('fee_requests')
-          .select('id, student_id, classes, month, note')
+          .select('id, student_id, classes, month, note, list_amount, discount_pct')
           .eq('id', requestId)
           .single();
 
@@ -1289,7 +1297,9 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
 
         const invoice = await invoiceFeePayment(supabase, {
           feeId, studentName, student, classes: classes || 0, amountMajor, currency, payment, today, feeMonth,
-          payerEmail, payerPhone
+          payerEmail, payerPhone,
+          listAmount: Number(request?.list_amount) || 0,
+          discountPct: Number(request?.discount_pct) || 0
         });
 
         return res.json({ received: true, routed: 'fee_request', requestId, feeId, invoice });
