@@ -1,361 +1,1497 @@
-// invoice-service.js
-// Runs inside the Railway webhook server after a Razorpay payment has been
-// saved. Creates the invoice row, renders the PDF, stores it, emails it, and
-// records the outcome. Never throws out to the webhook: every failure turns
-// into a dashboard notification so the booking itself is never at risk.
+const express = require('express');
+const crypto = require('crypto');
+const { createClient } = require('@supabase/supabase-js');
+const { invoiceWorkshopBooking, invoiceFeePayment, invoiceFromRow, getPdf, renderAndStore, emailInvoice, pdfFilename, buildInvoicePdf } = require('./invoice-service');
 
-const { buildInvoicePdf, amountInWords, BIZ } = require('./invoice-pdf');
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
-const FROM_EMAIL = process.env.INVOICE_FROM_EMAIL || 'invoices@arpitpandey.com';
-const REPLY_TO = process.env.INVOICE_REPLY_TO || BIZ.email;
-const ADMIN_BCC = (process.env.INVOICE_ADMIN_BCC || 'arpithandpan@gmail.com').trim();
-const BUCKET = 'invoices';
+// ── CORS ──
+// book.html calls /api/create-payment-link and /api/workshop/:id/availability
+// directly from the browser, from a different origin than this server, so we need to
+// allow that. This is just response headers, doesn't affect the Razorpay webhook route
+// (which reads the raw body separately) or any other logic.
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
 
-const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
-
-function monthLabel(iso) {
-  const d = new Date(String(iso || '').slice(0, 10) + 'T00:00:00');
-  if (isNaN(d)) return '';
-  return MONTHS[d.getMonth()] + ' ' + d.getFullYear();
-}
-// Server runs in UTC. Invoice and payment dates should be India's date.
-function todayIST() {
-  return new Date(Date.now() + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 10);
-}
-function fmtNo(n) { return 'INV-' + String(n).padStart(3, '0'); }
-function slug(s) { return (s || 'invoice').replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-|-$/g, '') || 'invoice'; }
-function esc(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
-
-async function notify(supabase, type, message) {
-  try { await supabase.from('notifications').insert({ type, message, read: false }); }
-  catch (e) { console.error('notify failed:', e.message); }
-}
-
-// ── email copy ──
-function emailText(no) {
-  return 'Hi,\n\nPlease find attached your invoice.\n\nThank you for being part of the journey.\n\nWarm regards,\nArpit Pandey\nhttps://arpitpandey.com/\nhttps://www.instagram.com/pandeyarpit';
-}
-function emailHtml(no) {
-  return '<div style="font-family:Helvetica,Arial,sans-serif;font-size:15px;line-height:1.6;color:#1a1a1a;">'
-    + '<p>Hi,</p>'
-    + '<p>Please find attached your invoice.</p>'
-    + '<p>Thank you for being part of the journey.</p>'
-    + '<p>Warm regards,<br>Arpit Pandey<br>'
-    + '<a href="https://arpitpandey.com/" style="color:#500018;">arpitpandey.com</a> · '
-    + '<a href="https://www.instagram.com/pandeyarpit" style="color:#500018;">@pandeyarpit</a></p>'
-    + '</div>';
+// ── DATES (IST) ──
+// Railway runs in UTC. Anything that is "today" or "this month" for the
+// business must use India time, or it is wrong between midnight and 5:30 AM.
+function nowIST() { return new Date(Date.now() + 5.5 * 60 * 60 * 1000); }
+function todayISTDate() { return nowIST().toISOString().slice(0, 10); }
+function monthYM(d) { return d.toISOString().slice(0, 7); }              // 'YYYY-MM'
+function monthLong(ym) {                                                  // 'YYYY-MM' → 'September 2026'
+  const m = String(ym || '').match(/^(\d{4})-(\d{2})$/); if (!m) return '';
+  const names = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  return names[Number(m[2]) - 1] + ' ' + m[1];
 }
 
-async function sendViaResend({ to, cc, subject, text, html, filename, pdfBuffer }) {
-  if (!RESEND_API_KEY) throw new Error('RESEND_API_KEY is not set');
-  const toLower = String(to).toLowerCase();
-  const ccList = (Array.isArray(cc) ? cc : (cc ? [cc] : [])).filter(a => a && a.toLowerCase() !== toLower);
-  const ccLower = ccList.map(a => a.toLowerCase());
-  const bccList = ADMIN_BCC && ADMIN_BCC.toLowerCase() !== toLower && !ccLower.includes(ADMIN_BCC.toLowerCase()) ? [ADMIN_BCC] : [];
-  const res = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: { 'Authorization': 'Bearer ' + RESEND_API_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      from: BIZ.name + ' <' + FROM_EMAIL + '>',
-      to: [to],
-      ...(ccList.length ? { cc: ccList } : {}),
-      ...(bccList.length ? { bcc: bccList } : {}),
-      reply_to: REPLY_TO,
-      subject,
-      text,
-      html,
-      attachments: [{ filename, content: pdfBuffer.toString('base64') }]
-    })
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.message || data.error || ('Resend HTTP ' + res.status));
-  return data.id || null;
+// ── SUPABASE ──
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+// ── GENERAL PAYMENT PAGE ID ──
+const GENERAL_PAYMENT_PAGE_ID = 'pl_SvxuRdqY2rd7ge';
+
+// ── TICKET PRICING ──
+// Pricing now lives per-workshop on the workshops table (price_per_head for
+// participants, observer_price for audience passes), set from the dashboard.
+// Never trusted from the client — /api/create-payment-link always looks up
+// the workshop's own prices in Supabase before computing the charge.
+
+// ── HEALTH CHECK ──
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', time: new Date().toISOString() });
+});
+
+// ── HELPERS ──
+async function generateId(table, prefix) {
+  const { data } = await supabase
+    .from(table)
+    .select('id')
+    .like('id', `${prefix}-%`)
+    .order('id', { ascending: false })
+    .limit(1);
+  if (data && data.length > 0) {
+    const lastNum = parseInt(data[0].id.replace(`${prefix}-`, ''));
+    return `${prefix}-${String(lastNum + 1).padStart(3, '0')}`;
+  }
+  return `${prefix}-001`;
 }
 
-// ── Shared helpers used by both the webhook flow and the dashboard endpoints ──
+// generateId() looks up the current max each time it's called, so calling
+// it N times back-to-back before anything is actually inserted hands back
+// the same id N times over — nothing in between bumps the max. This
+// queries the max once and builds the rest of the sequence locally, which
+// is what inserting a whole group of people in one go needs.
+async function generateSequentialIds(table, prefix, count) {
+  const { data } = await supabase
+    .from(table)
+    .select('id')
+    .like('id', `${prefix}-%`)
+    .order('id', { ascending: false })
+    .limit(1);
 
-// Map an invoices table row to what buildInvoicePdf expects.
-function invoiceFromRow(r) {
-  const lines = (r.line_items || []).map(l => ({ desc: l.desc || l.description || '', sub: l.sub || '', qty: Number(l.qty) || 1, rate: Number(l.rate) || 0 }));
-  const status = r.cancelled ? 'cancelled' : (r.payment_received_date ? 'paid' : 'due');
+  let nextNum = 1;
+  if (data && data.length > 0) {
+    nextNum = parseInt(data[0].id.replace(`${prefix}-`, '')) + 1;
+  }
+
+  const ids = [];
+  for (let i = 0; i < count; i++) {
+    ids.push(`${prefix}-${String(nextNum + i).padStart(3, '0')}`);
+  }
+  return ids;
+}
+
+// ── RESOLVE FEE REQUEST ──
+// Single source of truth for the pay page. Amount and currency come from the
+// fee_requests row, never from the client.
+async function resolveFeeRequest(requestId) {
+  if (!requestId) return { error: 'not_found' };
+
+  const { data: r, error } = await supabase
+    .from('fee_requests')
+    .select('id, student_id, classes, amount, currency, month, note, status, paid_at, razorpay_payment_id, list_amount, discount_pct')
+    .eq('id', requestId)
+    .single();
+
+  if (error || !r) return { error: 'not_found' };
+  if (r.status === 'cancelled') return { error: 'not_found' };
+
+  const { data: s } = await supabase
+    .from('students')
+    .select('id, full_name, email, phone, level, archived')
+    .eq('id', r.student_id)
+    .single();
+
+  if (!s || s.archived) return { error: 'not_found' };
+
+  const amount = Number(r.amount) || 0;
+  if (amount <= 0) return { error: 'not_found' };
+
+  const classes = parseInt(r.classes, 10) || 0;
+  const label = classes === 1 ? 'Fee for 1 class' : `Fee for ${classes} classes`;
+
+  // Package discount: list_amount is the full price before discount. Only
+  // shown when it is actually higher than what is being charged.
+  const listAmount = Number(r.list_amount) || 0;
+  const hasDiscount = listAmount > amount;
+
   return {
-    number: fmtNo(r.invoice_number),
-    date: r.invoice_date,
-    status,
-    dueDate: r.due_date || undefined,
-    cancelledAt: r.cancelled_at ? String(r.cancelled_at).slice(0, 10) : '',
-    currency: (r.currency || 'INR').toUpperCase(),
-    billed: {
-      name: r.billed_name || '', company: r.billed_company || '', address: r.billed_address || r.billed_city || '',
-      state: r.billed_state || '', country: r.billed_country || '', email: r.billed_email || '', phone: r.billed_phone || '',
-      gstin: r.billed_gstin || ''
-    },
-    servicePeriod: r.service_period || '',
-    payment: { date: r.payment_received_date || '', mode: r.payment_mode || '', ref: r.payment_reference || '' },
-    amountPaid: Number(r.amount_paid) || 0,
-    lines,
-    notes: r.notes || '',
-    showPan: !!r.show_pan || !!r.pan, showBank: !!r.show_bank, showAddress: !!r.show_address
+    request: r,
+    student: s,
+    fee: {
+      requestId: r.id,
+      studentId: s.id,
+      name: s.full_name,
+      email: s.email || '',
+      phone: s.phone || '',
+      level: s.level || null,
+      classes,
+      label,
+      month: r.month || null,
+      monthLabel: monthLong(r.month),
+      note: r.note || null,
+      amount,
+      listAmount: hasDiscount ? listAmount : null,
+      discountAmount: hasDiscount ? Math.round((listAmount - amount) * 100) / 100 : null,
+      discountPct: hasDiscount && Number(r.discount_pct) > 0 ? Number(r.discount_pct) : null,
+      currency: (r.currency || 'INR').toUpperCase(),
+      status: r.status,
+      paidAt: r.paid_at || null,
+      paymentId: r.razorpay_payment_id || null
+    }
   };
 }
-function pdfFilename(r) { return fmtNo(r.invoice_number) + '_' + slug(r.billed_name) + '.pdf'; }
-function pdfStoragePath(r) { return String(r.invoice_date || todayIST()).slice(0, 4) + '/' + pdfFilename(r); }
 
-// Render the PDF for a row and store it. Returns { pdf, path }.
-async function renderAndStore(supabase, row) {
-  const pdf = await buildInvoicePdf(invoiceFromRow(row));
-  const path = pdfStoragePath(row);
-  const { error } = await supabase.storage.from(BUCKET).upload(path, pdf, { contentType: 'application/pdf', upsert: true });
-  if (error) throw new Error('Storage upload failed: ' + error.message);
-  await supabase.from('invoices').update({ pdf_path: path }).eq('id', row.id);
-  return { pdf, path };
+// ── IDEMPOTENCY CHECKS ──
+async function isAlreadyProcessed(razorpayPaymentId) {
+  const { data, error } = await supabase
+    .from('payments')
+    .select('id')
+    .eq('razorpay_payment_id', razorpayPaymentId)
+    .limit(1);
+  if (error) { console.warn('Idempotency check error:', error.message); return false; }
+  return data && data.length > 0;
 }
 
-// Fetch the stored PDF for a row, or render (and store) it if missing.
-async function getPdf(supabase, row) {
-  if (row.pdf_path) {
-    const { data, error } = await supabase.storage.from(BUCKET).download(row.pdf_path);
-    if (!error && data) return { pdf: Buffer.from(await data.arrayBuffer()), path: row.pdf_path };
+async function isAlreadyUnassigned(razorpayPaymentId) {
+  const { data, error } = await supabase
+    .from('unassigned_payments')
+    .select('id')
+    .eq('razorpay_payment_id', razorpayPaymentId)
+    .limit(1);
+  if (error) { console.warn('Unassigned idempotency check error:', error.message); return false; }
+  return data && data.length > 0;
+}
+
+// ── NORMALISE YES/NO ──
+function normaliseYesNo(val) {
+  if (!val) return null;
+  const v = val.toString().trim().toLowerCase();
+  if (['yes','y','yeah','yep','yup','true','1','ok','okay'].includes(v)) return 'Yes';
+  if (['no','n','nope','nah','false','0'].includes(v)) return 'No';
+  return val.trim();
+}
+
+// ── COUNT TOTAL PEOPLE ON A PARTICIPANT ROW ──
+// Legacy rows (from the old Payment Page flow) don't have participant_count /
+// observer_count set, so we fall back to "1 participant, 0 observers" — the
+// same assumption the old code made implicitly with its "+1 pax" logic.
+function rowPeopleCounts(row) {
+  return {
+    participantCount: row.participant_count ?? 1,
+    observerCount: row.observer_count ?? 0,
+  };
+}
+
+// ── EXTRACT ALL FIELDS FROM PAYMENT ──
+// This is the single source of truth for what we capture from Razorpay.
+// All fields are extracted here. Adding a new field in future = just add it here.
+function extractPaymentFields(payment) {
+  const notes = payment.notes || {};
+
+  // Core fields
+  const name   = notes.name || payment.customer_name || 'Unknown';
+  const phone  = payment.contact || null;
+  // Email: prefer the address the person actually typed on book.html, which
+  // /api/create-payment-link stashes in notes.email. payment.email is
+  // Razorpay's own field and it comes back as the literal string
+  // 'void@razorpay.com' when Razorpay didn't collect one — that placeholder
+  // is truthy, so reading it first silently overwrote every real address.
+  const notesEmail = (notes.email || '').toString().trim();
+  const rzpEmail   = (payment.email || '').toString().trim();
+  const email = notesEmail
+    || (rzpEmail.toLowerCase() === 'void@razorpay.com' ? null : rzpEmail)
+    || null;
+  const amount = payment.amount / 100;
+
+  // Custom note fields — try all known key variants
+  const bringingOwn = notes.bringingOwnHandpan
+    || notes['handpans_will_be_provided_bringing_your_own?_(yes/no)']
+    || notes['handpans_will_be_provided_bringing_your_own?(yes/no)']
+    || notes['handpans_will_be_provided._bringing_your_own?_(yes/no)']
+    || notes['bringing_your_own']
+    || null;
+
+  // Page ID (used by the old Payment Page matching flow)
+  const pageId = notes.payment_page_id
+    || payment.payment_page_id
+    || payment.invoice_id
+    || null;
+
+  // NEW: workshop + ticket info, set by /api/create-payment-link for
+  // bookings made through book.html. Won't be present on payments
+  // from manually-created Payment Pages — that's fine, those fall back to
+  // page_id / date+amount matching below, same as before.
+  const workshopIdFromNotes = notes.workshopId || null;
+  const participantCount = notes.participants !== undefined
+    ? (parseInt(notes.participants, 10) || 0)
+    : null;
+  const observerCount = notes.observers !== undefined
+    ? (parseInt(notes.observers, 10) || 0)
+    : null;
+
+  // NEW: guest names for additional participants, the handpan-count
+  // breakdown for a group, and the per-head price used to charge this
+  // booking — all stashed in notes by /api/create-payment-link so the
+  // webhook can build one row per person without re-querying anything.
+  let guestNames = [];
+  if (notes.guestNames !== undefined) {
+    try {
+      const parsed = JSON.parse(notes.guestNames);
+      if (Array.isArray(parsed)) guestNames = parsed;
+    } catch (e) {
+      // malformed — fall back to no guest names rather than failing the whole webhook
+    }
   }
-  return renderAndStore(supabase, row);
+
+  const ownHandpanCount = notes.ownHandpanCount !== undefined
+    ? (parseInt(notes.ownHandpanCount, 10) || 0)
+    : null;
+
+  const participantPrice = notes.participantPrice !== undefined
+    ? (parseFloat(notes.participantPrice) || null)
+    : null;
+
+  return {
+    name,
+    phone,
+    email,
+    amount,
+    pageId,
+    bringingOwn,        // raw value as typed by user
+    bringingOwnNorm: normaliseYesNo(bringingOwn),   // normalised for filters
+    workshopIdFromNotes,
+    participantCount,   // null if not present (old-flow payment)
+    observerCount,       // null if not present (old-flow payment)
+    guestNames,          // [] if not present
+    ownHandpanCount,      // null if not present (old-flow payment)
+    participantPrice,    // null if not present (old-flow payment)
+  };
 }
 
-// Email a row's PDF. Returns the address it went to. Throws on failure.
-async function emailInvoice(supabase, row, pdf, to) {
-  const addr = (to || row.billed_email || '').trim();
-  if (!addr) throw new Error('No email address on this invoice');
-  const no = fmtNo(row.invoice_number);
-  await sendViaResend({ to: addr, subject: 'Your invoice from Arpit Pandey (' + no + ')', text: emailText(no), html: emailHtml(no), filename: pdfFilename(row), pdfBuffer: pdf });
-  await supabase.from('invoices').update({ sent: true, sent_at: new Date().toISOString(), email_sent_to: addr, email_error: null }).eq('id', row.id);
-  return addr;
+// ── WORKSHOP MATCHING ──
+async function findWorkshopById(workshopId) {
+  if (!workshopId) return null;
+  const { data } = await supabase
+    .from('workshops')
+    .select('id')
+    .eq('id', workshopId)
+    .single();
+  return data ? data.id : null;
 }
 
-/**
- * Create, store and email one invoice.
- *
- * job = {
- *   sourceTable: 'participants' | 'fee_payments',
- *   sourceId: 'P-042' | 'FP-031',
- *   razorpayPaymentId: 'pay_xxx',
- *   billed: { name, email, phone, country },
- *   currency: 'INR',
- *   paymentDate: 'YYYY-MM-DD',
- *   paymentMode: 'Razorpay UPI',
- *   servicePeriod: 'September 2026' | null   (workshops only; class fees carry none)
- *   lines: [{ desc, qty, rate }]
- * }
- */
-async function createAndSendInvoice(supabase, job) {
-  const tag = job.razorpayPaymentId || job.sourceId;
+async function findWorkshopByPageId(pageId) {
+  if (!pageId) return null;
+  const { data } = await supabase
+    .from('workshops')
+    .select('id')
+    .eq('razorpay_page_id', pageId)
+    .single();
+  return data ? data.id : null;
+}
+
+async function findWorkshopByDateAndAmount(amountINR, paymentDateStr) {
   try {
-    // 0. Already invoiced? A replayed webhook should never make a second one.
-    const { data: existing } = await supabase
-      .from('invoices').select('id, invoice_number')
-      .eq('payment_reference', job.razorpayPaymentId).eq('auto_generated', true).limit(1);
-    if (existing && existing.length) {
-      console.log('Invoice already exists for', tag, fmtNo(existing[0].invoice_number));
-      return { skipped: 'exists', invoiceNumber: existing[0].invoice_number };
-    }
+    const { data: workshops } = await supabase
+      .from('workshops')
+      .select('id, date, price_per_head, venue')
+      .neq('archived', true)
+      .order('date', { ascending: true });
 
-    const today = todayIST();
-    const currency = (job.currency || 'INR').toUpperCase();
-    const lines = (job.lines || []).map(l => ({ desc: l.desc, qty: Number(l.qty) || 1, rate: Number(l.rate) || 0 }));
-    const total = Math.round(lines.reduce((a, l) => a + l.qty * l.rate, 0) * 100) / 100;
-    const words = amountInWords(total, currency);
-
-    const row = {
-      invoice_number: null,
-      invoice_date: today,
-      source_table: job.sourceTable || null,
-      source_id: job.sourceId || null,
-      billed_name: job.billed.name || 'Customer',
-      billed_email: job.billed.email || null,
-      billed_phone: job.billed.phone || null,
-      billed_city: null,
-      billed_country: (job.billed.country || '').trim() || null,
-      payment_received_date: job.paymentDate || today,
-      payment_mode: job.paymentMode || 'Razorpay UPI',
-      payment_reference: job.razorpayPaymentId || null,
-      line_items: lines,
-      total_amount: total,
-      amount_in_words: words,
-      currency,
-      service_period: job.servicePeriod || null,
-      auto_generated: true,
-      sent: false
-    };
-
-    // 1 + 2. Reserve a number from the shared atomic counter and insert.
-    // If the number is already taken (counter drifted behind the table),
-    // take the next one and try again, a few times. A duplicate on
-    // payment_reference means another webhook delivery beat us: skip.
-    let invoiceId = null, invoiceNumber = null, no = null;
-    for (let attempt = 1; attempt <= 5; attempt++) {
-      const { data: num, error: numErr } = await supabase.rpc('next_invoice_number');
-      invoiceNumber = Number(Array.isArray(num) ? num[0] : num);
-      if (numErr || !(invoiceNumber > 0)) throw new Error('Could not reserve invoice number: ' + (numErr?.message || 'empty'));
-      no = fmtNo(invoiceNumber);
-      row.invoice_number = invoiceNumber;
-
-      const { data: inserted, error: insErr } = await supabase.from('invoices').insert(row).select('id').single();
-      if (!insErr) { invoiceId = inserted.id; break; }
-
-      const msg = (insErr.message || '') + ' ' + (insErr.details || '');
-      if (insErr.code === '23505' && /payment_reference/.test(msg)) {
-        console.log('Invoice already created by another delivery for', tag);
-        return { skipped: 'exists' };
-      }
-      if (insErr.code === '23505' && /invoice_number/.test(msg)) {
-        console.warn('Invoice number', no, 'already taken, retrying (attempt ' + attempt + ')');
-        continue;
-      }
-      throw new Error('Insert failed: ' + insErr.message + (insErr.details ? ' (' + insErr.details + ')' : ''));
-    }
-    if (!invoiceId) throw new Error('Could not find a free invoice number after 5 attempts');
-
-    // 3. PDF.
-    const pdf = await buildInvoicePdf({
-      number: no,
-      date: today,
-      status: 'paid',
-      currency,
-      billed: { name: row.billed_name, email: row.billed_email, phone: row.billed_phone, country: row.billed_country || '' },
-      servicePeriod: row.service_period || '',
-      payment: { date: row.payment_received_date, mode: row.payment_mode, ref: row.payment_reference },
-      lines
+    if (!workshops) return null;
+    const payDate = new Date(paymentDateStr);
+    const matches = workshops.filter(w => {
+      if (!w.date || !w.price_per_head) return false;
+      const wsDate = new Date(w.date);
+      const diffDays = (wsDate - payDate) / (1000 * 60 * 60 * 24);
+      if (diffDays < 0 || diffDays > 45) return false;
+      const pph = Number(w.price_per_head);
+      return Math.abs(amountINR - pph) <= pph * 0.05;
     });
-    const filename = no + '_' + slug(row.billed_name) + '.pdf';
-
-    // 4. Store it. A storage failure is logged but does not stop the email.
-    let pdfPath = null;
-    try {
-      const path = today.slice(0, 4) + '/' + filename;
-      const { error: upErr } = await supabase.storage.from(BUCKET).upload(path, pdf, { contentType: 'application/pdf', upsert: true });
-      if (upErr) throw upErr;
-      pdfPath = path;
-      await supabase.from('invoices').update({ pdf_path: pdfPath }).eq('id', invoiceId);
-    } catch (e) {
-      console.error('Invoice PDF upload failed:', e.message);
-      await notify(supabase, 'warning', `⚠️ Invoice ${no} created but the PDF could not be stored: ${e.message}`);
-    }
-
-    // 5. Email, if we have an address.
-    if (!row.billed_email) {
-      await notify(supabase, 'info', `🧾 Invoice ${no} created for ${row.billed_name} but no email on the booking. Send it from the dashboard.`);
-      return { invoiceId, invoiceNumber, emailed: false };
-    }
-
-    try {
-      const cc = (job.cc || []).filter(a => a && a.toLowerCase() !== String(row.billed_email).toLowerCase());
-      await sendViaResend({
-        to: row.billed_email,
-        cc,
-        subject: 'Your invoice from Arpit Pandey (' + no + ')',
-        text: emailText(no),
-        html: emailHtml(no),
-        filename,
-        pdfBuffer: pdf
-      });
-      const sentTo = [row.billed_email].concat(cc).join(', ');
-      await supabase.from('invoices').update({ sent: true, sent_at: new Date().toISOString(), email_sent_to: sentTo, email_error: null }).eq('id', invoiceId);
-      await notify(supabase, 'info', `🧾 Invoice ${no} sent to ${sentTo} (${row.billed_name})`);
-      return { invoiceId, invoiceNumber, emailed: true };
-    } catch (e) {
-      console.error('Invoice email failed:', e.message);
-      await supabase.from('invoices').update({ sent: false, email_error: e.message }).eq('id', invoiceId);
-      await notify(supabase, 'warning', `⚠️ Invoice ${no} created but the email to ${row.billed_email} failed: ${e.message}. Use Resend in the dashboard.`);
-      return { invoiceId, invoiceNumber, emailed: false, error: e.message };
-    }
+    return matches.length ? matches[0] : null;
   } catch (e) {
-    console.error('createAndSendInvoice error:', e.message);
-    await notify(supabase, 'warning', `⚠️ Auto invoice failed for ${job.billed?.name || 'customer'} (${tag}): ${e.message}. Create it from the dashboard.`);
-    return { error: e.message };
+    console.error('findWorkshopByDateAndAmount error:', e.message);
+    return null;
   }
 }
 
-// ── Job builders, called from server.js ──
+// ── SAVE PARTICIPANT (with full raw payload backup) ──
+// This function saves all known fields + the full raw Razorpay payment object.
+// Even if new columns are added to Supabase later, the raw_payload always has everything.
+async function saveParticipant(participantId, fields, workshopId, matchMethod, rawPayment) {
+  const { name, phone, email, amount, bringingOwn } = fields;
+  const today = todayISTDate();
 
-// Workshop booking: one invoice to the lead for the whole group.
-async function invoiceWorkshopBooking(supabase, { workshopId, fields, payment, participantIds, today }) {
-  const { data: ws } = await supabase.from('workshops').select('date, price_per_head, observer_price').eq('id', workshopId).single();
+  // Default to "1 participant, 0 observers" for old-flow payments where
+  // notes.participants / notes.observers weren't set.
+  const participantCount = fields.participantCount ?? 1;
+  const observerCount = fields.observerCount ?? 0;
+
+  const record = {
+    id: participantId,
+    full_name: name,
+    razorpay_name: name,
+    phone: phone || null,
+    email: email || null,
+    workshop_id: workshopId,
+    amount_paid: amount,
+    participant_count: participantCount,
+    observer_count: observerCount,
+    payment_mode: 'Razorpay UPI',
+    booking_source: 'Razorpay UPI',
+    checked_in: false,
+    date: today,
+    bringing_own_handpan: bringingOwn || null,
+    razorpay_payment_id: rawPayment.id || null,
+    raw_payload: rawPayment, // full Razorpay payment object — never lose data
+    notes: `Auto-created via Razorpay webhook (matched by ${matchMethod}). Payment ID: ${rawPayment.id}`
+  };
+
+  const { error } = await supabase.from('participants').insert(record);
+
+  if (error) {
+    console.error('Error saving participant:', error.message);
+    // Send a dashboard notification so the failure is visible
+    await supabase.from('notifications').insert({
+      type: 'warning',
+      message: `⚠️ Failed to save participant ${name} — Payment ${rawPayment.id}. Error: ${error.message}`,
+      read: false
+    });
+    return { success: false, error: error.message };
+  }
+
+  console.log('Participant saved:', participantId, name, '— all fields captured');
+  return { success: true };
+}
+
+// ── BUILD ONE ROW PER PERSON FOR A NEW-FLOW BOOKING ──
+// Bookings made through book.html always set notes.participants, which is
+// what tells us we have real per-person data to split out. This builds one
+// row for the lead and one for each remaining ticket, filling any blank
+// guest name with a placeholder Arpit can rename in person. Pure function,
+// no DB calls, so it's easy to test directly with different inputs.
+function buildParticipantRows(ids, fields, workshopId, matchMethod, rawPayment, today) {
   const pCount = fields.participantCount ?? 1;
   const oCount = fields.observerCount ?? 0;
-  const pPrice = fields.participantPrice != null ? fields.participantPrice : Number(ws?.price_per_head) || 0;
-  const oPrice = Number(ws?.observer_price) || 0;
-  const period = monthLabel(ws?.date) || monthLabel(todayIST());
+  const guestNamesRaw = Array.isArray(fields.guestNames) ? fields.guestNames : [];
 
-  const lines = [];
-  if (pCount > 0) lines.push({ desc: 'Handpan Workshop, ' + period, qty: pCount, rate: pPrice });
-  if (oCount > 0 && oPrice > 0) lines.push({ desc: 'Audience pass', qty: oCount, rate: oPrice });
-
-  // Old-flow payments have no per-head price; fall back to one line at the paid amount.
-  const lineTotal = lines.reduce((a, l) => a + l.qty * l.rate, 0);
-  if (!lines.length || Math.abs(lineTotal - fields.amount) > 1) {
-    lines.length = 0;
-    lines.push({ desc: 'Handpan Workshop, ' + period, qty: 1, rate: fields.amount });
+  // The lead, then one entry per remaining ticket. Guest numbering starts
+  // at 2 since the lead is implicitly person 1.
+  const names = [fields.name];
+  for (let i = 0; i < pCount - 1; i++) {
+    const provided = (guestNamesRaw[i] || '').toString().trim();
+    names.push(provided || `${fields.name}'s Guest ${i + 1}`);
   }
 
-  return createAndSendInvoice(supabase, {
-    sourceTable: 'participants',
-    sourceId: participantIds[0],
-    razorpayPaymentId: payment.id,
-    billed: { name: fields.name, email: fields.email, phone: fields.phone },
-    currency: 'INR',
-    paymentDate: todayIST(),
-    paymentMode: 'Razorpay UPI',
-    servicePeriod: period,
-    lines
+  // The handpan question is a group-level aggregate, shown identically on
+  // every card from this booking — plain Yes/No for a solo booking, or
+  // "X of Y" once there's more than one ticket.
+  let handpanDisplay;
+  if (pCount <= 1) {
+    handpanDisplay = fields.bringingOwn || null;
+  } else {
+    const ownCount = fields.ownHandpanCount != null ? fields.ownHandpanCount : 0;
+    handpanDisplay = `${ownCount} of ${pCount}`;
+  }
+
+  return names.map((name, idx) => {
+    const isLead = idx === 0;
+    return {
+      id: ids[idx],
+      full_name: name,
+      razorpay_name: isLead ? fields.name : null,
+      phone: fields.phone || null,
+      email: fields.email || null,
+      workshop_id: workshopId,
+      amount_paid: fields.participantPrice != null ? fields.participantPrice : fields.amount,
+      participant_count: 1,
+      observer_count: isLead ? oCount : 0,
+      payment_mode: 'Razorpay UPI',
+      booking_source: 'Razorpay UPI',
+      checked_in: false,
+      date: today,
+      bringing_own_handpan: handpanDisplay,
+      razorpay_payment_id: rawPayment.id || null,
+      lead_name: isLead ? null : fields.name,
+      guest_count: isLead ? (names.length - 1) : null,
+      raw_payload: rawPayment, // full Razorpay payment object — never lose data
+      notes: `Auto-created via Razorpay webhook (matched by ${matchMethod}). Payment ID: ${rawPayment.id}. Person ${idx + 1} of ${names.length}.`
+    };
   });
 }
 
-// Class fee from pay.html, INR or foreign currency.
-// No service period on these: classes can be rescheduled and stretch past a
-// month, so the invoice states only what was bought (the class count). The
-// month chosen on the fee request still lives in fee_requests / fee_payments
-// for Arpit's own records; it is not shown to the student anywhere.
-// Country for the invoice. The student row can carry a stale 'India' (the add
-// form's default) for someone abroad, so for a foreign-currency payment the
-// dial code on the phone decides when the stored country is blank or India.
-const DIAL_COUNTRY = [['+971','United Arab Emirates'],['+977','Nepal'],['+353','Ireland'],['+41','Switzerland'],['+44','UK'],['+49','Germany'],['+33','France'],['+31','Netherlands'],['+61','Australia'],['+64','New Zealand'],['+65','Singapore'],['+81','Japan'],['+82','South Korea'],['+86','China'],['+1','USA']];
-function countryFromDial(phone) {
-  const p = String(phone || '').replace(/[\s-]/g, '');
-  if (!p.startsWith('+')) return '';
-  const hit = DIAL_COUNTRY.find(([d]) => p.startsWith(d));
-  return hit ? hit[1] : '';
-}
-function invoiceCountry(student, phone, currency) {
-  const stored = String(student?.country || '').trim();
-  if (currency === 'INR') return stored;
-  if (stored && !/india/i.test(stored)) return stored;
-  return countryFromDial(phone) || countryFromDial(student?.phone) || '';
+// ── SAVE A WHOLE GROUP OF PEOPLE FROM ONE BOOKING ──
+async function saveParticipantGroup(rows) {
+  const { error } = await supabase.from('participants').insert(rows);
+
+  if (error) {
+    console.error('Error saving participant group:', error.message);
+    await supabase.from('notifications').insert({
+      type: 'warning',
+      message: `⚠️ Failed to save ${rows.length} participant row(s) for ${rows[0]?.full_name || 'unknown'} — Payment ${rows[0]?.razorpay_payment_id}. Error: ${error.message}`,
+      read: false
+    });
+    return { success: false, error: error.message };
+  }
+
+  console.log('Participant group saved:', rows.length, 'rows —', rows.map(r => r.id).join(', '));
+  return { success: true };
 }
 
-async function invoiceFeePayment(supabase, { feeId, studentName, student, classes, amountMajor, currency, payment, today, feeMonth, payerEmail, payerPhone }) {
-  // Show qty = classes only when the per-class rate divides cleanly, so the
-  // invoice total always equals exactly what was paid. Otherwise one line at
-  // the full amount with the class count in the description.
-  const qty = classes > 0 ? classes : 1;
-  const rate = Math.round((amountMajor / qty) * 100) / 100;
-  const clean = Math.round(rate * qty * 100) === Math.round(amountMajor * 100);
-  const lines = clean
-    ? [{ desc: 'Online Handpan Classes', qty, rate }]
-    : [{ desc: 'Online Handpan Classes' + (classes > 0 ? ' (' + classes + ' classes)' : ''), qty: 1, rate: amountMajor }];
+// ── CREATE PAYMENT LINK ──
+// Called by book.html when someone taps "Reserve my spot".
+// Creates a Razorpay Payment Link for the exact amount (computed here, not
+// trusted from the client) and stashes workshopId + ticket counts in notes
+// so the webhook below can match and count this booking accurately.
+app.post('/api/create-payment-link', express.json(), async (req, res) => {
+  try {
+    const {
+      workshopId, participants, observers,
+      name, phone, email,
+      bringingOwnHandpan,
+      guestNames, ownHandpanCount
+    } = req.body || {};
 
-  return createAndSendInvoice(supabase, {
-    sourceTable: 'fee_payments',
-    sourceId: feeId,
-    razorpayPaymentId: payment.id,
-    // The address typed at payment time wins (it may be a parent paying). The
-    // student's address on file is copied in, so nothing is lost either way.
-    billed: { name: studentName, email: payerEmail || payment.notes?.email || student?.email || null, phone: payerPhone || payment.notes?.phone || student?.phone || payment.contact || null, country: invoiceCountry(student, payerPhone || payment.notes?.phone || payment.contact, (currency || 'INR').toUpperCase()) },
-    cc: student?.email ? [student.email] : [],
-    currency,
-    paymentDate: todayIST(),
-    paymentMode: currency === 'INR' ? 'Razorpay UPI' : 'Razorpay International',
-    servicePeriod: null,
-    lines
-  });
+    if (!workshopId || !name || !phone) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const pCount = Number(participants) || 0;
+    const oCount = Number(observers) || 0;
+    if (pCount + oCount <= 0) {
+      return res.status(400).json({ error: 'At least one ticket is required' });
+    }
+
+    // 1. Look up the workshop, its capacity (if set), and its prices
+    const { data: workshop, error: wsError } = await supabase
+      .from('workshops')
+      .select('id, participant_capacity, observer_capacity, price_per_head, observer_price, archived, cancelled')
+      .eq('id', workshopId)
+      .single();
+
+    if (wsError || !workshop || workshop.archived) {
+      return res.status(404).json({ error: 'Workshop not found' });
+    }
+
+    // A cancelled workshop stays visible in the dashboard rather than being
+    // archived, so it has to be closed to bookings explicitly here.
+    if (workshop.cancelled) {
+      return res.status(410).json({ error: 'This workshop has been cancelled' });
+    }
+
+    // 2. If capacity is configured, re-check availability before charging.
+    // This is the server-side guard against the race condition where two
+    // people both see "1 spot left" and try to book it at the same time.
+    if (workshop.participant_capacity != null || workshop.observer_capacity != null) {
+      const { data: existing, error: existingErr } = await supabase
+        .from('participants')
+        .select('participant_count, observer_count')
+        .eq('workshop_id', workshopId);
+
+      if (existingErr) {
+        console.error('Availability check error:', existingErr.message);
+        return res.status(500).json({ error: 'Failed to check availability' });
+      }
+
+      let participantsSold = 0;
+      let observersSold = 0;
+      for (const row of (existing || [])) {
+        const counts = rowPeopleCounts(row);
+        participantsSold += counts.participantCount;
+        observersSold += counts.observerCount;
+      }
+
+      if (workshop.participant_capacity != null
+          && participantsSold + pCount > workshop.participant_capacity) {
+        return res.status(409).json({ error: 'Not enough participant slots remaining' });
+      }
+      if (workshop.observer_capacity != null
+          && observersSold + oCount > workshop.observer_capacity) {
+        return res.status(409).json({ error: 'Not enough audience pass slots remaining' });
+      }
+    }
+
+    // 3. Compute the amount server-side from this workshop's own prices —
+    // never trust an amount from the client, and never fall back to a
+    // guessed price. If a price isn't set for a ticket type someone's
+    // actually trying to buy, fail clearly instead of charging ₹0 for it.
+    const participantPrice = Number(workshop.price_per_head) || 0;
+    const observerPrice = Number(workshop.observer_price) || 0;
+
+    if (pCount > 0 && participantPrice <= 0) {
+      return res.status(400).json({ error: 'Participant price is not set for this workshop yet' });
+    }
+    if (oCount > 0 && observerPrice <= 0) {
+      return res.status(400).json({ error: 'Audience pass price is not set for this workshop yet' });
+    }
+
+    const amountRupees = pCount * participantPrice + oCount * observerPrice;
+    const amountPaise = Math.round(amountRupees * 100);
+
+    const ticketSummary = `${pCount} participant${pCount === 1 ? '' : 's'}`
+      + (oCount ? `, ${oCount} audience pass${oCount === 1 ? '' : 'es'}` : '');
+
+    // 4. Create the Razorpay Payment Link
+    const auth = Buffer.from(
+      `${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`
+    ).toString('base64');
+
+    const rzpRes = await fetch('https://api.razorpay.com/v1/payment_links', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        amount: amountPaise,
+        currency: 'INR',
+        description: `${workshopId} — ${ticketSummary}`,
+        customer: email ? { name, contact: phone, email } : { name, contact: phone },
+        notify: { sms: true, email: !!email },
+        reminder_enable: true,
+        callback_url: `https://arpitpandey.com/pages/book?ws=${encodeURIComponent(workshopId)}`,
+        callback_method: 'get',
+        notes: {
+          workshopId,
+          participants: String(pCount),
+          observers: String(oCount),
+          name,
+          phone,
+          email: email || '',
+          bringingOwnHandpan: bringingOwnHandpan || '',
+          guestNames: JSON.stringify(Array.isArray(guestNames) ? guestNames.map(n => (n || '').toString().trim()) : []),
+          ownHandpanCount: String(ownHandpanCount != null ? ownHandpanCount : 0),
+          participantPrice: String(participantPrice)
+        }
+      })
+    });
+
+    const rzpData = await rzpRes.json();
+
+    if (!rzpRes.ok) {
+      console.error('Razorpay payment link error:', rzpData);
+      return res.status(502).json({
+        error: 'Failed to create payment link',
+        detail: rzpData.error?.description || 'Unknown error'
+      });
+    }
+
+    return res.json({ short_url: rzpData.short_url, id: rzpData.id });
+  } catch (err) {
+    console.error('create-payment-link error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── CREATE BOOKING ORDER (Razorpay Checkout popup) ──
+// Called by book.html on "Reserve my spot". Same checks and the same
+// server-side price maths as /api/create-payment-link, but it creates a
+// Razorpay Order instead of a Payment Link and returns what checkout.js
+// needs. The popup opens on book.html itself with name, phone and email
+// prefilled. Notes are identical to the payment-link flow, so the webhook
+// below handles the payment without any changes (it already copies order
+// notes onto the payment when checkout.js does not pass them through).
+// /api/create-payment-link stays as the fallback when checkout.js fails
+// to load in the browser.
+app.post('/api/create-booking-order', express.json(), async (req, res) => {
+  try {
+    const {
+      workshopId, participants, observers,
+      name, phone, email,
+      bringingOwnHandpan,
+      guestNames, ownHandpanCount
+    } = req.body || {};
+
+    if (!workshopId || !name || !phone) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const pCount = Number(participants) || 0;
+    const oCount = Number(observers) || 0;
+    if (pCount + oCount <= 0) {
+      return res.status(400).json({ error: 'At least one ticket is required' });
+    }
+
+    const { data: workshop, error: wsError } = await supabase
+      .from('workshops')
+      .select('id, date, venue, participant_capacity, observer_capacity, price_per_head, observer_price, archived, cancelled')
+      .eq('id', workshopId)
+      .single();
+
+    if (wsError || !workshop || workshop.archived) {
+      return res.status(404).json({ error: 'Workshop not found' });
+    }
+    if (workshop.cancelled) {
+      return res.status(410).json({ error: 'This workshop has been cancelled' });
+    }
+
+    // Capacity re-check right before charging (race guard).
+    if (workshop.participant_capacity != null || workshop.observer_capacity != null) {
+      const { data: existing, error: existingErr } = await supabase
+        .from('participants')
+        .select('participant_count, observer_count')
+        .eq('workshop_id', workshopId);
+
+      if (existingErr) {
+        console.error('Availability check error:', existingErr.message);
+        return res.status(500).json({ error: 'Failed to check availability' });
+      }
+
+      let participantsSold = 0;
+      let observersSold = 0;
+      for (const row of (existing || [])) {
+        const counts = rowPeopleCounts(row);
+        participantsSold += counts.participantCount;
+        observersSold += counts.observerCount;
+      }
+
+      if (workshop.participant_capacity != null
+          && participantsSold + pCount > workshop.participant_capacity) {
+        return res.status(409).json({ error: 'Not enough participant slots remaining' });
+      }
+      if (workshop.observer_capacity != null
+          && observersSold + oCount > workshop.observer_capacity) {
+        return res.status(409).json({ error: 'Not enough audience pass slots remaining' });
+      }
+    }
+
+    const participantPrice = Number(workshop.price_per_head) || 0;
+    const observerPrice = Number(workshop.observer_price) || 0;
+
+    if (pCount > 0 && participantPrice <= 0) {
+      return res.status(400).json({ error: 'Participant price is not set for this workshop yet' });
+    }
+    if (oCount > 0 && observerPrice <= 0) {
+      return res.status(400).json({ error: 'Audience pass price is not set for this workshop yet' });
+    }
+
+    const amountRupees = pCount * participantPrice + oCount * observerPrice;
+    const amountPaise = Math.round(amountRupees * 100);
+
+    const ticketSummary = `${pCount} participant${pCount === 1 ? '' : 's'}`
+      + (oCount ? `, ${oCount} audience pass${oCount === 1 ? '' : 'es'}` : '');
+
+    const cleanEmail = String(email || '').trim();
+    const notes = {
+      workshopId,
+      participants: String(pCount),
+      observers: String(oCount),
+      name,
+      phone,
+      email: cleanEmail,
+      bringingOwnHandpan: bringingOwnHandpan || '',
+      guestNames: JSON.stringify(Array.isArray(guestNames) ? guestNames.map(n => (n || '').toString().trim()) : []),
+      ownHandpanCount: String(ownHandpanCount != null ? ownHandpanCount : 0),
+      participantPrice: String(participantPrice)
+    };
+
+    const auth = Buffer.from(
+      `${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`
+    ).toString('base64');
+
+    const rzpRes = await fetch('https://api.razorpay.com/v1/orders', {
+      method: 'POST',
+      headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        amount: amountPaise,
+        currency: 'INR',
+        // Razorpay caps receipt at 40 chars. Workshop id + phone digits keeps it unique enough for support lookups.
+        receipt: `${workshopId}-${String(phone).replace(/\D/g, '').slice(-10)}`.slice(0, 40),
+        notes
+      })
+    });
+    const order = await rzpRes.json();
+    if (!rzpRes.ok) {
+      console.error('Razorpay booking order error:', order);
+      return res.status(502).json({ error: 'Failed to start payment', detail: order.error?.description || 'Unknown error' });
+    }
+
+    return res.json({
+      orderId: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      keyId: process.env.RAZORPAY_KEY_ID,
+      name,
+      email: cleanEmail,
+      phone,
+      description: `Handpan workshop · ${ticketSummary}`,
+      notes
+    });
+  } catch (err) {
+    console.error('create-booking-order error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── WORKSHOP INFO + AVAILABILITY ──
+// Called by book.html on page load. Returns everything the page needs to
+// render itself for this workshop: date, time, venue, prices, and how many
+// participant / audience pass slots are left. book.html no longer hardcodes
+// any of this — it's a single template that works for any workshop ID.
+app.get('/api/workshop/:id/availability', async (req, res) => {
+  try {
+    const workshopId = req.params.id;
+
+    const { data: workshop, error: wsError } = await supabase
+      .from('workshops')
+      .select('id, date, venue, workshop_time, venue_map_url, price_per_head, observer_price, participant_capacity, observer_capacity, archived, cancelled')
+      .eq('id', workshopId)
+      .single();
+
+    if (wsError || !workshop || workshop.archived) {
+      return res.status(404).json({ error: 'Workshop not found' });
+    }
+
+    // A cancelled workshop stays visible in the dashboard rather than being
+    // archived, so it has to be closed to bookings explicitly here.
+    if (workshop.cancelled) {
+      return res.status(410).json({ error: 'This workshop has been cancelled' });
+    }
+
+    const { data: rows, error } = await supabase
+      .from('participants')
+      .select('participant_count, observer_count')
+      .eq('workshop_id', workshopId);
+
+    if (error) {
+      console.error('Availability query error:', error.message);
+      return res.status(500).json({ error: 'Failed to fetch availability' });
+    }
+
+    let participantsSold = 0;
+    let observersSold = 0;
+    for (const row of (rows || [])) {
+      const counts = rowPeopleCounts(row);
+      participantsSold += counts.participantCount;
+      observersSold += counts.observerCount;
+    }
+
+    const result = {
+      workshopId,
+      date: workshop.date,
+      time: workshop.workshop_time || null,
+      venue: workshop.venue || null,
+      venueMapUrl: workshop.venue_map_url || null,
+      participantPrice: workshop.price_per_head != null ? Number(workshop.price_per_head) : null,
+      observerPrice: workshop.observer_price != null ? Number(workshop.observer_price) : null,
+      participantsSold,
+      observersSold
+    };
+
+    if (workshop.participant_capacity != null) {
+      result.participantsRemaining = Math.max(0, workshop.participant_capacity - participantsSold);
+    }
+    if (workshop.observer_capacity != null) {
+      result.observersRemaining = Math.max(0, workshop.observer_capacity - observersSold);
+    }
+
+    return res.json(result);
+  } catch (err) {
+    console.error('availability error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── FEE REQUEST INFO ──
+// Called by pay.html on load. Returns only what the page needs.
+app.get('/api/fee-request/:id', async (req, res) => {
+  try {
+    const result = await resolveFeeRequest(req.params.id);
+    if (result.error) return res.status(404).json({ error: 'Fee request not found' });
+    return res.json(result.fee);
+  } catch (err) {
+    console.error('fee-request error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── CREATE FEE PAYMENT LINK ──
+// Called by pay.html on Pay. Creates a Razorpay Payment Link for exactly this
+// request, in its currency, and stashes requestId in notes for the webhook.
+app.post('/api/create-fee-payment-link', express.json(), async (req, res) => {
+  try {
+    const { requestId } = req.body || {};
+    const result = await resolveFeeRequest(requestId);
+    if (result.error) return res.status(404).json({ error: 'Fee request not found' });
+
+    const { request, student, fee } = result;
+    if (request.status === 'paid') {
+      return res.status(409).json({ error: 'This fee has already been paid' });
+    }
+
+    const isINR = fee.currency === 'INR';
+    const amountMinor = Math.round(fee.amount * 100);   // paise or cents
+
+    const customer = { name: student.full_name };
+    if (student.email) customer.email = student.email;
+    if (student.phone) customer.contact = student.phone;
+
+    const auth = Buffer.from(
+      `${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`
+    ).toString('base64');
+
+    const rzpRes = await fetch('https://api.razorpay.com/v1/payment_links', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        amount: amountMinor,
+        currency: fee.currency,
+        description: `${fee.label} — ${student.full_name} (${request.id})`,
+        customer,
+        // Student is already on pay.html, no need for Razorpay's payment requested SMS/email
+        notify: { sms: false, email: false },
+        reminder_enable: false,
+        callback_url: `https://arpitpandey.com/pages/pay?r=${encodeURIComponent(request.id)}`,
+        callback_method: 'get',
+        notes: {
+          kind: 'fee_request',
+          requestId: request.id,
+          studentId: student.id,
+          name: student.full_name,
+          email: student.email || '',
+          classes: String(fee.classes),
+          label: fee.label,
+          currency: fee.currency,
+          amount: String(fee.amount)
+        }
+      })
+    });
+
+    const rzpData = await rzpRes.json();
+    if (!rzpRes.ok) {
+      console.error('Razorpay fee payment link error:', rzpData);
+      return res.status(502).json({
+        error: 'Failed to create payment link',
+        detail: rzpData.error?.description || 'Unknown error'
+      });
+    }
+
+    // Remember which link belongs to this request (handy for support).
+    await supabase.from('fee_requests')
+      .update({ razorpay_link_id: rzpData.id })
+      .eq('id', request.id);
+
+    return res.json({ short_url: rzpData.short_url, id: rzpData.id });
+  } catch (err) {
+    console.error('create-fee-payment-link error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── CREATE FEE ORDER (Razorpay Checkout popup) ──
+// Called by pay.html on Pay. Creates a Razorpay Order for this request and
+// returns what checkout.js needs. The popup opens on pay.html itself with the
+// student's name, phone and email prefilled, so nothing is typed twice.
+// Phone and email may have been corrected on the page; they go into notes
+// and are used for the invoice (student row on file is CC'd).
+app.post('/api/create-fee-order', express.json(), async (req, res) => {
+  try {
+    const { requestId, phone, email } = req.body || {};
+    const result = await resolveFeeRequest(requestId);
+    if (result.error) return res.status(404).json({ error: 'Fee request not found' });
+
+    const { request, student, fee } = result;
+    if (request.status === 'paid') {
+      return res.status(409).json({ error: 'This fee has already been paid' });
+    }
+    if (request.status === 'cancelled') {
+      return res.status(410).json({ error: 'This payment link was cancelled' });
+    }
+
+    // The request only flips to 'paid' when the webhook lands. If the student
+    // refreshes in that window, do not let them pay twice: ask Razorpay
+    // whether the previous order already has a captured payment.
+    const { data: reqRow } = await supabase.from('fee_requests').select('razorpay_order_id').eq('id', request.id).maybeSingle();
+    if (reqRow?.razorpay_order_id) {
+      try {
+        const authChk = Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString('base64');
+        const pRes = await fetch(`https://api.razorpay.com/v1/orders/${reqRow.razorpay_order_id}/payments`, { headers: { 'Authorization': `Basic ${authChk}` } });
+        const pData = await pRes.json();
+        if (pRes.ok && Array.isArray(pData.items) && pData.items.some(p => p.status === 'captured')) {
+          return res.status(409).json({ error: 'This fee has already been paid' });
+        }
+      } catch (e) { console.warn('order payments check failed:', e.message); }
+    }
+
+    const payerEmail = String(email || student.email || '').trim();
+    const payerPhone = String(phone || student.phone || '').trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(payerEmail)) {
+      return res.status(400).json({ error: 'Enter a valid email address' });
+    }
+    if (payerPhone.replace(/\D/g, '').length < 8) {
+      return res.status(400).json({ error: 'Enter a valid phone number' });
+    }
+
+    const amountMinor = Math.round(fee.amount * 100);
+    const notes = {
+      kind: 'fee_request',
+      requestId: request.id,
+      studentId: student.id,
+      name: student.full_name,
+      email: payerEmail,
+      phone: payerPhone,
+      classes: String(fee.classes),
+      label: fee.label,
+      currency: fee.currency,
+      amount: String(fee.amount),
+      month: request.month || ''
+    };
+
+    const auth = Buffer.from(
+      `${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`
+    ).toString('base64');
+
+    const rzpRes = await fetch('https://api.razorpay.com/v1/orders', {
+      method: 'POST',
+      headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        amount: amountMinor,
+        currency: fee.currency,
+        receipt: request.id,
+        notes
+      })
+    });
+    const order = await rzpRes.json();
+    if (!rzpRes.ok) {
+      console.error('Razorpay fee order error:', order);
+      return res.status(502).json({ error: 'Failed to start payment', detail: order.error?.description || 'Unknown error' });
+    }
+
+    await supabase.from('fee_requests').update({ razorpay_order_id: order.id }).eq('id', request.id);
+
+    return res.json({
+      orderId: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      keyId: process.env.RAZORPAY_KEY_ID,
+      name: student.full_name,
+      email: payerEmail,
+      phone: payerPhone,
+      description: `${fee.label} — ${student.full_name}`,
+      notes
+    });
+  } catch (err) {
+    console.error('create-fee-order error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── WAITLIST SIGNUP ──
+// Called by book.html when someone on a sold-out workshop submits the
+// "which month works for you" prompt. Always source: 'Website' here — the
+// dashboard's manual-entry form writes to Supabase directly like every
+// other section does, it doesn't go through this endpoint.
+app.post('/api/waitlist', express.json(), async (req, res) => {
+  try {
+    const { name, phone, email, preferredMonth } = req.body || {};
+
+    if (!name || !phone) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const waitlistId = await generateId('workshop_waitlist', 'WL');
+
+    const { error } = await supabase.from('workshop_waitlist').insert({
+      id: waitlistId,
+      full_name: name,
+      phone,
+      email: email || null,
+      preferred_month: preferredMonth || null,
+      source: 'Website',
+      contacted: false
+    });
+
+    if (error) {
+      console.error('Error saving waitlist entry:', error.message);
+      return res.status(500).json({ error: 'Failed to save waitlist entry' });
+    }
+
+    let monthLabel = 'a future workshop';
+    if (preferredMonth) {
+      const d = new Date(`${preferredMonth}T00:00:00`);
+      if (!isNaN(d)) monthLabel = d.toLocaleDateString('en-IN', { month: 'long', year: 'numeric' });
+    }
+
+    await supabase.from('notifications').insert({
+      type: 'info',
+      message: `📋 New waitlist signup: ${name} — interested in ${monthLabel}`,
+      read: false
+    });
+
+    return res.json({ id: waitlistId });
+  } catch (err) {
+    console.error('waitlist error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── DASHBOARD INVOICE ENDPOINTS ──
+// Called by dashboard.html with the logged-in user's Supabase token. The
+// token is verified against Supabase Auth; only a non-viewer account may
+// render or send invoices. No separate secret to manage.
+const VIEWER_EMAILS = (process.env.DASHBOARD_VIEWER_EMAILS || 'arpitbam@gmail.com')
+  .split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
+
+async function requireAdmin(req, res, next) {
+  try {
+    const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+    if (!token) return res.status(401).json({ error: 'Sign in required' });
+    const { data, error } = await supabase.auth.getUser(token);
+    const email = (data?.user?.email || '').toLowerCase();
+    if (error || !email) return res.status(401).json({ error: 'Session expired, sign in again' });
+    if (VIEWER_EMAILS.includes(email)) return res.status(403).json({ error: 'Viewer access only' });
+    req.adminEmail = email;
+    next();
+  } catch (e) {
+    console.error('requireAdmin error:', e.message);
+    return res.status(401).json({ error: 'Could not verify session' });
+  }
 }
 
-module.exports = { createAndSendInvoice, invoiceWorkshopBooking, invoiceFeePayment, invoiceFromRow, renderAndStore, getPdf, emailInvoice, pdfFilename, buildInvoicePdf };
+async function loadInvoiceRow(id) {
+  const { data, error } = await supabase.from('invoices').select('*').eq('id', id).single();
+  if (error || !data) return null;
+  return data;
+}
+
+// PDF for an existing invoice: stored file if present, otherwise rendered now.
+app.get('/api/invoice/:id/pdf', requireAdmin, async (req, res) => {
+  try {
+    const row = await loadInvoiceRow(req.params.id);
+    if (!row) return res.status(404).json({ error: 'Invoice not found' });
+    const fresh = req.query.fresh === '1' || row.cancelled;   // cancelled: always re-render so the watermark shows
+    const { pdf } = fresh ? await renderAndStore(supabase, row) : await getPdf(supabase, row);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'inline; filename="' + pdfFilename(row) + '"');
+    return res.send(pdf);
+  } catch (err) {
+    console.error('invoice pdf error:', err);
+    return res.status(500).json({ error: err.message || 'Could not build the PDF' });
+  }
+});
+
+// Send (or resend) an existing invoice by email. Body may carry { to } to override.
+app.post('/api/invoice/:id/send', requireAdmin, express.json(), async (req, res) => {
+  try {
+    const row = await loadInvoiceRow(req.params.id);
+    if (!row) return res.status(404).json({ error: 'Invoice not found' });
+    if (row.cancelled) return res.status(409).json({ error: 'This invoice is cancelled' });
+    const { pdf } = await renderAndStore(supabase, row);   // always current data
+    const to = await emailInvoice(supabase, row, pdf, req.body?.to);
+    await supabase.from('notifications').insert({ type: 'info', message: `🧾 Invoice ${pdfFilename(row).split('_')[0]} sent to ${to} (${row.billed_name})`, read: false });
+    return res.json({ ok: true, to });
+  } catch (err) {
+    console.error('invoice send error:', err);
+    try { await supabase.from('invoices').update({ email_error: err.message }).eq('id', req.params.id); } catch (e) {}
+    return res.status(500).json({ error: err.message || 'Could not send the invoice' });
+  }
+});
+
+// Preview an unsaved invoice from the editor. Body is a row-shaped object.
+app.post('/api/invoice/preview', requireAdmin, express.json({ limit: '200kb' }), async (req, res) => {
+  try {
+    const body = req.body || {};
+    const row = { ...body, invoice_number: Number(body.invoice_number) || 0, id: body.id || 'preview' };
+    const pdf = await buildInvoicePdf(invoiceFromRow(row));
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'inline; filename="preview.pdf"');
+    return res.send(pdf);
+  } catch (err) {
+    console.error('invoice preview error:', err);
+    return res.status(500).json({ error: err.message || 'Could not build the preview' });
+  }
+});
+
+// ── RAZORPAY WEBHOOK ──
+app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), async (req, res) => {
+  try {
+    // 1. Verify signature
+    const signature = req.headers['x-razorpay-signature'];
+    const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
+    const expectedSignature = crypto
+      .createHmac('sha256', secret)
+      .update(req.body)
+      .digest('hex');
+
+    if (signature !== expectedSignature) {
+      console.warn('Invalid Razorpay webhook signature');
+      return res.status(400).json({ error: 'Invalid signature' });
+    }
+
+    const event = JSON.parse(req.body.toString());
+    console.log('Webhook event:', event.event);
+
+    // ── PAYMENT CAPTURED ──
+    if (event.event === 'payment.captured') {
+      const payment = event.payload.payment.entity;
+      // Checkout (Orders API) payments: notes live on the order. Copy them
+      // onto the payment if checkout.js did not pass them through.
+      if ((!payment.notes || !Object.keys(payment.notes).length) && payment.order_id) {
+        try {
+          const auth = Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString('base64');
+          const oRes = await fetch(`https://api.razorpay.com/v1/orders/${payment.order_id}`, { headers: { 'Authorization': `Basic ${auth}` } });
+          const order = await oRes.json();
+          if (oRes.ok && order.notes && Object.keys(order.notes).length) payment.notes = order.notes;
+        } catch (e) { console.error('order notes fetch failed:', e.message); }
+      }
+      const fields = extractPaymentFields(payment);
+      const today = todayISTDate();
+
+      console.log('Payment:', payment.id, '₹' + fields.amount, 'from', fields.name);
+      console.log('Notes:', JSON.stringify(payment.notes));
+
+      const isGeneral = fields.pageId === GENERAL_PAYMENT_PAGE_ID;
+
+      // 2. Idempotency — skip if already processed
+      if (isGeneral) {
+        if (await isAlreadyUnassigned(payment.id)) {
+          console.log('Duplicate unassigned — skipping:', payment.id);
+          return res.json({ received: true, skipped: 'duplicate' });
+        }
+      } else {
+        if (await isAlreadyProcessed(payment.id)) {
+          console.log('Duplicate payment — skipping:', payment.id);
+          return res.json({ received: true, skipped: 'duplicate' });
+        }
+      }
+
+      // ── FEE REQUEST PAYMENT (from pay.html) ──
+      // Payment Links created by /api/create-fee-payment-link carry
+      // notes.kind = 'fee_request'. Class fees, not workshop bookings, so
+      // they skip the workshop matching below. Returns early on purpose.
+      if (payment.notes && payment.notes.kind === 'fee_request') {
+        const requestId = payment.notes.requestId || null;
+        const currency = (payment.currency || payment.notes.currency || 'INR').toUpperCase();
+        const amountMajor = payment.amount / 100;   // paise → rupees, cents → dollars
+        const isINR = currency === 'INR';
+
+        // Idempotency on our own unique index.
+        const { data: dup } = await supabase
+          .from('fee_payments')
+          .select('id')
+          .eq('razorpay_payment_id', payment.id)
+          .limit(1);
+        if (dup && dup.length > 0) {
+          console.log('Duplicate fee request payment — skipping:', payment.id);
+          return res.json({ received: true, skipped: 'duplicate' });
+        }
+
+        const { data: request } = await supabase
+          .from('fee_requests')
+          .select('id, student_id, classes, month, note, list_amount, discount_pct')
+          .eq('id', requestId)
+          .single();
+
+        const studentId = request?.student_id || payment.notes.studentId || null;
+        let student = null;
+        if (studentId) {
+          const { data: sRow, error: sErr } = await supabase.from('students').select('*').eq('id', studentId).maybeSingle();
+          if (sErr) console.error('student lookup failed:', studentId, sErr.message);
+          student = sRow || null;
+        }
+        console.log('Fee student:', studentId, student ? (student.email || 'no email') : 'NOT FOUND');
+
+        const studentName = student?.full_name || payment.notes.name || fields.name;
+        const classes = request?.classes ?? (parseInt(payment.notes.classes, 10) || null);
+        const label = payment.notes.label || (classes ? `Fee for ${classes} classes` : 'Class fee');
+        // Fee month comes from the request (chosen when the link was made).
+        // Old links without one fall back to the current month in India.
+        const feeMonth = (request?.month && /^\d{4}-\d{2}$/.test(request.month)) ? request.month : monthYM(nowIST());
+        const monthLabel = feeMonth;
+        const symbol = { INR: '₹', USD: '$', EUR: '€', GBP: '£', CHF: 'CHF ', AUD: 'A$', SGD: 'S$', AED: 'AED ' }[currency] || (currency + ' ');
+
+        const feeId = await generateId('fee_payments', 'FP');
+
+        // ── FEE PAYMENT INSERT ──
+        // ignoreDuplicates: true means a webhook retry that hits the unique
+        // constraint on razorpay_payment_id silently skips instead of
+        // throwing, so the handler returns success and Razorpay stops retrying.
+        const { error: feeErr } = await supabase.from('fee_payments').insert({
+          id: feeId,
+          student_id: studentId,
+          student_name: studentName,
+          month: monthLabel,
+          classes,
+          amount: amountMajor,
+          currency,
+          payment_mode: isINR ? 'Razorpay UPI' : 'Razorpay International',
+          paid: true,
+          payment_date: today,
+          razorpay_payment_id: payment.id,
+          description: `${label}${request?.note ? ' · ' + request.note : ''} · ${requestId} · ${payment.id}`
+        }, { onConflict: 'razorpay_payment_id', ignoreDuplicates: true });
+
+        if (feeErr) {
+          console.error('Error saving fee payment:', feeErr.message);
+          await supabase.from('notifications').insert({
+            type: 'warning',
+            message: `⚠️ Failed to save fee payment for ${studentName} — ${requestId} / ${payment.id}. Error: ${feeErr.message}`,
+            read: false
+          });
+          return res.status(500).json({ error: 'Failed to save fee payment', detail: feeErr.message });
+        }
+
+        // Mark the request paid so the link can't be used twice.
+        if (requestId) {
+          await supabase.from('fee_requests')
+            .update({ status: 'paid', paid_at: new Date().toISOString(), razorpay_payment_id: payment.id, fee_payment_id: feeId })
+            .eq('id', requestId);
+        }
+
+        // Income ledger (payments table) is in rupees. INR goes straight in.
+        // Foreign currency is NOT inserted — Razorpay's INR settlement amount
+        // isn't in the webhook, and "499" in a rupee ledger would be wrong.
+        // The notification reminds Arpit to add it from the settlement report.
+        if (isINR) {
+          const { data: payNum } = await supabase.rpc('next_payment_number');
+          const paymentId = payNum != null ? `PAY-${String(payNum).padStart(3, '0')}` : `PAY-${Date.now()}`;
+          const { error: payErr } = await supabase.from('payments').insert({
+            id: paymentId,
+            razorpay_payment_id: payment.id,
+            reference_id: studentId,
+            payer_name: studentName,
+            amount: amountMajor,
+            payment_mode: 'Razorpay UPI',
+            type: 'income',
+            category: 'class',
+            synced_from_razorpay: true,
+            date: today,
+            description: `${label} — ${studentName} (${feeId})`
+          });
+          if (payErr) console.error('Error saving payment record:', payErr.message);
+        }
+
+        await supabase.from('notifications').insert({
+          type: 'payment',
+          message: isINR
+            ? `✅ Fee received: ₹${amountMajor} from ${studentName} — ${label} (${feeId})`
+            : `🌍 International fee received: ${symbol}${amountMajor} ${currency} from ${studentName} — ${label} (${feeId}). Add the INR settlement to Payments once Razorpay settles.`,
+          read: false
+        });
+
+        // Auto invoice: number, row, PDF, storage, email. Never throws; any
+        // failure becomes a dashboard notification and the fee stays saved.
+        // Email and phone typed on pay.html (notes) or on Razorpay's page (fields).
+        const payerEmail = (payment.notes.email || fields.email || '').trim() || null;
+        const payerPhone = (payment.notes.phone || fields.phone || '').trim() || null;
+        if (student && payerEmail && student.email && payerEmail.toLowerCase() !== String(student.email).toLowerCase()) {
+          await supabase.from('notifications').insert({
+            type: 'info',
+            message: `✉️ ${studentName} paid ${feeId} with a different email: ${payerEmail} (on file: ${student.email}). Update the student if this is their new address.`,
+            read: false
+          });
+        }
+
+        const invoice = await invoiceFeePayment(supabase, {
+          feeId, studentName, student, classes: classes || 0, amountMajor, currency, payment, today, feeMonth,
+          payerEmail, payerPhone,
+          listAmount: Number(request?.list_amount) || 0,
+          discountPct: Number(request?.discount_pct) || 0
+        });
+
+        return res.json({ received: true, routed: 'fee_request', requestId, feeId, invoice });
+      }
+
+      // 3. Route general payments to unassigned
+      if (isGeneral) {
+        const unassignedId = await generateId('unassigned_payments', 'UP');
+        const { error } = await supabase.from('unassigned_payments').insert({
+          id: unassignedId,
+          amount: fields.amount,
+          payer_name: fields.name,
+          payer_phone: fields.phone,
+          payer_email: fields.email,
+          razorpay_payment_id: payment.id,
+          razorpay_order_id: payment.order_id || null,
+          date: today,
+          status: 'pending',
+          notes: `Auto-created from Razorpay payment ${payment.id}`
+        });
+
+        if (error) {
+          console.error('Error saving unassigned:', error.message);
+          return res.status(500).json({ error: 'Failed to save unassigned payment' });
+        }
+
+        await supabase.from('notifications').insert({
+          type: 'payment',
+          message: `💸 New unassigned payment: ₹${fields.amount} from ${fields.name} — needs assignment`,
+          read: false
+        });
+
+        return res.json({ received: true, routed: 'unassigned', id: unassignedId });
+      }
+
+      // 4. Match workshop
+      let workshopId = null;
+      let matchMethod = null;
+
+      // NEW: try a direct match via workshopId stashed in notes by
+      // /api/create-payment-link. This is the most reliable match, and is
+      // checked first. Old-flow payments (from manually-created Payment
+      // Pages) won't have this, so they fall through to the checks below
+      // exactly as before.
+      if (fields.workshopIdFromNotes) {
+        workshopId = await findWorkshopById(fields.workshopIdFromNotes);
+        if (workshopId) {
+          matchMethod = 'notes_workshop_id';
+          console.log('Workshop matched by notes.workshopId:', workshopId);
+        }
+      }
+
+      if (!workshopId) {
+        workshopId = await findWorkshopByPageId(fields.pageId);
+        if (workshopId) {
+          matchMethod = 'page_id';
+          console.log('Workshop matched by page_id:', workshopId);
+        } else {
+          const matched = await findWorkshopByDateAndAmount(fields.amount, today);
+          if (matched) {
+            workshopId = matched.id;
+            matchMethod = 'date_amount';
+            console.log('Workshop matched by date+amount:', workshopId);
+          }
+        }
+      }
+
+      // 5. No workshop match → unassigned
+      if (!workshopId) {
+        const unassignedId = await generateId('unassigned_payments', 'UP');
+        await supabase.from('unassigned_payments').insert({
+          id: unassignedId,
+          amount: fields.amount,
+          payer_name: fields.name,
+          payer_phone: fields.phone,
+          payer_email: fields.email,
+          razorpay_payment_id: payment.id,
+          date: today,
+          status: 'pending',
+          notes: `No workshop match found. Payment ${payment.id}`
+        });
+
+        await supabase.from('notifications').insert({
+          type: 'warning',
+          message: `⚠️ No workshop matched for payment ₹${fields.amount} from ${fields.name} — moved to unassigned`,
+          read: false
+        });
+
+        return res.json({ received: true, routed: 'unassigned_no_match', id: unassignedId });
+      }
+
+      // 6. Save participant(s) with full payload — one row per person for
+      // new-flow bookings (which always carry notes.participants), or the
+      // original single row for old-flow Payment Page payments that don't
+      // have per-person data to split out.
+      let participantIds;
+      if (fields.participantCount != null) {
+        const pCount = fields.participantCount ?? 1;
+        const ids = await generateSequentialIds('participants', 'P', pCount);
+        const rows = buildParticipantRows(ids, fields, workshopId, matchMethod, payment, today);
+        const result = await saveParticipantGroup(rows);
+
+        if (!result.success) {
+          return res.status(500).json({ error: 'Failed to save participants', detail: result.error });
+        }
+        participantIds = ids;
+      } else {
+        const participantId = await generateId('participants', 'P');
+        const result = await saveParticipant(participantId, fields, workshopId, matchMethod, payment);
+
+        if (!result.success) {
+          return res.status(500).json({ error: 'Failed to save participant', detail: result.error });
+        }
+        participantIds = [participantId];
+      }
+
+      // Workshop stats (pax / revenue / profit / margin) are now recomputed
+      // automatically by a database trigger whenever participants or payments
+      // change. Nothing to update here.
+
+      // 8. Save payment record
+      const { data: payNum, error: payNumErr } = await supabase.rpc('next_payment_number');
+      if (payNumErr || payNum == null) {
+        console.error('Error getting payment number:', payNumErr?.message);
+        await supabase.from('notifications').insert({
+          type: 'warning',
+          message: `⚠️ Could not generate payment number for ${fields.name} — Payment ${payment.id}. Booking saved but payment record missing.`,
+          read: false
+        });
+      }
+      const paymentId = payNum != null ? `PAY-${String(payNum).padStart(3, '0')}` : `PAY-${Date.now()}`;
+      const { error: payErr } = await supabase.from('payments').insert({
+        id: paymentId,
+        razorpay_payment_id: payment.id,
+        reference_id: workshopId,
+        payer_name: fields.name,
+        amount: fields.amount,
+        payment_mode: 'Razorpay UPI',
+        type: 'income',
+        category: 'workshop',
+        synced_from_razorpay: true,
+        date: today,
+        description: `Workshop ${workshopId} — ${fields.name}`
+      });
+
+      if (payErr) {
+        console.error('Error saving payment record:', payErr.message);
+        await supabase.from('notifications').insert({
+          type: 'warning',
+          message: `⚠️ Payment record failed for ${fields.name} (${workshopId}) — ₹${fields.amount}. Error: ${payErr.message}`,
+          read: false
+        });
+      }
+
+      // 9. Success notification
+      await supabase.from('notifications').insert({
+        type: 'payment',
+        message: `✅ New booking: ₹${fields.amount} from ${fields.name} → ${workshopId} (${matchMethod})`,
+        read: false
+      });
+
+      // 10. Auto invoice to the lead for the whole booking. Never throws; any
+      // failure becomes a dashboard notification and the booking stays saved.
+      const invoice = await invoiceWorkshopBooking(supabase, {
+        workshopId, fields, payment, participantIds, today
+      });
+
+      return res.json({ received: true, routed: 'workshop', workshopId, participantIds, paymentId, invoice });
+    }
+
+    // ── PAYMENT FAILED ──
+    if (event.event === 'payment.failed') {
+      const payment = event.payload.payment.entity;
+      const name = payment.notes?.name || payment.customer_name || 'Unknown';
+      console.log('Payment failed:', payment.id);
+      await supabase.from('notifications').insert({
+        type: 'warning',
+        message: `⚠️ Payment failed: ₹${payment.amount / 100} from ${name} — ID ${payment.id}`,
+        read: false
+      });
+    }
+
+    res.json({ received: true });
+
+  } catch (err) {
+    console.error('Webhook error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── START ──
+app.listen(PORT, () => {
+  console.log(`Handpan webhook server running on port ${PORT}`);
+  console.log(`Health: http://localhost:${PORT}/health`);
+});
