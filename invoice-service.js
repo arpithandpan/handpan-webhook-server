@@ -347,7 +347,7 @@ async function invoiceFeePayment(supabase, { feeId, studentName, student, classe
     ? [{ desc: 'Online Handpan Classes', qty, rate }]
     : [{ desc: 'Online Handpan Classes' + (classes > 0 ? ' (' + classes + ' classes)' : ''), qty: 1, rate: gross }];
   if (discount > 0) {
-    lines.push({ desc: 'Package discount' + (Number(discountPct) > 0 ? ' (' + Number(discountPct) + '%)' : ''), qty: 1, rate: -discount });
+    lines.push({ desc: 'Discount' + (Number(discountPct) > 0 ? ' (' + Number(discountPct) + '%)' : ''), qty: 1, rate: -discount });
   }
 
   return createAndSendInvoice(supabase, {
