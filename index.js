@@ -2,6 +2,7 @@ const express = require('express');
 const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 const { invoiceWorkshopBooking, invoiceFeePayment, invoiceFromRow, getPdf, renderAndStore, emailInvoice, pdfFilename, buildInvoicePdf } = require('./invoice-service');
+const zoom = require('./zoom-service');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -36,6 +37,7 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
+zoom.init(supabase);
 
 // ── GENERAL PAYMENT PAGE ID ──
 const GENERAL_PAYMENT_PAGE_ID = 'pl_SvxuRdqY2rd7ge';
@@ -1115,6 +1117,34 @@ app.post('/api/invoice/preview', requireAdmin, express.json({ limit: '200kb' }),
   }
 });
 
+// ── ZOOM (attendance auto-log, logic lives in zoom-service.js) ──
+// Webhook: Zoom calls this when a meeting ends. Raw body for the signature check.
+app.post('/api/webhooks/zoom', express.raw({ type: '*/*' }), zoom.webhookHandler);
+
+// Quick check that the Zoom env vars are loaded. No secrets in the reply.
+app.get('/api/zoom/status', (req, res) => res.json(zoom.status()));
+
+// Dashboard review list: this Zoom person is that student. Logs the class
+// with the same rules as the worker and remembers the name.
+app.post('/api/zoom/unmatched/:id/resolve', requireAdmin, express.json(), async (req, res) => {
+  try {
+    const studentId = (req.body && req.body.studentId) || '';
+    if (!studentId) return res.status(400).json({ error: 'Pick a student' });
+    const out = await zoom.resolveUnmatched(req.params.id, studentId);
+    if (out.status !== 200) return res.status(out.status).json({ error: out.error });
+    return res.json(out);
+  } catch (err) {
+    console.error('zoom resolve error:', err);
+    return res.status(500).json({ error: err.message || 'Could not log the class' });
+  }
+});
+
+// Run the Zoom worker now instead of waiting for the next 5 minute tick.
+app.post('/api/zoom/process-now', requireAdmin, async (req, res) => {
+  try { return res.json(await zoom.processPending()); }
+  catch (err) { return res.status(500).json({ error: err.message }); }
+});
+
 // ── RAZORPAY WEBHOOK ──
 app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
@@ -1494,4 +1524,5 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
 app.listen(PORT, () => {
   console.log(`Handpan webhook server running on port ${PORT}`);
   console.log(`Health: http://localhost:${PORT}/health`);
+  zoom.startWorker();
 });
