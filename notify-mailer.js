@@ -1,18 +1,29 @@
 // notify-mailer.js
-// Emails dashboard notifications to Arpit. Runs inside the Railway server.
+// Emails dashboard notifications to Arpit, and WhatsApps the urgent ones.
+// Runs inside the Railway server.
 //
 // How it works: every part of the system already writes its notifications
 // into the `notifications` table. This worker checks that table every
-// 2 minutes and emails anything new, then marks it emailed. One place,
+// 2 minutes, emails anything new, and sends the urgent ones to WhatsApp
+// too (via Meta's Cloud API, template `dashboard_alert`). One place,
 // catches everything — nothing else in the codebase needed changing.
 //
-// Channels are decided by category (see channelFor). Today only email is
-// wired up; when WhatsApp is added later it plugs into the same routing.
+// Channels are decided by category (see channelFor). Email gets everything;
+// WhatsApp gets only what channelFor marks urgent.
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const NOTIFY_EMAIL_TO = (process.env.NOTIFY_EMAIL_TO || 'arpithandpan@gmail.com').trim();
 const NOTIFY_FROM = process.env.NOTIFY_FROM_EMAIL || 'notifications@arpitpandey.com';
 const DASHBOARD_URL = 'https://arpitpandey.com/pages/dashboard';
+
+// WhatsApp (Meta Cloud API). All three must be set in Railway, else the
+// WhatsApp side stays off and everything behaves exactly as before.
+const WHATSAPP_TOKEN = (process.env.WHATSAPP_TOKEN || '').trim();
+const WHATSAPP_PHONE_NUMBER_ID = (process.env.WHATSAPP_PHONE_NUMBER_ID || '').trim();
+const NOTIFY_WHATSAPP_TO = (process.env.NOTIFY_WHATSAPP_TO || '').trim(); // digits with country code, no +
+const WHATSAPP_ON = !!(WHATSAPP_TOKEN && WHATSAPP_PHONE_NUMBER_ID && NOTIFY_WHATSAPP_TO);
+const WHATSAPP_TEMPLATE = 'dashboard_alert'; // approved Utility template, body: "Handpan dashboard alert: {{1}}. Open the dashboard for details."
+const WHATSAPP_LANG = 'en';
 
 const EVERY_MS = 2 * 60 * 1000;
 const MAX_ATTEMPTS = 5;
@@ -21,9 +32,9 @@ let supabase = null;
 function init(client) { supabase = client; }
 
 // ── ROUTING ──
-// 'urgent' notifications will also go to WhatsApp once that exists.
-// Everything goes to email. Routing looks at what the message is about,
-// since the notifications table only stores type + message text.
+// 'urgent' notifications also go to WhatsApp. Everything goes to email.
+// Routing looks at what the message is about, since the notifications
+// table only stores type + message text.
 function channelFor(n) {
   const msg = String(n.message || '');
   const urgent =
@@ -69,6 +80,38 @@ async function sendEmail(n) {
   }
 }
 
+// ── WHATSAPP ──
+// Template parameters may not contain newlines/tabs or long runs of
+// spaces, so collapse whitespace. Meta caps template params well above
+// this, but keep it short — it's a phone alert.
+function whatsappText(n) {
+  let s = String(n.message || 'Dashboard notification').replace(/\s+/g, ' ').trim();
+  if (s.length > 900) s = s.slice(0, 897) + '...';
+  return s;
+}
+
+async function sendWhatsApp(n) {
+  const res = await fetch('https://graph.facebook.com/v21.0/' + WHATSAPP_PHONE_NUMBER_ID + '/messages', {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + WHATSAPP_TOKEN, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      messaging_product: 'whatsapp',
+      to: NOTIFY_WHATSAPP_TO,
+      type: 'template',
+      template: {
+        name: WHATSAPP_TEMPLATE,
+        language: { code: WHATSAPP_LANG },
+        components: [{ type: 'body', parameters: [{ type: 'text', text: whatsappText(n) }] }]
+      }
+    })
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const err = (data && data.error) || {};
+    throw new Error(err.message || ('WhatsApp HTTP ' + res.status));
+  }
+}
+
 // ── WORKER ──
 let _running = false;
 async function processPending() {
@@ -76,25 +119,50 @@ async function processPending() {
   _running = true;
   try {
     const { data, error } = await supabase.from('notifications')
-      .select('id, type, message, created_at, email_attempts')
-      .eq('emailed', false)
+      .select('id, type, message, created_at, email_attempts, emailed, whatsapped, whatsapp_attempts')
+      .or('emailed.eq.false,whatsapped.eq.false')
       .order('created_at', { ascending: true })
       .limit(15);
     if (error) { console.error('notify-mailer query error:', error.message); return; }
 
     for (const n of data || []) {
-      try {
-        await sendEmail(n);
-        await supabase.from('notifications').update({ emailed: true }).eq('id', n.id);
-      } catch (e) {
-        const attempts = (Number(n.email_attempts) || 0) + 1;
-        const giveUp = attempts >= MAX_ATTEMPTS;
-        console.error('notify email failed (attempt ' + attempts + '):', e.message);
-        // After MAX_ATTEMPTS we stop trying so one bad row can never block
-        // the queue. The notification itself is still on the dashboard.
-        await supabase.from('notifications')
-          .update({ email_attempts: attempts, ...(giveUp ? { emailed: true } : {}) })
-          .eq('id', n.id);
+      // 1) Email — untouched behaviour.
+      if (!n.emailed) {
+        try {
+          await sendEmail(n);
+          await supabase.from('notifications').update({ emailed: true }).eq('id', n.id);
+        } catch (e) {
+          const attempts = (Number(n.email_attempts) || 0) + 1;
+          const giveUp = attempts >= MAX_ATTEMPTS;
+          console.error('notify email failed (attempt ' + attempts + '):', e.message);
+          // After MAX_ATTEMPTS we stop trying so one bad row can never block
+          // the queue. The notification itself is still on the dashboard.
+          await supabase.from('notifications')
+            .update({ email_attempts: attempts, ...(giveUp ? { emailed: true } : {}) })
+            .eq('id', n.id);
+        }
+      }
+
+      // 2) WhatsApp — urgent rows only. Non-urgent rows (and rows arriving
+      // while WhatsApp is unconfigured) are marked done immediately so the
+      // queue stays clean.
+      if (!n.whatsapped) {
+        const route = channelFor(n);
+        if (!route.whatsapp || !WHATSAPP_ON) {
+          await supabase.from('notifications').update({ whatsapped: true }).eq('id', n.id);
+        } else {
+          try {
+            await sendWhatsApp(n);
+            await supabase.from('notifications').update({ whatsapped: true }).eq('id', n.id);
+          } catch (e) {
+            const attempts = (Number(n.whatsapp_attempts) || 0) + 1;
+            const giveUp = attempts >= MAX_ATTEMPTS;
+            console.error('notify whatsapp failed (attempt ' + attempts + '):', e.message);
+            await supabase.from('notifications')
+              .update({ whatsapp_attempts: attempts, ...(giveUp ? { whatsapped: true } : {}) })
+              .eq('id', n.id);
+          }
+        }
       }
     }
   } catch (e) {
@@ -104,9 +172,10 @@ async function processPending() {
 
 function startWorker() {
   if (!RESEND_API_KEY) { console.log('Notify mailer idle: RESEND_API_KEY not set'); return; }
-  console.log('Notify mailer on: every 2 min → ' + NOTIFY_EMAIL_TO);
+  console.log('Notify mailer on: every 2 min → ' + NOTIFY_EMAIL_TO
+    + (WHATSAPP_ON ? (' + WhatsApp → ' + NOTIFY_WHATSAPP_TO) : ' (WhatsApp off)'));
   setTimeout(processPending, 20 * 1000);
   setInterval(processPending, EVERY_MS);
 }
 
-module.exports = { init, startWorker, processPending, _test: { channelFor, subjectFor } };
+module.exports = { init, startWorker, processPending, _test: { channelFor, subjectFor, whatsappText } };
