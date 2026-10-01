@@ -4,6 +4,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { invoiceWorkshopBooking, invoiceFeePayment, invoiceFromRow, getPdf, renderAndStore, emailInvoice, pdfFilename, buildInvoicePdf } = require('./invoice-service');
 const zoom = require('./zoom-service');
 const notifyMailer = require('./notify-mailer');
+const settlementWorker = require('./settlement-worker');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -40,6 +41,7 @@ const supabase = createClient(
 );
 zoom.init(supabase);
 notifyMailer.init(supabase);
+settlementWorker.init(supabase);
 
 // ── GENERAL PAYMENT PAGE ID ──
 const GENERAL_PAYMENT_PAGE_ID = 'pl_SvxuRdqY2rd7ge';
@@ -1549,4 +1551,5 @@ app.listen(PORT, () => {
   console.log(`Health: http://localhost:${PORT}/health`);
   zoom.startWorker();
   notifyMailer.startWorker();
+  settlementWorker.startWorker();
 });
