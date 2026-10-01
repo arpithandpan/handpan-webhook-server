@@ -1276,11 +1276,32 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
           return res.status(500).json({ error: 'Failed to save fee payment', detail: feeErr.message });
         }
 
-        // Mark the request paid so the link can't be used twice.
+        // Mark the request paid so the link can't be used twice. The money is
+        // already saved above, so if this update fails (it happened on 29 Sep
+        // during a brief Supabase outage, leaving FR-018 stuck in Pending),
+        // retry a few times; if it still won't go through, leave a warning
+        // notification so the stale "pending" row gets cleaned up by hand
+        // instead of silently sitting in the list.
         if (requestId) {
-          await supabase.from('fee_requests')
-            .update({ status: 'paid', paid_at: new Date().toISOString(), razorpay_payment_id: payment.id, fee_payment_id: feeId })
-            .eq('id', requestId);
+          let reqErr = null;
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            const { error } = await supabase.from('fee_requests')
+              .update({ status: 'paid', paid_at: new Date().toISOString(), razorpay_payment_id: payment.id, fee_payment_id: feeId })
+              .eq('id', requestId);
+            reqErr = error || null;
+            if (!reqErr) break;
+            console.error('Mark-request-paid failed (attempt ' + attempt + '):', requestId, reqErr.message);
+            await new Promise(r => setTimeout(r, 1500 * attempt));
+          }
+          if (reqErr) {
+            try {
+              await supabase.from('notifications').insert({
+                type: 'warning',
+                message: `⚠️ ${requestId} is paid (${feeId}) but could not be marked paid, so it may still show under Pending fee requests. Cancel it there manually.`,
+                read: false
+              });
+            } catch (e) { console.error('warning notification failed too:', e.message); }
+          }
         }
 
         // Income ledger (payments table) is in rupees. INR goes straight in.
