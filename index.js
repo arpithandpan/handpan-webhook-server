@@ -810,6 +810,150 @@ app.get('/api/workshop/:id/availability', async (req, res) => {
 
 // ── FEE REQUEST INFO ──
 // Called by pay.html on load. Returns only what the page needs.
+// ── RESOLVE GIG ──
+// Single source of truth for the gig payment page. One link serves the whole
+// gig: it asks for the advance until that is paid, then for the balance, and
+// shows "all paid" after that. Amounts always come from the gigs row.
+async function resolveGig(gigId) {
+  if (!gigId) return { error: 'not_found' };
+  const { data: g, error } = await supabase
+    .from('gigs').select('*').eq('id', gigId).single();
+  if (error || !g || g.archived) return { error: 'not_found' };
+  if (g.status === 'cancelled') return { error: 'cancelled' };
+  const agreed = Number(g.agreed_fee) || 0;
+  if (agreed <= 0) return { error: 'not_found' };
+  const advance = Math.min(Math.max(Number(g.advance_amount) || 0, 0), agreed);
+  const balance = Math.round((agreed - advance) * 100) / 100;
+  let stage = 'paid', dueAmount = 0;
+  if (!g.advance_paid && advance > 0) { stage = 'advance'; dueAmount = advance; }
+  else if (!g.balance_paid && balance > 0) { stage = 'balance'; dueAmount = balance; }
+  return { gig: g, stage, dueAmount, agreed, advance, balance };
+}
+
+app.get('/api/gig/:id', async (req, res) => {
+  try {
+    const r = await resolveGig(req.params.id);
+    if (r.error === 'cancelled') return res.status(410).json({ error: 'This booking was cancelled' });
+    if (r.error) return res.status(404).json({ error: 'Booking not found' });
+    const g = r.gig;
+    return res.json({
+      gigId: g.id,
+      clientName: g.client_name,
+      agency: g.agency || null,
+      title: g.title || 'Solo Handpan Performance',
+      venue: g.venue || null,
+      eventDate: g.event_date || null,
+      eventTime: g.event_time || null,
+      duration: g.duration || null,
+      currency: (g.currency || 'INR').toUpperCase(),
+      agreedFee: r.agreed,
+      advanceAmount: r.advance,
+      balanceAmount: r.balance,
+      advancePaid: !!g.advance_paid,
+      balancePaid: !!g.balance_paid,
+      stage: r.stage,
+      dueAmount: r.dueAmount,
+      terms: g.terms || null
+    });
+  } catch (err) {
+    console.error('gig resolve error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── CREATE GIG ORDER (Razorpay Checkout popup) ──
+// Called by gig.html on Pay. Mirrors /api/create-fee-order: creates a
+// Razorpay Order for whatever stage is currently due (advance or balance)
+// and stashes kind:'gig' in notes so the webhook routes it correctly.
+app.post('/api/create-gig-order', express.json(), async (req, res) => {
+  try {
+    const { gigId, name, phone, email } = req.body || {};
+    const r = await resolveGig(gigId);
+    if (r.error === 'cancelled') return res.status(410).json({ error: 'This booking was cancelled' });
+    if (r.error) return res.status(404).json({ error: 'Booking not found' });
+    if (r.stage === 'paid') return res.status(409).json({ error: 'This booking is fully paid' });
+
+    const gig = r.gig;
+    const stage = r.stage; // 'advance' | 'balance'
+
+    // Refresh-window double-pay guard, same as fee orders: if this stage
+    // already has an order with a captured payment, refuse.
+    const existingOrderId = stage === 'advance' ? gig.advance_order_id : gig.balance_order_id;
+    if (existingOrderId) {
+      try {
+        const authChk = Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString('base64');
+        const pRes = await fetch(`https://api.razorpay.com/v1/orders/${existingOrderId}/payments`, { headers: { 'Authorization': `Basic ${authChk}` } });
+        const pData = await pRes.json();
+        if (pRes.ok && Array.isArray(pData.items) && pData.items.some(p => p.status === 'captured')) {
+          return res.status(409).json({ error: 'This payment has already been made' });
+        }
+      } catch (e) { console.warn('gig order payments check failed:', e.message); }
+    }
+
+    const payerName = String(name || gig.client_name || '').trim();
+    const payerEmail = String(email || gig.contact_email || '').trim();
+    const payerPhone = String(phone || gig.contact_phone || '').trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(payerEmail)) {
+      return res.status(400).json({ error: 'Enter a valid email address' });
+    }
+    if (payerPhone.replace(/\D/g, '').length < 8) {
+      return res.status(400).json({ error: 'Enter a valid phone number' });
+    }
+
+    const currency = (gig.currency || 'INR').toUpperCase();
+    const amountMinor = Math.round(r.dueAmount * 100);
+    const stageLabel = stage === 'advance' ? 'Advance' : 'Balance';
+    const label = `${stageLabel} — ${gig.title || 'Handpan performance'}`;
+    const notes = {
+      kind: 'gig',
+      gigId: gig.id,
+      stage,
+      clientName: gig.client_name,
+      agency: gig.agency || '',
+      name: payerName,
+      email: payerEmail,
+      phone: payerPhone,
+      label,
+      currency,
+      amount: String(r.dueAmount)
+    };
+
+    const auth = Buffer.from(
+      `${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`
+    ).toString('base64');
+
+    const rzpRes = await fetch('https://api.razorpay.com/v1/orders', {
+      method: 'POST',
+      headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ amount: amountMinor, currency, receipt: gig.id + '-' + stage, notes })
+    });
+    const order = await rzpRes.json();
+    if (!rzpRes.ok) {
+      console.error('Razorpay gig order error:', order);
+      return res.status(502).json({ error: 'Failed to start payment', detail: order.error?.description || 'Unknown error' });
+    }
+
+    await supabase.from('gigs')
+      .update(stage === 'advance' ? { advance_order_id: order.id } : { balance_order_id: order.id })
+      .eq('id', gig.id);
+
+    return res.json({
+      orderId: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      keyId: process.env.RAZORPAY_KEY_ID,
+      name: payerName,
+      email: payerEmail,
+      phone: payerPhone,
+      description: `${label} (${gig.id})`,
+      notes
+    });
+  } catch (err) {
+    console.error('create-gig-order error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.get('/api/fee-request/:id', async (req, res) => {
   try {
     const result = await resolveFeeRequest(req.params.id);
@@ -1358,6 +1502,109 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         });
 
         return res.json({ received: true, routed: 'fee_request', requestId, feeId, invoice });
+      }
+
+      // ── GIG / PERFORMANCE PAYMENT (from gig.html) ──
+      // Orders created by /api/create-gig-order carry notes.kind = 'gig' with
+      // the stage (advance or balance). Marks that stage paid on the gig,
+      // records the income under category 'gig', notifies, and auto-invoices.
+      if (payment.notes && payment.notes.kind === 'gig') {
+        const gigId = payment.notes.gigId || null;
+        const stage = payment.notes.stage === 'balance' ? 'balance' : 'advance';
+        const currency = (payment.currency || 'INR').toUpperCase();
+        const amountMajor = payment.amount / 100;
+        const isINR = currency === 'INR';
+        const sym = isINR ? '₹' : (currency + ' ');
+
+        // Idempotency: one ledger row per razorpay payment.
+        const { data: dup } = await supabase.from('payments')
+          .select('id').eq('razorpay_payment_id', payment.id).limit(1);
+        if (dup && dup.length > 0) {
+          console.log('Duplicate gig payment — skipping:', payment.id);
+          return res.json({ received: true, skipped: 'duplicate' });
+        }
+
+        const { data: gig } = await supabase.from('gigs').select('*').eq('id', gigId).maybeSingle();
+        const clientName = gig?.client_name || payment.notes.clientName || fields.name || 'Client';
+        const stageLabel = stage === 'advance' ? 'Advance' : 'Balance';
+        const label = `${stageLabel} — ${gig?.title || 'Handpan performance'}`;
+
+        // Mark the stage paid, with the same retry-and-warn pattern as fee
+        // requests, so a database hiccup never leaves a silently stale gig.
+        if (gigId) {
+          const upd = stage === 'advance'
+            ? { advance_paid: true, advance_paid_at: new Date().toISOString(), advance_payment_id: payment.id }
+            : { balance_paid: true, balance_paid_at: new Date().toISOString(), balance_payment_id: payment.id };
+          let gigErr = null;
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            const { error } = await supabase.from('gigs').update(upd).eq('id', gigId);
+            gigErr = error || null;
+            if (!gigErr) break;
+            console.error('Mark-gig-paid failed (attempt ' + attempt + '):', gigId, gigErr.message);
+            await new Promise(r => setTimeout(r, 1500 * attempt));
+          }
+          if (gigErr) {
+            try {
+              await supabase.from('notifications').insert({
+                type: 'warning',
+                message: `⚠️ ${gigId} ${stage} is paid (${payment.id}) but could not be marked paid — check the Performances section.`,
+                read: false
+              });
+            } catch (e) { console.error('gig warning notification failed too:', e.message); }
+          }
+        }
+
+        // Income ledger. INR goes straight in; foreign currency follows the
+        // same rule as fees — the settlement amount is added separately.
+        if (isINR) {
+          const { data: payNum } = await supabase.rpc('next_payment_number');
+          const paymentId = payNum != null ? `PAY-${String(payNum).padStart(3, '0')}` : `PAY-${Date.now()}`;
+          const { error: payErr } = await supabase.from('payments').insert({
+            id: paymentId,
+            razorpay_payment_id: payment.id,
+            reference_id: gigId,
+            payer_name: clientName,
+            amount: amountMajor,
+            payment_mode: 'Razorpay UPI',
+            type: 'income',
+            category: 'gig',
+            synced_from_razorpay: true,
+            date: today,
+            description: `${label} — ${clientName} (${gigId})`
+          });
+          if (payErr) console.error('Error saving gig payment record:', payErr.message);
+        } else {
+          await supabase.from('notifications').insert({
+            type: 'info',
+            message: `🌍 ${label}: ${sym}${amountMajor} from ${clientName} (${gigId}). Add the INR settlement to Payments once Razorpay settles.`,
+            read: false
+          });
+        }
+
+        await supabase.from('notifications').insert({
+          type: 'payment',
+          message: `💰 Gig ${stage} received: ${sym}${amountMajor.toLocaleString('en-IN')} from ${clientName} — ${gig?.title || 'performance'} (${gigId})`,
+          read: false
+        });
+
+        // Auto invoice to the payer (agency or client). Never throws; a
+        // failure becomes a dashboard notification and the payment stays saved.
+        const gigPayerEmail = (payment.notes.email || fields.email || '').trim() || null;
+        const gigPayerPhone = (payment.notes.phone || fields.phone || payment.contact || '').trim() || null;
+        const invoice = await createAndSendInvoice(supabase, {
+          sourceTable: 'gigs',
+          sourceId: gigId,
+          razorpayPaymentId: payment.id,
+          billed: { name: gig?.agency || clientName, email: gigPayerEmail, phone: gigPayerPhone, country: isINR ? 'India' : '' },
+          cc: (gig?.contact_email && gigPayerEmail && gig.contact_email.toLowerCase() !== gigPayerEmail.toLowerCase()) ? [gig.contact_email] : [],
+          currency,
+          paymentDate: today,
+          paymentMode: isINR ? 'Razorpay UPI' : 'Razorpay International',
+          servicePeriod: gig?.event_date || null,
+          lines: [{ desc: `${label}${gig?.event_date ? ' · ' + gig.event_date : ''}${gig?.venue ? ' · ' + gig.venue : ''}`, qty: 1, rate: amountMajor }]
+        });
+
+        return res.json({ received: true, routed: 'gig', gigId, stage, invoice });
       }
 
       // 3. Route general payments to unassigned
