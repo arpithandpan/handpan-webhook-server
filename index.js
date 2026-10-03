@@ -1,7 +1,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
-const { invoiceWorkshopBooking, invoiceFeePayment, invoiceFromRow, getPdf, renderAndStore, emailInvoice, pdfFilename, buildInvoicePdf } = require('./invoice-service');
+const { createAndSendInvoice, invoiceWorkshopBooking, invoiceFeePayment, invoiceFromRow, getPdf, renderAndStore, emailInvoice, pdfFilename, buildInvoicePdf } = require('./invoice-service');
 const zoom = require('./zoom-service');
 const notifyMailer = require('./notify-mailer');
 const settlementWorker = require('./settlement-worker');
