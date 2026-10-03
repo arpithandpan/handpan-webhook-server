@@ -1595,6 +1595,9 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
           sourceTable: 'gigs',
           sourceId: gigId,
           razorpayPaymentId: payment.id,
+          // Gigs are usually corporate/agency clients: print the PAN so their
+          // accounts team has what they need for TDS and bookkeeping.
+          showPan: true,
           billed: { name: gig?.agency || clientName, email: gigPayerEmail, phone: gigPayerPhone, country: isINR ? 'India' : '' },
           cc: (gig?.contact_email && gigPayerEmail && gig.contact_email.toLowerCase() !== gigPayerEmail.toLowerCase()) ? [gig.contact_email] : [],
           currency,
