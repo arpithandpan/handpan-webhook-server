@@ -182,6 +182,7 @@ async function createAndSendInvoice(supabase, job) {
       amount_in_words: words,
       currency,
       service_period: job.servicePeriod || null,
+      show_pan: !!job.showPan,
       auto_generated: true,
       sent: false
     };
@@ -223,6 +224,7 @@ async function createAndSendInvoice(supabase, job) {
       billed: { name: row.billed_name, email: row.billed_email, phone: row.billed_phone, country: row.billed_country || '' },
       servicePeriod: row.service_period || '',
       payment: { date: row.payment_received_date, mode: row.payment_mode, ref: row.payment_reference },
+      showPan: !!job.showPan,
       lines
     });
     const filename = no + '_' + slug(row.billed_name) + '.pdf';
