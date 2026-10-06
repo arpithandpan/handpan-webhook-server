@@ -114,7 +114,7 @@ async function resolveFeeRequest(requestId) {
 
   const { data: s } = await supabase
     .from('students')
-    .select('id, full_name, email, phone, level, archived')
+    .select('id, full_name, email, phone, level, country, archived')
     .eq('id', r.student_id)
     .single();
 
@@ -141,6 +141,7 @@ async function resolveFeeRequest(requestId) {
       email: s.email || '',
       phone: s.phone || '',
       level: s.level || null,
+      country: s.country || null,
       classes,
       label,
       month: r.month || null,
