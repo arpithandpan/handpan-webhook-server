@@ -10,6 +10,10 @@
 //      report, cleans it, matches people to students and logs classes.
 //   3. People it cannot match (20+ minutes) go to zoom_unmatched. The
 //      dashboard shows them and Arpit picks the student in one tap.
+//   4. Trial meetings ("trial" or "trail" in the title): people who are not
+//      known students go straight into the trials table instead of review.
+//      Only email and saved Zoom names count as a match there, never a bare
+//      first name or the topic, so a new "Sasha" is not logged as an old one.
 //
 // Never throws out to the server. Every failure becomes a log line, a
 // retry, or a dashboard notification.
@@ -22,6 +26,7 @@ const CLIENT_SECRET = process.env.ZOOM_CLIENT_SECRET || '';
 const WEBHOOK_SECRET = process.env.ZOOM_WEBHOOK_SECRET || '';
 
 const MIN_MINUTES = Number(process.env.ZOOM_MIN_MINUTES) || 20;   // attendance needed to count a class
+const TRIAL_MIN_MINUTES = Number(process.env.ZOOM_TRIAL_MIN_MINUTES) || 10;   // a trial attendee needs this much
 const REPORT_DELAY_MIN = 10;                                        // wait this long after a meeting ends
 const MAX_ATTEMPTS = 6;                                             // then give up and notify
 const WORKER_EVERY_MS = 5 * 60 * 1000;
@@ -49,6 +54,11 @@ function normName(s) {
 }
 function firstWord(s) { return normName(s).split(' ')[0] || ''; }
 function isEmail(s) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(s || '').trim()); }
+// "Handpan Trial - Adrienne", "free trial", "TRAIL class" → true. Matches whole words only.
+function isTrialTopic(topic) {
+  const t = ' ' + normName(topic) + ' ';
+  return [' trial ', ' trials ', ' trail ', ' trails '].some(w => t.includes(w));
+}
 function istDate(iso) {
   const d = iso ? new Date(iso) : new Date();
   if (isNaN(d)) return new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
@@ -238,12 +248,13 @@ function buildIndex(students) {
   return { byEmail, byName, byFirst };
 }
 
-function matchPerson(person, idx) {
+function matchPerson(person, idx, strict) {
   if (person.email && idx.byEmail.get(person.email)) return { student: idx.byEmail.get(person.email), how: 'email' };
   for (const n of person.names) {
     const s = idx.byName.get(normName(n));
     if (s) return { student: s, how: 'zoom name' };
   }
+  if (strict) return null;   // trial meetings: no first-name guesses
   for (const n of person.names) {
     const nn = normName(n);
     const s = !nn.includes(' ') ? idx.byFirst.get(nn) : null;   // "Sahana" alone → Sahana
@@ -265,11 +276,12 @@ function studentsInTopic(topic, students) {
 
 // Pure: decide what to do with a cleaned meeting. No DB calls, easy to test.
 function planMeeting(people, students, topic) {
+  const isTrial = isTrialTopic(topic);
   const idx = buildIndex(students);
   const byStudent = new Map();   // student id → { student, minutes, names, email, how }
   const unmatched = [];
   for (const p of people) {
-    const m = matchPerson(p, idx);
+    const m = matchPerson(p, idx, isTrial);
     if (!m) { unmatched.push(p); continue; }
     const cur = byStudent.get(m.student.id) || { student: m.student, minutes: 0, names: [], email: null, how: m.how };
     cur.minutes += p.minutes;
@@ -282,7 +294,7 @@ function planMeeting(people, students, topic) {
   // not already matched, and exactly one unmatched person who stayed long enough.
   const learn = [];
   const longUnmatched = unmatched.filter(p => p.minutes >= MIN_MINUTES);
-  const topicStudents = studentsInTopic(topic, students).filter(s => !byStudent.has(s.id));
+  const topicStudents = isTrial ? [] : studentsInTopic(topic, students).filter(s => !byStudent.has(s.id));
   if (topicStudents.length === 1 && longUnmatched.length === 1) {
     const p = longUnmatched[0], s = topicStudents[0];
     byStudent.set(s.id, { student: s, minutes: p.minutes, names: p.names.slice(), email: p.email, how: 'meeting topic' });
@@ -292,9 +304,14 @@ function planMeeting(people, students, topic) {
 
   const toLog = [...byStudent.values()].filter(x => x.minutes >= MIN_MINUTES);
   const short = [...byStudent.values()].filter(x => x.minutes < MIN_MINUTES);
+  if (isTrial) {
+    const trials = unmatched.filter(p => p.minutes >= TRIAL_MIN_MINUTES);
+    const ignoredShort = unmatched.filter(p => p.minutes < TRIAL_MIN_MINUTES);
+    return { toLog, short, review: [], trials, ignoredShort, learn, isTrial };
+  }
   const review = unmatched.filter(p => p.minutes >= MIN_MINUTES);
   const ignoredShort = unmatched.filter(p => p.minutes < MIN_MINUTES);
-  return { toLog, short, review, ignoredShort, learn };
+  return { toLog, short, review, trials: [], ignoredShort, learn, isTrial };
 }
 
 // ── 5. DB WRITES ──
@@ -411,6 +428,23 @@ async function processMeeting(m) {
     }
     for (const l of plan.learn) await learnNames(l.student.id, l.names, l.email);
 
+    // Trial attendees → trials table. One row per meeting + person, so a retry
+    // never duplicates. If the insert fails, the person falls back to review.
+    const trialsAdded = [];
+    for (const p of plan.trials) {
+      const { error } = await supabase.from('trials').upsert({
+        full_name: p.name || p.email || 'Unknown', contact: p.email || null, trial_date: classDate,
+        source: 'zoom', status: 'pending', notes: m.topic || null,
+        zoom_meeting_uuid: m.uuid, zoom_person_key: p.key
+      }, { onConflict: 'zoom_meeting_uuid,zoom_person_key', ignoreDuplicates: true });
+      if (error) { console.error('trials insert failed, sending to review:', error.message); plan.review.push(p); }
+      else trialsAdded.push(p);
+    }
+    if (trialsAdded.length) {
+      const who = trialsAdded.map(p => `${p.name || p.email} (${p.minutes} min)`).join(', ');
+      await notify('info', `🎥 Trial from Zoom: ${who} on ${prettyDate(classDate)}. Added to Trial classes on the Students page.`);
+    }
+
     for (const p of plan.review) {
       const { error } = await supabase.from('zoom_unmatched').upsert({
         meeting_uuid: m.uuid, person_key: p.key, class_date: classDate, topic: m.topic || null,
@@ -429,10 +463,11 @@ async function processMeeting(m) {
         classDate, logged,
         short: plan.short.map(x => ({ student: x.student.id, minutes: x.minutes })),
         review: plan.review.map(p => ({ name: p.name, email: p.email, minutes: p.minutes })),
+        trials: trialsAdded.map(p => ({ name: p.name, email: p.email, minutes: p.minutes })),
         ignoredShort: plan.ignoredShort.map(p => ({ name: p.name, minutes: p.minutes }))
       }
     }).eq('uuid', m.uuid);
-    console.log('Zoom meeting', m.uuid, 'done. Logged', logged.length, 'review', plan.review.length);
+    console.log('Zoom meeting', m.uuid, 'done. Logged', logged.length, 'review', plan.review.length, 'trials', trialsAdded.length);
   } catch (e) {
     return failMeeting(m, e);
   }
@@ -473,6 +508,7 @@ function status() {
     configured: isConfigured(),
     webhookSecret: !!WEBHOOK_SECRET,
     minMinutes: MIN_MINUTES,
+    trialMinMinutes: TRIAL_MIN_MINUTES,
     lastRun: _lastRun,
     lastError: _lastError
   };
@@ -505,5 +541,5 @@ async function resolveUnmatched(id, studentId) {
 
 module.exports = {
   init, webhookHandler, startWorker, processPending, resolveUnmatched, status,
-  _test: { cleanParticipants, planMeeting, buildIndex, matchPerson, studentsInTopic, encodeUuid, istDate, normName, hmac, MIN_MINUTES }
+  _test: { cleanParticipants, planMeeting, buildIndex, matchPerson, studentsInTopic, isTrialTopic, encodeUuid, istDate, normName, hmac, MIN_MINUTES, TRIAL_MIN_MINUTES }
 };
