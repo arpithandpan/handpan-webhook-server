@@ -28,6 +28,64 @@ app.use((req, res, next) => {
 function nowIST() { return new Date(Date.now() + 5.5 * 60 * 60 * 1000); }
 function todayISTDate() { return nowIST().toISOString().slice(0, 10); }
 function monthYM(d) { return d.toISOString().slice(0, 7); }              // 'YYYY-MM'
+
+// ── WORKSHOP BOOKING WINDOW + LATE LINKS ──
+// Normal bookings close at 00:00 IST on the workshop's own day (same rule
+// book.html shows). After that, only a late link works: the dashboard writes
+// the SHA-256 hash of a random code (late_code_hash) plus late_expires_at
+// (1 hour) on the workshop, and the link carries ?k=<code>. Only the hash is
+// stored, because the workshops table is readable with the public key.
+// A late link is one-time: the webhook clears it once a booking paid through
+// it lands. Nothing books after the workshop starts. Neither the code nor the
+// hash is ever sent to the browser, only "valid + seconds left".
+function lateHash(code) {
+  return crypto.createHash('sha256').update(String(code || '').trim()).digest('hex');
+}
+function workshopStartUtc(dateStr, timeStr) {
+  if (!dateStr) return null;
+  let hours = 23, minutes = 59;   // no start time set → end of that day
+  const m = String(timeStr || '').match(/(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)?/);
+  if (m) {
+    hours = parseInt(m[1], 10); minutes = parseInt(m[2], 10);
+    let mer = m[3];
+    if (!mer) { const later = String(timeStr).slice(m.index + m[0].length).match(/(AM|PM|am|pm)/); mer = later ? later[1] : null; }
+    if (mer) { mer = mer.toUpperCase(); if (mer === 'PM' && hours < 12) hours += 12; if (mer === 'AM' && hours === 12) hours = 0; }
+  }
+  const d = new Date(`${dateStr}T${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:00+05:30`);
+  return isNaN(d) ? null : d;
+}
+function bookingCutoffUtc(dateStr) {
+  if (!dateStr) return null;
+  const d = new Date(`${dateStr}T00:00:00+05:30`);
+  return isNaN(d) ? null : d;
+}
+// { valid, secondsLeft } for a code against this workshop, or null when no code was given.
+function lateWindow(workshop, code, now = new Date()) {
+  const k = String(code || '').trim();
+  if (!k) return null;
+  const start = workshopStartUtc(workshop.date, workshop.workshop_time);
+  const expires = workshop.late_expires_at ? new Date(workshop.late_expires_at) : null;
+  const ok = !!workshop.late_code_hash && lateHash(k) === workshop.late_code_hash && expires && !isNaN(expires)
+    && now < expires && (!start || now < start);
+  if (!ok) return { valid: false, secondsLeft: 0 };
+  const until = start && start < expires ? start : expires;
+  return { valid: true, secondsLeft: Math.max(0, Math.floor((until - now) / 1000)) };
+}
+// Can this booking go ahead right now? { ok, late } or { ok:false, status, reason, error }.
+function bookingGate(workshop, code, now = new Date()) {
+  const start = workshopStartUtc(workshop.date, workshop.workshop_time);
+  if (start && now >= start) {
+    return { ok: false, status: 403, reason: 'started', error: 'This workshop has already started' };
+  }
+  // A valid late code always marks the booking as late (even before the cutoff),
+  // so the webhook burns the link and it stays one-time.
+  const late = lateWindow(workshop, code, now);
+  if (late && late.valid) return { ok: true, late: true };
+  const cutoff = bookingCutoffUtc(workshop.date);
+  if (!cutoff || now < cutoff) return { ok: true, late: false };
+  if (late) return { ok: false, status: 403, reason: 'late_expired', error: 'This late booking link has expired or was already used. Message Arpit for a new one.' };
+  return { ok: false, status: 403, reason: 'closed', error: 'Bookings for this workshop have closed' };
+}
 function monthLong(ym) {                                                  // 'YYYY-MM' → 'September 2026'
   const m = String(ym || '').match(/^(\d{4})-(\d{2})$/); if (!m) return '';
   const names = ['January','February','March','April','May','June','July','August','September','October','November','December'];
@@ -269,6 +327,9 @@ function extractPaymentFields(payment) {
     ? (parseFloat(notes.participantPrice) || null)
     : null;
 
+  // Late link code, only present when the booking came through one.
+  const lateCode = notes.lateCode ? String(notes.lateCode) : null;
+
   return {
     name,
     phone,
@@ -283,6 +344,7 @@ function extractPaymentFields(payment) {
     guestNames,          // [] if not present
     ownHandpanCount,      // null if not present (old-flow payment)
     participantPrice,    // null if not present (old-flow payment)
+    lateCode,            // null unless booked through a late link
   };
 }
 
@@ -466,7 +528,8 @@ app.post('/api/create-payment-link', express.json(), async (req, res) => {
       workshopId, participants, observers,
       name, phone, email,
       bringingOwnHandpan,
-      guestNames, ownHandpanCount
+      guestNames, ownHandpanCount,
+      lateCode
     } = req.body || {};
 
     if (!workshopId || !name || !phone) {
@@ -482,7 +545,7 @@ app.post('/api/create-payment-link', express.json(), async (req, res) => {
     // 1. Look up the workshop, its capacity (if set), and its prices
     const { data: workshop, error: wsError } = await supabase
       .from('workshops')
-      .select('id, participant_capacity, observer_capacity, price_per_head, observer_price, archived, cancelled')
+      .select('id, date, workshop_time, late_code_hash, late_expires_at, participant_capacity, observer_capacity, price_per_head, observer_price, archived, cancelled')
       .eq('id', workshopId)
       .single();
 
@@ -495,6 +558,10 @@ app.post('/api/create-payment-link', express.json(), async (req, res) => {
     if (workshop.cancelled) {
       return res.status(410).json({ error: 'This workshop has been cancelled' });
     }
+
+    // Booking window: closed from 00:00 IST on the day unless a valid late link.
+    const gate = bookingGate(workshop, lateCode);
+    if (!gate.ok) return res.status(gate.status).json({ error: gate.error, reason: gate.reason });
 
     // 2. If capacity is configured, re-check availability before charging.
     // This is the server-side guard against the race condition where two
@@ -578,7 +645,8 @@ app.post('/api/create-payment-link', express.json(), async (req, res) => {
           bringingOwnHandpan: bringingOwnHandpan || '',
           guestNames: JSON.stringify(Array.isArray(guestNames) ? guestNames.map(n => (n || '').toString().trim()) : []),
           ownHandpanCount: String(ownHandpanCount != null ? ownHandpanCount : 0),
-          participantPrice: String(participantPrice)
+          participantPrice: String(participantPrice),
+          ...(gate.late ? { lateCode: String(lateCode).trim() } : {})
         }
       })
     });
@@ -616,7 +684,8 @@ app.post('/api/create-booking-order', express.json(), async (req, res) => {
       workshopId, participants, observers,
       name, phone, email,
       bringingOwnHandpan,
-      guestNames, ownHandpanCount
+      guestNames, ownHandpanCount,
+      lateCode
     } = req.body || {};
 
     if (!workshopId || !name || !phone) {
@@ -631,7 +700,7 @@ app.post('/api/create-booking-order', express.json(), async (req, res) => {
 
     const { data: workshop, error: wsError } = await supabase
       .from('workshops')
-      .select('id, date, venue, participant_capacity, observer_capacity, price_per_head, observer_price, archived, cancelled')
+      .select('id, date, venue, workshop_time, late_code_hash, late_expires_at, participant_capacity, observer_capacity, price_per_head, observer_price, archived, cancelled')
       .eq('id', workshopId)
       .single();
 
@@ -641,6 +710,10 @@ app.post('/api/create-booking-order', express.json(), async (req, res) => {
     if (workshop.cancelled) {
       return res.status(410).json({ error: 'This workshop has been cancelled' });
     }
+
+    // Booking window: closed from 00:00 IST on the day unless a valid late link.
+    const gate = bookingGate(workshop, lateCode);
+    if (!gate.ok) return res.status(gate.status).json({ error: gate.error, reason: gate.reason });
 
     // Capacity re-check right before charging (race guard).
     if (workshop.participant_capacity != null || workshop.observer_capacity != null) {
@@ -699,7 +772,8 @@ app.post('/api/create-booking-order', express.json(), async (req, res) => {
       bringingOwnHandpan: bringingOwnHandpan || '',
       guestNames: JSON.stringify(Array.isArray(guestNames) ? guestNames.map(n => (n || '').toString().trim()) : []),
       ownHandpanCount: String(ownHandpanCount != null ? ownHandpanCount : 0),
-      participantPrice: String(participantPrice)
+      participantPrice: String(participantPrice),
+      ...(gate.late ? { lateCode: String(lateCode).trim() } : {})
     };
 
     const auth = Buffer.from(
@@ -751,7 +825,7 @@ app.get('/api/workshop/:id/availability', async (req, res) => {
 
     const { data: workshop, error: wsError } = await supabase
       .from('workshops')
-      .select('id, date, venue, workshop_time, venue_map_url, price_per_head, observer_price, participant_capacity, observer_capacity, archived, cancelled')
+      .select('id, date, venue, workshop_time, venue_map_url, price_per_head, observer_price, participant_capacity, observer_capacity, late_code_hash, late_expires_at, archived, cancelled')
       .eq('id', workshopId)
       .single();
 
@@ -801,6 +875,10 @@ app.get('/api/workshop/:id/availability', async (req, res) => {
     if (workshop.observer_capacity != null) {
       result.observersRemaining = Math.max(0, workshop.observer_capacity - observersSold);
     }
+
+    // Late link (?k=): only "valid + seconds left" goes out, never the code.
+    const late = lateWindow(workshop, req.query.k);
+    if (late) result.late = late;
 
     return res.json(result);
   } catch (err) {
@@ -1760,10 +1838,19 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         });
       }
 
-      // 9. Success notification
+      // 9. Late link is one-time: clear it now that a booking through it is saved.
+      // Only clears that exact code, so a newer link made since stays alive.
+      if (fields.lateCode) {
+        const { error: lateErr } = await supabase.from('workshops')
+          .update({ late_code_hash: null, late_expires_at: null })
+          .eq('id', workshopId).eq('late_code_hash', lateHash(fields.lateCode));
+        if (lateErr) console.error('Could not clear late link for', workshopId, lateErr.message);
+      }
+
+      // Success notification
       await supabase.from('notifications').insert({
         type: 'payment',
-        message: `✅ New booking: ₹${fields.amount} from ${fields.name} → ${workshopId} (${matchMethod})`,
+        message: `✅ New booking: ₹${fields.amount} from ${fields.name} → ${workshopId} (${matchMethod}${fields.lateCode ? ', late link' : ''})`,
         read: false
       });
 
