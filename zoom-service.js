@@ -76,6 +76,79 @@ async function notify(type, message) {
   catch (e) { console.error('zoom notify failed:', e.message); }
 }
 
+// ── AUTO FEE REQUEST (zero-touch renewals) ──
+// When a student's classes hit 0, create the next fee request automatically
+// by copying their most recent request (same classes, amount, currency).
+// "Whatever they took last time is what renews." The WhatsApp worker in
+// whatsapp-service.js then picks the new pending request up and sends the
+// fee_link template by itself. A special case (discount, package change) is
+// handled the old way: Arpit cancels the auto request in the dashboard and
+// creates one by hand — a manual request always wins.
+//
+// Gated by AUTO_FEE_REQUESTS = 'on' in Railway, so it can be rolled out
+// together with WA_STUDENT_SENDS. Off = the old "send a fee link" alert.
+function autoFeeRequestsOn() {
+  return String(process.env.AUTO_FEE_REQUESTS || '').trim().toLowerCase() === 'on';
+}
+
+function currentMonthYM() {
+  return new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().slice(0, 7);
+}
+
+async function nextFeeRequestId() {
+  const { data } = await supabase.from('fee_requests')
+    .select('id').like('id', 'FR-%').order('id', { ascending: false }).limit(1);
+  if (data && data.length > 0) {
+    const lastNum = parseInt(data[0].id.replace('FR-', ''), 10) || 0;
+    return 'FR-' + String(lastNum + 1).padStart(3, '0');
+  }
+  return 'FR-001';
+}
+
+// Returns { created: true, id, classes, amount, currency } when a renewal
+// request was made, or { created: false, reason } otherwise. Never throws.
+async function maybeAutoRenewal(student) {
+  try {
+    if (!autoFeeRequestsOn()) return { created: false, reason: 'off' };
+
+    // Already being chased? Then nothing to do — one pending request at a time.
+    const { data: pending } = await supabase.from('fee_requests')
+      .select('id').eq('student_id', student.id).eq('status', 'pending').limit(1);
+    if (pending && pending.length) return { created: false, reason: 'pending_exists' };
+
+    // Copy the most recent non-cancelled request as the package template.
+    const { data: prevRows } = await supabase.from('fee_requests')
+      .select('id, classes, amount, currency, list_amount, discount_pct, status')
+      .eq('student_id', student.id).neq('status', 'cancelled')
+      .order('id', { ascending: false }).limit(1);
+    const prev = prevRows && prevRows[0];
+    if (!prev || !(Number(prev.amount) > 0)) return { created: false, reason: 'no_previous' };
+
+    const id = await nextFeeRequestId();
+    const { error } = await supabase.from('fee_requests').insert({
+      id,
+      student_id: student.id,
+      classes: prev.classes,
+      amount: prev.amount,
+      currency: prev.currency || 'INR',
+      list_amount: prev.list_amount || null,
+      discount_pct: prev.discount_pct || null,
+      month: currentMonthYM(),
+      note: 'Auto renewal (copied from ' + prev.id + ')',
+      status: 'pending'
+    });
+    if (error) {
+      console.error('auto fee request insert failed:', student.id, error.message);
+      return { created: false, reason: error.message };
+    }
+    console.log('Auto fee request created:', id, 'for', student.id, '(from ' + prev.id + ')');
+    return { created: true, id, classes: prev.classes, amount: prev.amount, currency: (prev.currency || 'INR').toUpperCase() };
+  } catch (e) {
+    console.error('maybeAutoRenewal error:', e.message);
+    return { created: false, reason: e.message };
+  }
+}
+
 // ── 1. WEBHOOK ──
 function hmac(msg) { return crypto.createHmac('sha256', WEBHOOK_SECRET).update(msg).digest('hex'); }
 
@@ -351,10 +424,19 @@ async function logClass({ student, classDate, minutes, meetingUuid, how }) {
     const taken = allLogs.filter(l => !l.is_free).length + 1;
     const remaining = paid - taken;
     await notify('info', `🎥 Class logged from Zoom: ${name} · ${prettyDate(classDate)} · ${minutes} min (${how})`);
-    if (remaining === 0) {
-      await notify('payment', `💳 ${name} has 0 classes left after the ${prettyDate(classDate)} class. Time to send a fee link.`);
-    } else if (remaining < 0) {
-      await notify('payment', `💳 ${name} has ${-remaining} unpaid class${remaining === -1 ? '' : 'es'} after ${prettyDate(classDate)}. Send a fee link.`);
+    if (remaining <= 0) {
+      const deficit = remaining === 0
+        ? `0 classes left after the ${prettyDate(classDate)} class`
+        : `${-remaining} unpaid class${remaining === -1 ? '' : 'es'} after ${prettyDate(classDate)}`;
+      const auto = await maybeAutoRenewal(student);
+      if (auto.created) {
+        const sym = auto.currency === 'INR' ? '₹' : auto.currency + ' ';
+        await notify('payment', `💳 ${name} has ${deficit}. Renewal ${auto.id} created automatically (${auto.classes} classes, ${sym}${auto.amount}) — the WhatsApp link goes out by itself. Cancel ${auto.id} in the dashboard if the package should change.`);
+      } else if (auto.reason === 'pending_exists') {
+        await notify('payment', `💳 ${name} has ${deficit}. A fee request is already pending for them.`);
+      } else {
+        await notify('payment', `💳 ${name} has ${deficit}. Time to send a fee link.`);
+      }
     }
   }
   return { logged: true, isFree };
