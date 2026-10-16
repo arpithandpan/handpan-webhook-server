@@ -5,6 +5,7 @@ const { createAndSendInvoice, invoiceWorkshopBooking, invoiceFeePayment, invoice
 const zoom = require('./zoom-service');
 const notifyMailer = require('./notify-mailer');
 const settlementWorker = require('./settlement-worker');
+const whatsapp = require('./whatsapp-service');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -100,6 +101,7 @@ const supabase = createClient(
 zoom.init(supabase);
 notifyMailer.init(supabase);
 settlementWorker.init(supabase);
+whatsapp.init(supabase);
 
 // ── GENERAL PAYMENT PAGE ID ──
 const GENERAL_PAYMENT_PAGE_ID = 'pl_SvxuRdqY2rd7ge';
@@ -1351,6 +1353,16 @@ app.post('/api/webhooks/zoom', express.raw({ type: '*/*' }), zoom.webhookHandler
 // Quick check that the Zoom env vars are loaded. No secrets in the reply.
 app.get('/api/zoom/status', (req, res) => res.json(zoom.status()));
 
+// ── WHATSAPP (student messages, logic lives in whatsapp-service.js) ──
+// Quick check that the prod WhatsApp env vars are loaded. No secrets in the reply.
+app.get('/api/whatsapp/status', (req, res) => res.json(whatsapp.status()));
+
+// Run the WhatsApp worker now instead of waiting for the next 2 minute tick.
+app.post('/api/whatsapp/process-now', requireAdmin, async (req, res) => {
+  try { return res.json(await whatsapp.processPending()); }
+  catch (err) { return res.status(500).json({ error: err.message }); }
+});
+
 // Dashboard review list: this Zoom person is that student. Logs the class
 // with the same rules as the worker and remembers the name.
 app.post('/api/zoom/unmatched/:id/resolve', requireAdmin, express.json(), async (req, res) => {
@@ -1890,4 +1902,5 @@ app.listen(PORT, () => {
   zoom.startWorker();
   notifyMailer.startWorker();
   settlementWorker.startWorker();
+  whatsapp.startWorker();
 });
