@@ -40,7 +40,9 @@ function channelFor(n) {
   const urgent =
     n.type === 'payment'                       // money in, fee reminders
     || /payment failed/i.test(msg)             // student tried to pay, failed
-    || /not linked to a student/i.test(msg);   // zoom review needed
+    || /not linked to a student/i.test(msg)    // zoom review needed
+    || /WhatsApp reply to/i.test(msg)          // student replied on the studio number
+    || /Upcoming class/i.test(msg);            // Arpit's own class heads-up
   return { email: true, whatsapp: urgent };
 }
 
