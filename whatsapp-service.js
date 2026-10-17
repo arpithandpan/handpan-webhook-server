@@ -182,7 +182,7 @@ async function pendingWithStudents(filter) {
   const ids = [...new Set(reqs.map(r => r.student_id).filter(Boolean))];
   const { data: students } = await supabase
     .from('students')
-    .select('id, full_name, phone, archived')
+    .select('*')
     .in('id', ids);
   const byId = {};
   for (const s of (students || [])) byId[s.id] = s;
@@ -226,7 +226,7 @@ async function sendForRequest({ request, student }, templateName, stampColumn, o
     return;
   }
 
-  const result = await sendTemplate(student.phone, templateName, [firstName(student.full_name), label, link]);
+  const result = await sendToAllPhones(student, templateName, [firstName(student.full_name), label, link]);
 
   if (result.ok) {
     await stamp(request.id, stampColumn);
@@ -366,6 +366,35 @@ async function planScheduleOccurrences(now) {
   return out;
 }
 
+// ── ALL PHONES FOR A STUDENT ──
+// students.phone is the main number. students.extra_phones (text[], optional)
+// holds extra numbers, e.g. both parents of a child. Every student message
+// (fee link, payment reminder, class reminder) goes to all of them. A second
+// payment is impossible: the pay page shows "already paid" and the server
+// rejects it. Duplicates and unusable numbers are dropped.
+function allPhones(student) {
+  const list = [student.phone].concat(Array.isArray(student.extra_phones) ? student.extra_phones : []);
+  const seen = new Set();
+  const out = [];
+  for (const raw of list) {
+    const n = normalizePhone(raw);
+    if (n && !seen.has(n)) { seen.add(n); out.push(n); }
+  }
+  return out;
+}
+
+// Send one template to every number of a student. ok if at least one went.
+async function sendToAllPhones(student, templateName, params) {
+  const phones = allPhones(student);
+  if (!phones.length) return { ok: false, error: 'No usable phone number' };
+  let ok = false, lastError = '';
+  for (const ph of phones) {
+    const r = await sendTemplate(ph, templateName, params);
+    if (r.ok) ok = true; else lastError = r.error;
+  }
+  return ok ? { ok: true } : { ok: false, error: lastError };
+}
+
 async function processClassReminders() {
   const now = new Date();
   const { ymd, weekday } = istParts(now);
@@ -402,7 +431,7 @@ async function processClassReminders() {
     if (m.reminder_sent_on === ymd || !m.join_url) continue;
 
     const { data: student } = await supabase.from('students')
-      .select('id, full_name, phone, archived').eq('id', m.student_id).maybeSingle();
+      .select('*').eq('id', m.student_id).maybeSingle();
     if (!student || student.archived || !normalizePhone(student.phone)) {
       await supabase.from('class_meetings').update({ reminder_sent_on: ymd }).eq('id', m.id);
       await notify('warning', `⚠️ Class reminder skipped for ${student?.full_name || m.student_id} — no usable phone or student missing.`);
@@ -413,7 +442,7 @@ async function processClassReminders() {
       console.log(`WA dry-run: would send class reminder to ${student.full_name} (${timeLabel}, server meeting)`);
       continue;
     }
-    const result = await sendTemplate(student.phone, CLASS_REMINDER_TEMPLATE, [firstName(student.full_name), timeLabel, m.join_url]);
+    const result = await sendToAllPhones(student, CLASS_REMINDER_TEMPLATE, [firstName(student.full_name), timeLabel, m.join_url]);
     if (result.ok) {
       await supabase.from('class_meetings').update({ reminder_sent_on: ymd }).eq('id', m.id);
       await notify('info', `⏰ Class reminder sent to ${student.full_name} on WhatsApp — today at ${timeLabel}.`);
@@ -455,7 +484,7 @@ async function processClassReminders() {
     if (!row.zoom_link) continue;                             // nothing to send without a link
 
     const { data: student } = await supabase.from('students')
-      .select('id, full_name, phone, archived').eq('id', row.student_id).maybeSingle();
+      .select('*').eq('id', row.student_id).maybeSingle();
     if (!student || student.archived || !normalizePhone(student.phone)) {
       await supabase.from('class_schedule').update({ reminder_sent_on: stampDay }).eq('id', row.id);
       await notify('warning', `⚠️ Class reminder skipped for ${student?.full_name || row.student_id} — no usable phone or student missing.`);
@@ -469,7 +498,7 @@ async function processClassReminders() {
       continue;
     }
 
-    const result = await sendTemplate(student.phone, CLASS_REMINDER_TEMPLATE, [firstName(student.full_name), timeLabel, row.zoom_link]);
+    const result = await sendToAllPhones(student, CLASS_REMINDER_TEMPLATE, [firstName(student.full_name), timeLabel, row.zoom_link]);
     if (result.ok) {
       await supabase.from('class_schedule').update({ reminder_sent_on: stampDay }).eq('id', row.id);
       row.reminder_sent_on = stampDay;
@@ -547,12 +576,15 @@ function verifyWebhook(req, res) {
 async function studentByPhone(waPhone) {
   const digits = String(waPhone || '').replace(/\D/g, '');
   if (!digits) return null;
-  const { data: students } = await supabase.from('students').select('id, full_name, phone, archived');
+  const { data: students } = await supabase.from('students').select('*');
   for (const s of (students || [])) {
     if (s.archived) continue;
-    const p = String(s.phone || '').replace(/\D/g, '');
-    if (!p) continue;
-    if (digits.endsWith(p.slice(-10)) || p.endsWith(digits.slice(-10))) return s;
+    const nums = [s.phone].concat(Array.isArray(s.extra_phones) ? s.extra_phones : []);
+    for (const raw of nums) {
+      const p = String(raw || '').replace(/\D/g, '');
+      if (!p) continue;
+      if (digits.endsWith(p.slice(-10)) || p.endsWith(digits.slice(-10))) return s;
+    }
   }
   return null;
 }
