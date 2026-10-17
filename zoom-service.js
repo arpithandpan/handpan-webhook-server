@@ -583,6 +583,11 @@ function startWorker() {
   console.log('Zoom worker on: every 5 min, min ' + MIN_MINUTES + ' min to count a class');
   setTimeout(processPending, 60 * 1000);
   setInterval(processPending, WORKER_EVERY_MS);
+  // Meeting sync engine: reconcile Zoom with the planned week a few times a
+  // day. syncMeetings() guards itself on the ZOOM_AUTO_MEETINGS flag.
+  console.log('Zoom meeting sync: ' + (autoMeetingsOn() ? 'ON (every 6h)' : 'off (ZOOM_AUTO_MEETINGS not set)'));
+  setTimeout(() => syncMeetings().catch(e => console.error('zoom sync error:', e.message)), 90 * 1000);
+  setInterval(() => syncMeetings().catch(e => console.error('zoom sync error:', e.message)), SYNC_EVERY_MS);
 }
 
 function status() {
@@ -591,9 +596,157 @@ function status() {
     webhookSecret: !!WEBHOOK_SECRET,
     minMinutes: MIN_MINUTES,
     trialMinMinutes: TRIAL_MIN_MINUTES,
+    autoMeetings: autoMeetingsOn() ? 'on' : 'off',
     lastRun: _lastRun,
     lastError: _lastError
   };
+}
+
+// ── 8. MEETING SYNC ENGINE (server-created meetings) ──
+// The database is the source of truth; Zoom is made to mirror it.
+// Every few hours (and on /api/zoom/sync-now) this builds the definitive
+// list of classes for the next 7 days from class_schedule (weekly slots)
+// plus class_exceptions (skip / move), then reconciles Zoom against it:
+// a planned class with no meeting gets one created; a stored meeting whose
+// time changed gets updated; a stored meeting no longer planned is deleted.
+// Meetings are created under the host account with the student's name in
+// the topic ("Handpan Class with Trina") so attendance matching works.
+// Gated by ZOOM_AUTO_MEETINGS = 'on' so it can be rolled out deliberately.
+const HOST_EMAIL = process.env.ZOOM_HOST_EMAIL || 'arpithandpan@gmail.com';
+const SYNC_DAYS = 7;
+const SYNC_EVERY_MS = 6 * 60 * 60 * 1000;   // reconcile 4x a day
+
+function autoMeetingsOn() {
+  return String(process.env.ZOOM_AUTO_MEETINGS || '').trim().toLowerCase() === 'on';
+}
+
+async function zoomApi(method, path, body) {
+  const doFetch = async (tok) => fetch('https://api.zoom.us/v2' + path, {
+    method,
+    headers: { 'Authorization': 'Bearer ' + tok, 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  let r = await doFetch(await zoomToken());
+  if (r.status === 401) r = await doFetch(await zoomToken(true));
+  if (r.status === 204) return { ok: true, data: null };
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) return { ok: false, status: r.status, error: j.message || ('HTTP ' + r.status) };
+  return { ok: true, data: j };
+}
+
+function addDaysIst(offset) {
+  const ist = new Date(Date.now() + 5.5 * 3600 * 1000 + offset * 24 * 3600 * 1000);
+  return { ymd: ist.toISOString().slice(0, 10), weekday: ist.getUTCDay() };
+}
+
+// The definitive class list for the window: { 'S-011|2026-10-19': {…} }
+async function planWindow() {
+  const { data: schedules } = await supabase.from('class_schedule')
+    .select('student_id, weekday, time_ist, duration_min, student_tz, active').eq('active', true);
+  const from = addDaysIst(0).ymd, to = addDaysIst(SYNC_DAYS + 7).ymd;
+  const { data: exceptions } = await supabase.from('class_exceptions')
+    .select('student_id, original_date, action, new_date, new_time_ist')
+    .gte('original_date', from).lte('original_date', to);
+  const { data: students } = await supabase.from('students').select('id, full_name, archived');
+  const nameById = {};
+  for (const s of (students || [])) if (!s.archived) nameById[s.id] = s.full_name;
+
+  const plan = {};
+  for (let i = 0; i < SYNC_DAYS; i++) {
+    const { ymd, weekday } = addDaysIst(i);
+    for (const sc of (schedules || [])) {
+      if (sc.weekday !== weekday || !nameById[sc.student_id]) continue;
+      plan[sc.student_id + '|' + ymd] = {
+        student_id: sc.student_id, name: nameById[sc.student_id], date: ymd,
+        time: String(sc.time_ist).slice(0, 5), duration: sc.duration_min || 60,
+        tz: sc.student_tz || 'Asia/Kolkata'
+      };
+    }
+  }
+  // Exceptions: a skip removes the slot; a move removes it and adds the new one.
+  for (const ex of (exceptions || [])) {
+    const key = ex.student_id + '|' + ex.original_date;
+    const original = plan[key];
+    if (ex.action === 'skip') { delete plan[key]; continue; }
+    if (ex.action === 'move' && ex.new_date) {
+      const base = original || { student_id: ex.student_id, name: nameById[ex.student_id], duration: 60, tz: 'Asia/Kolkata' };
+      delete plan[key];
+      if (!base.name) continue;
+      plan[ex.student_id + '|' + ex.new_date] = {
+        ...base, date: ex.new_date,
+        time: ex.new_time_ist ? String(ex.new_time_ist).slice(0, 5) : base.time
+      };
+    }
+  }
+  // Drop classes already underway or past (30 min grace).
+  const now = Date.now();
+  for (const k of Object.keys(plan)) {
+    const p = plan[k];
+    const t = new Date(p.date + 'T' + p.time + ':00+05:30').getTime();
+    if (isNaN(t) || t < now + 30 * 60 * 1000) delete plan[k];
+  }
+  return plan;
+}
+
+async function syncMeetings() {
+  if (!supabase || !isConfigured()) return { skipped: 'zoom not configured' };
+  if (!autoMeetingsOn()) return { skipped: 'ZOOM_AUTO_MEETINGS is off' };
+
+  const plan = await planWindow();
+  const from = addDaysIst(0).ymd, to = addDaysIst(SYNC_DAYS + 7).ymd;
+  const { data: stored, error } = await supabase.from('class_meetings')
+    .select('*').eq('status', 'scheduled').gte('class_date', from).lte('class_date', to);
+  if (error) return { error: error.message };
+
+  const storedByKey = {};
+  for (const m of (stored || [])) storedByKey[m.student_id + '|' + m.class_date] = m;
+
+  let created = 0, updated = 0, cancelled = 0;
+
+  // 1. Planned but missing, or present with a changed time.
+  for (const [key, p] of Object.entries(plan)) {
+    const existing = storedByKey[key];
+    const startIst = p.date + 'T' + p.time + ':00';
+    if (!existing) {
+      const topic = 'Handpan Class with ' + p.name;
+      const res = await zoomApi('POST', '/users/' + encodeURIComponent(HOST_EMAIL) + '/meetings', {
+        topic, type: 2, start_time: startIst, timezone: 'Asia/Kolkata', duration: p.duration,
+        settings: { join_before_host: true, waiting_room: false, approval_type: 2 }
+      });
+      if (!res.ok) { await notify('warning', `⚠️ Could not create Zoom meeting for ${p.name} on ${prettyDate(p.date)}: ${res.error}`); continue; }
+      const { error: insErr } = await supabase.from('class_meetings').insert({
+        student_id: p.student_id, class_date: p.date, time_ist: p.time, duration_min: p.duration,
+        student_tz: p.tz, zoom_meeting_id: String(res.data.id), join_url: res.data.join_url, status: 'scheduled'
+      });
+      if (insErr) { console.error('class_meetings insert failed:', insErr.message); await zoomApi('DELETE', '/meetings/' + res.data.id); continue; }
+      created++;
+    } else if (String(existing.time_ist).slice(0, 5) !== p.time) {
+      const res = await zoomApi('PATCH', '/meetings/' + existing.zoom_meeting_id, {
+        start_time: startIst, timezone: 'Asia/Kolkata', duration: p.duration
+      });
+      if (!res.ok) { await notify('warning', `⚠️ Could not move Zoom meeting for ${p.name} on ${prettyDate(p.date)}: ${res.error}`); continue; }
+      await supabase.from('class_meetings')
+        .update({ time_ist: p.time, duration_min: p.duration, reminder_sent_on: null })
+        .eq('id', existing.id);
+      await notify('info', `🔁 ${p.name}'s class on ${prettyDate(p.date)} moved to ${p.time} IST — Zoom updated automatically.`);
+      updated++;
+    }
+  }
+
+  // 2. Stored but no longer planned → cancel.
+  for (const [key, m] of Object.entries(storedByKey)) {
+    if (plan[key]) continue;
+    const res = await zoomApi('DELETE', '/meetings/' + m.zoom_meeting_id);
+    if (!res.ok && res.status !== 404) { await notify('warning', `⚠️ Could not cancel Zoom meeting ${m.zoom_meeting_id} (${m.student_id}, ${prettyDate(m.class_date)}): ${res.error}`); continue; }
+    await supabase.from('class_meetings').update({ status: 'cancelled' }).eq('id', m.id);
+    cancelled++;
+  }
+
+  if (created || updated || cancelled) {
+    await notify('info', `📅 Zoom sync: ${created} meeting(s) created, ${updated} moved, ${cancelled} cancelled for the coming week.`);
+  }
+  console.log('Zoom sync done:', { created, updated, cancelled, planned: Object.keys(plan).length });
+  return { created, updated, cancelled, planned: Object.keys(plan).length };
 }
 
 // ── 7. REVIEW LIST: pick a student for an unmatched person ──
@@ -622,6 +775,6 @@ async function resolveUnmatched(id, studentId) {
 }
 
 module.exports = {
-  init, webhookHandler, startWorker, processPending, resolveUnmatched, status,
+  init, webhookHandler, startWorker, processPending, resolveUnmatched, status, syncMeetings,
   _test: { cleanParticipants, planMeeting, buildIndex, matchPerson, studentsInTopic, isTrialTopic, encodeUuid, istDate, normName, hmac, MIN_MINUTES, TRIAL_MIN_MINUTES }
 };
