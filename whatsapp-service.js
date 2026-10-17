@@ -419,6 +419,82 @@ async function processPending() {
   return { fresh: fresh.length, reminders: due.length, escalated: stale.length, classReminders: cls.reminders };
 }
 
+// ── INCOMING MESSAGES (webhook from Meta) ──
+// Students can reply to the studio number. Nobody's phone holds that number,
+// so Meta delivers every incoming message here and we surface it as a
+// dashboard notification — which the alert pipeline already forwards to
+// Arpit's WhatsApp and email. Statuses (sent/delivered/read) are ignored.
+//
+// Env:
+//   WHATSAPP_VERIFY_TOKEN – any secret string; the same value is typed into
+//                           the Meta webhook config. Meta sends it back once
+//                           during setup to prove the URL is really ours.
+
+// GET: Meta's one-time URL verification handshake.
+function verifyWebhook(req, res) {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && token && token === process.env.WHATSAPP_VERIFY_TOKEN) {
+    console.log('WhatsApp webhook verified');
+    return res.status(200).send(challenge);
+  }
+  return res.sendStatus(403);
+}
+
+// Find which student a phone number belongs to, for a friendly name.
+async function studentByPhone(waPhone) {
+  const digits = String(waPhone || '').replace(/\D/g, '');
+  if (!digits) return null;
+  const { data: students } = await supabase.from('students').select('id, full_name, phone, archived');
+  for (const s of (students || [])) {
+    if (s.archived) continue;
+    const p = String(s.phone || '').replace(/\D/g, '');
+    if (!p) continue;
+    if (digits.endsWith(p.slice(-10)) || p.endsWith(digits.slice(-10))) return s;
+  }
+  return null;
+}
+
+function describeMessage(msg) {
+  if (msg.type === 'text') return msg.text?.body || '';
+  if (msg.type === 'button') return msg.button?.text || '[button reply]';
+  if (msg.type === 'interactive') return msg.interactive?.button_reply?.title || msg.interactive?.list_reply?.title || '[interactive reply]';
+  if (msg.type === 'image') return '[photo]';
+  if (msg.type === 'audio') return '[voice note]';
+  if (msg.type === 'video') return '[video]';
+  if (msg.type === 'document') return '[document]';
+  if (msg.type === 'sticker') return '[sticker]';
+  if (msg.type === 'location') return '[location]';
+  return '[' + (msg.type || 'message') + ']';
+}
+
+// POST: every event for the studio number lands here. Always answer 200
+// fast so Meta does not retry; failures become log lines.
+async function incomingHandler(req, res) {
+  res.sendStatus(200);
+  try {
+    const body = req.body || {};
+    for (const entry of (body.entry || [])) {
+      for (const change of (entry.changes || [])) {
+        const value = change.value || {};
+        const contactName = value.contacts?.[0]?.profile?.name || null;
+        for (const msg of (value.messages || [])) {
+          const from = msg.from;                       // e.g. '919739742036'
+          const text = describeMessage(msg);
+          const student = await studentByPhone(from);
+          const who = student ? student.full_name : (contactName ? `${contactName} (+${from})` : '+' + from);
+          const preview = String(text).slice(0, 160);
+          await notify('info', `💬 WhatsApp reply to Handpan with Arpit — ${who}: "${preview}"${String(text).length > 160 ? '…' : ''} Reply from your main number.`);
+          console.log('WA incoming:', who, '-', preview);
+        }
+      }
+    }
+  } catch (e) {
+    console.error('WA incoming handler error:', e.message);
+  }
+}
+
 // ── WORKER LOOP ──
 function startWorker() {
   if (!configured()) {
@@ -437,4 +513,4 @@ function startWorker() {
   timer = setInterval(tick, TICK_MS);
 }
 
-module.exports = { init, status, startWorker, processPending, sendTemplate, normalizePhone };
+module.exports = { init, status, startWorker, processPending, sendTemplate, normalizePhone, verifyWebhook, incomingHandler };
