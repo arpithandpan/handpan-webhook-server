@@ -249,7 +249,7 @@ async function sendForRequest({ request, student }, templateName, stampColumn, o
 // 2-minute tick sending twice.
 function istParts(d) {
   const ist = new Date(d.getTime() + 5.5 * 3600 * 1000);
-  return { ymd: ist.toISOString().slice(0, 10), weekday: ist.getUTCDay() };
+  return { ymd: ist.toISOString().slice(0, 10), weekday: ist.getUTCDay(), hhmm: ist.toISOString().slice(11, 16) };
 }
 
 function localTimeLabel(dateUtc, tz) {
@@ -262,6 +262,108 @@ function localTimeLabel(dateUtc, tz) {
   } catch (e) {
     return new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Kolkata', hour: 'numeric', minute: '2-digit', hour12: true }).format(dateUtc) + ' IST';
   }
+}
+
+// ── TIMEZONE HELPERS ──
+// Offset (minutes) of `tz` from UTC at instant `d`. Positive east of UTC.
+function tzOffsetMin(d, tz) {
+  const f = new Intl.DateTimeFormat('en-US', { timeZone: tz, hourCycle: 'h23',
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const p = {};
+  for (const x of f.formatToParts(d)) p[x.type] = x.value;
+  const asUtc = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour % 24, +p.minute, +p.second);
+  return Math.round((asUtc - d.getTime()) / 60000);
+}
+
+// Wall-clock date + time in `tz` → the real instant (Date). DST-correct.
+function zonedToUtc(ymd, hhmm, tz) {
+  const guess = new Date(`${ymd}T${hhmm}:00Z`);
+  let off = tzOffsetMin(guess, tz);
+  let t = new Date(guess.getTime() - off * 60000);
+  const off2 = tzOffsetMin(t, tz);
+  if (off2 !== off) t = new Date(guess.getTime() - off2 * 60000);
+  return t;
+}
+
+function addDays(ymd, n) {
+  const d = new Date(ymd + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+function weekdayOf(ymd) { return new Date(ymd + 'T00:00:00Z').getUTCDay(); }
+
+// ── WEEKLY SCHEDULE → CONCRETE CLASSES ──
+// Returns [{ row, utc, istDate, moved }] for classes whose IST date is today
+// or tomorrow. Rules:
+//  • A row with local_weekday + local_time is anchored to the student's own
+//    clock (student_tz), so US classes stay at the same local time across
+//    daylight saving and the IST time shifts automatically.
+//  • Otherwise the row is anchored to IST (weekday + time_ist), as before.
+//  • class_exceptions (by student + original IST date): 'skip' drops the
+//    class; 'move' drops it and adds one at new_date + new_time_ist (IST).
+async function planScheduleOccurrences(now) {
+  const today = istParts(now).ymd;
+  const days = [today, addDays(today, 1)];
+
+  const { data: rows, error } = await supabase
+    .from('class_schedule')
+    .select('id, student_id, weekday, time_ist, local_weekday, local_time, student_tz, zoom_link, active, reminder_sent_on, self_reminder_on')
+    .eq('active', true);
+  if (error) { console.error('class_schedule query error:', error.message); return []; }
+  if (!rows || !rows.length) return [];
+
+  const { data: exRows } = await supabase
+    .from('class_exceptions')
+    .select('student_id, original_date, action, new_date, new_time_ist')
+    .gte('original_date', addDays(today, -14))
+    .lte('original_date', addDays(today, 14));
+  const { data: movedIn } = await supabase
+    .from('class_exceptions')
+    .select('student_id, original_date, action, new_date, new_time_ist')
+    .eq('action', 'move')
+    .in('new_date', days);
+  const exKey = {};
+  for (const e of (exRows || [])) exKey[e.student_id + '|' + String(e.original_date).slice(0, 10)] = e;
+
+  const out = [];
+  for (const row of rows) {
+    const tz = row.student_tz || 'Asia/Kolkata';
+    const anchoredLocal = row.local_time != null && row.local_weekday != null && tz !== 'Asia/Kolkata';
+    const candidates = [];
+    if (anchoredLocal) {
+      const lt = String(row.local_time).slice(0, 5);
+      for (let i = -2; i <= 2; i++) {
+        const L = addDays(today, i);
+        if (weekdayOf(L) !== Number(row.local_weekday)) continue;
+        const utc = zonedToUtc(L, lt, tz);
+        candidates.push({ utc, istDate: istParts(utc).ymd });
+      }
+    } else {
+      for (const D of days) {
+        if (weekdayOf(D) !== Number(row.weekday)) continue;
+        const utc = new Date(`${D}T${String(row.time_ist).slice(0, 5)}:00+05:30`);
+        candidates.push({ utc, istDate: D });
+      }
+    }
+    for (const c of candidates) {
+      if (!days.includes(c.istDate) || isNaN(c.utc)) continue;
+      const ex = exKey[row.student_id + '|' + c.istDate];
+      if (ex && (ex.action === 'skip' || ex.action === 'move')) continue;
+      out.push({ row, utc: c.utc, istDate: c.istDate, moved: false });
+    }
+  }
+
+  // Classes moved INTO today/tomorrow (use the student's active row for link/tz).
+  for (const e of (movedIn || [])) {
+    const row = rows.find(r => r.student_id === e.student_id);
+    if (!row || !e.new_time_ist) continue;
+    const D = String(e.new_date).slice(0, 10);
+    const utc = new Date(`${D}T${String(e.new_time_ist).slice(0, 5)}:00+05:30`);
+    if (isNaN(utc)) continue;
+    out.push({ row, utc, istDate: D, moved: true });
+  }
+  return out;
 }
 
 async function processClassReminders() {
@@ -326,38 +428,36 @@ async function processClassReminders() {
     }
   }
 
-  const { data: rows, error } = await supabase
-    .from('class_schedule')
-    .select('id, student_id, weekday, time_ist, student_tz, zoom_link, active, reminder_sent_on, self_reminder_on')
-    .eq('active', true)
-    .eq('weekday', weekday);
-  if (error) { console.error('class_schedule query error:', error.message); return { reminders: sent }; }
-  if (!rows || !rows.length) return { reminders: sent };
+  // Weekly schedule (the normal path: each student's permanent Zoom link).
+  // planScheduleOccurrences() turns the weekly rows into concrete classes for
+  // today and tomorrow (IST), honouring skips/moves in class_exceptions and
+  // students whose slot is anchored to their own local time (DST-safe).
+  const occ = await planScheduleOccurrences(now);
+  for (const o of occ) {
+    const row = o.row;
+    if (o.istDate === ymd && studentsWithMeetingToday.has(row.student_id)) continue;   // engine row already handled today
 
-  for (const row of rows) {
-    if (studentsWithMeetingToday.has(row.student_id)) continue;   // engine row already handled today
-
-    // Today's class moment in UTC, built from the IST date + IST slot time.
-    const hhmm = String(row.time_ist).slice(0, 5);
-    const classUtc = new Date(`${ymd}T${hhmm}:00+05:30`);
-    if (isNaN(classUtc)) continue;
+    const classUtc = o.utc;
     const minutesUntil = (classUtc - now) / 60000;
     if (minutesUntil <= 0 || minutesUntil > CLASS_REMINDER_WINDOW_MIN) continue;
+    const istHHMM = istParts(classUtc).hhmm;
+    const stampDay = o.istDate;
 
-    // Arpit's own heads-up (works today, no Meta approval needed).
-    if (row.self_reminder_on !== ymd) {
+    // Arpit's own heads-up (works without Meta approval).
+    if (row.self_reminder_on !== stampDay) {
       const { data: s0 } = await supabase.from('students').select('full_name').eq('id', row.student_id).maybeSingle();
-      await notify('info', `⏰ Upcoming class: ${s0?.full_name || row.student_id} today at ${hhmm} IST (in about ${Math.round(minutesUntil)} min).`);
-      await supabase.from('class_schedule').update({ self_reminder_on: ymd }).eq('id', row.id);
+      await notify('info', `⏰ Upcoming class: ${s0?.full_name || row.student_id} today at ${istHHMM} IST (in about ${Math.round(minutesUntil)} min)${o.moved ? ' (rescheduled)' : ''}.`);
+      await supabase.from('class_schedule').update({ self_reminder_on: stampDay }).eq('id', row.id);
+      row.self_reminder_on = stampDay;
     }
 
-    if (row.reminder_sent_on === ymd) continue;              // already reminded today
+    if (row.reminder_sent_on === stampDay) continue;          // already reminded for this class
     if (!row.zoom_link) continue;                             // nothing to send without a link
 
     const { data: student } = await supabase.from('students')
       .select('id, full_name, phone, archived').eq('id', row.student_id).maybeSingle();
     if (!student || student.archived || !normalizePhone(student.phone)) {
-      await supabase.from('class_schedule').update({ reminder_sent_on: ymd }).eq('id', row.id);
+      await supabase.from('class_schedule').update({ reminder_sent_on: stampDay }).eq('id', row.id);
       await notify('warning', `⚠️ Class reminder skipped for ${student?.full_name || row.student_id} — no usable phone or student missing.`);
       continue;
     }
@@ -371,14 +471,15 @@ async function processClassReminders() {
 
     const result = await sendTemplate(student.phone, CLASS_REMINDER_TEMPLATE, [firstName(student.full_name), timeLabel, row.zoom_link]);
     if (result.ok) {
-      await supabase.from('class_schedule').update({ reminder_sent_on: ymd }).eq('id', row.id);
+      await supabase.from('class_schedule').update({ reminder_sent_on: stampDay }).eq('id', row.id);
+      row.reminder_sent_on = stampDay;
       await notify('info', `⏰ Class reminder sent to ${student.full_name} on WhatsApp — today at ${timeLabel}.`);
       sent++;
     } else {
-      const key = 'cls:' + row.id + ':' + ymd;
+      const key = 'cls:' + row.id + ':' + stampDay;
       failCounts[key] = (failCounts[key] || 0) + 1;
       if (failCounts[key] >= MAX_ATTEMPTS) {
-        await supabase.from('class_schedule').update({ reminder_sent_on: ymd }).eq('id', row.id);
+        await supabase.from('class_schedule').update({ reminder_sent_on: stampDay }).eq('id', row.id);
         await notify('warning', `⚠️ Class reminder to ${student.full_name} failed ${MAX_ATTEMPTS} times — ${result.error}. Remind them manually.`);
       }
     }
@@ -513,4 +614,4 @@ function startWorker() {
   timer = setInterval(tick, TICK_MS);
 }
 
-module.exports = { init, status, startWorker, processPending, sendTemplate, normalizePhone, verifyWebhook, incomingHandler };
+module.exports = { init, status, startWorker, processPending, sendTemplate, normalizePhone, verifyWebhook, incomingHandler, _test: { planScheduleOccurrences, zonedToUtc, tzOffsetMin } };
