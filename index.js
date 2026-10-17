@@ -1354,6 +1354,12 @@ app.post('/api/webhooks/zoom', express.raw({ type: '*/*' }), zoom.webhookHandler
 app.get('/api/zoom/status', (req, res) => res.json(zoom.status()));
 
 // ── WHATSAPP (student messages, logic lives in whatsapp-service.js) ──
+// Webhook for the studio number: GET is Meta's one-time verification
+// handshake, POST delivers every incoming message, which becomes a
+// dashboard notification (and from there an alert to Arpit).
+app.get('/api/webhooks/whatsapp', (req, res) => whatsapp.verifyWebhook(req, res));
+app.post('/api/webhooks/whatsapp', express.json(), (req, res) => whatsapp.incomingHandler(req, res));
+
 // Quick check that the prod WhatsApp env vars are loaded. No secrets in the reply.
 app.get('/api/whatsapp/status', (req, res) => res.json(whatsapp.status()));
 
