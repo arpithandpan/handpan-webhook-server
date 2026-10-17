@@ -268,16 +268,63 @@ async function processClassReminders() {
   const now = new Date();
   const { ymd, weekday } = istParts(now);
 
+  // Server-created meetings (class_meetings) are the preferred source: they
+  // carry the exact date, time and fresh join link, reschedules included.
+  // The weekly class_schedule rows with a hand-pasted zoom_link remain as a
+  // fallback for any student who has no meeting row today (pre-engine data).
+  const studentsWithMeetingToday = new Set();
+  let sent = 0;
+
+  const { data: meets } = await supabase
+    .from('class_meetings')
+    .select('id, student_id, class_date, time_ist, student_tz, join_url, status, reminder_sent_on')
+    .eq('class_date', ymd);
+  for (const m of (meets || [])) {
+    studentsWithMeetingToday.add(m.student_id);
+    if (m.status !== 'scheduled' || m.reminder_sent_on === ymd || !m.join_url) continue;
+    const hhmm = String(m.time_ist).slice(0, 5);
+    const classUtc = new Date(`${ymd}T${hhmm}:00+05:30`);
+    if (isNaN(classUtc)) continue;
+    const minutesUntil = (classUtc - now) / 60000;
+    if (minutesUntil <= 0 || minutesUntil > CLASS_REMINDER_WINDOW_MIN) continue;
+
+    const { data: student } = await supabase.from('students')
+      .select('id, full_name, phone, archived').eq('id', m.student_id).maybeSingle();
+    if (!student || student.archived || !normalizePhone(student.phone)) {
+      await supabase.from('class_meetings').update({ reminder_sent_on: ymd }).eq('id', m.id);
+      await notify('warning', `⚠️ Class reminder skipped for ${student?.full_name || m.student_id} — no usable phone or student missing.`);
+      continue;
+    }
+    const timeLabel = localTimeLabel(classUtc, m.student_tz || 'Asia/Kolkata');
+    if (!studentSendsOn()) {
+      console.log(`WA dry-run: would send class reminder to ${student.full_name} (${timeLabel}, server meeting)`);
+      continue;
+    }
+    const result = await sendTemplate(student.phone, CLASS_REMINDER_TEMPLATE, [firstName(student.full_name), timeLabel, m.join_url]);
+    if (result.ok) {
+      await supabase.from('class_meetings').update({ reminder_sent_on: ymd }).eq('id', m.id);
+      await notify('info', `⏰ Class reminder sent to ${student.full_name} on WhatsApp — today at ${timeLabel}.`);
+      sent++;
+    } else {
+      const key = 'clm:' + m.id + ':' + ymd;
+      failCounts[key] = (failCounts[key] || 0) + 1;
+      if (failCounts[key] >= MAX_ATTEMPTS) {
+        await supabase.from('class_meetings').update({ reminder_sent_on: ymd }).eq('id', m.id);
+        await notify('warning', `⚠️ Class reminder to ${student.full_name} failed ${MAX_ATTEMPTS} times — ${result.error}. Remind them manually.`);
+      }
+    }
+  }
+
   const { data: rows, error } = await supabase
     .from('class_schedule')
     .select('id, student_id, weekday, time_ist, student_tz, zoom_link, active, reminder_sent_on')
     .eq('active', true)
     .eq('weekday', weekday);
-  if (error) { console.error('class_schedule query error:', error.message); return { reminders: 0 }; }
-  if (!rows || !rows.length) return { reminders: 0 };
+  if (error) { console.error('class_schedule query error:', error.message); return { reminders: sent }; }
+  if (!rows || !rows.length) return { reminders: sent };
 
-  let sent = 0;
   for (const row of rows) {
+    if (studentsWithMeetingToday.has(row.student_id)) continue;   // engine row already handled today
     if (row.reminder_sent_on === ymd) continue;              // already reminded today
     if (!row.zoom_link) continue;                             // nothing to send without a link
 
