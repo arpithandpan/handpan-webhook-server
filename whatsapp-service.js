@@ -40,6 +40,21 @@ const TICK_MS = 2 * 60 * 1000;          // worker cadence
 const REMINDER_AFTER_MS = 3 * 24 * 60 * 60 * 1000;   // 3 days
 const ESCALATE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;   // 7 days
 
+// Class reminders: send when the class starts within this window.
+// The worker ticks every 2 minutes, so a 65 minute window with a
+// once-per-day stamp means exactly one reminder, roughly an hour before.
+const CLASS_REMINDER_WINDOW_MIN = 65;
+const CLASS_REMINDER_TEMPLATE = 'class_reminder_v2';
+
+// Friendly timezone labels for the reminder text. Anything not listed
+// falls back to the raw offset Intl gives us.
+const TZ_LABELS = {
+  'Asia/Kolkata': 'IST',
+  'America/New_York': 'ET',
+  'America/Los_Angeles': 'PT',
+  'America/Vancouver': 'PT'
+};
+
 let supabase = null;
 let timer = null;
 let ticking = false;
@@ -226,6 +241,85 @@ async function sendForRequest({ request, student }, templateName, stampColumn, o
   }
 }
 
+// ── CLASS REMINDERS ──
+// class_schedule holds each regular student's weekly slot in IST plus the
+// stable join link of their recurring Zoom meeting. About an hour before a
+// class, send the class_reminder template with the time written in the
+// student's own timezone. reminder_sent_on (a date) guards against the
+// 2-minute tick sending twice.
+function istParts(d) {
+  const ist = new Date(d.getTime() + 5.5 * 3600 * 1000);
+  return { ymd: ist.toISOString().slice(0, 10), weekday: ist.getUTCDay() };
+}
+
+function localTimeLabel(dateUtc, tz) {
+  try {
+    const t = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit', hour12: true }).format(dateUtc);
+    const label = TZ_LABELS[tz];
+    if (label) return `${t} ${label}`;
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit', hour12: true, timeZoneName: 'short' }).format(dateUtc);
+    return parts;
+  } catch (e) {
+    return new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Kolkata', hour: 'numeric', minute: '2-digit', hour12: true }).format(dateUtc) + ' IST';
+  }
+}
+
+async function processClassReminders() {
+  const now = new Date();
+  const { ymd, weekday } = istParts(now);
+
+  const { data: rows, error } = await supabase
+    .from('class_schedule')
+    .select('id, student_id, weekday, time_ist, student_tz, zoom_link, active, reminder_sent_on')
+    .eq('active', true)
+    .eq('weekday', weekday);
+  if (error) { console.error('class_schedule query error:', error.message); return { reminders: 0 }; }
+  if (!rows || !rows.length) return { reminders: 0 };
+
+  let sent = 0;
+  for (const row of rows) {
+    if (row.reminder_sent_on === ymd) continue;              // already reminded today
+    if (!row.zoom_link) continue;                             // nothing to send without a link
+
+    // Today's class moment in UTC, built from the IST date + IST slot time.
+    const hhmm = String(row.time_ist).slice(0, 5);
+    const classUtc = new Date(`${ymd}T${hhmm}:00+05:30`);
+    if (isNaN(classUtc)) continue;
+    const minutesUntil = (classUtc - now) / 60000;
+    if (minutesUntil <= 0 || minutesUntil > CLASS_REMINDER_WINDOW_MIN) continue;
+
+    const { data: student } = await supabase.from('students')
+      .select('id, full_name, phone, archived').eq('id', row.student_id).maybeSingle();
+    if (!student || student.archived || !normalizePhone(student.phone)) {
+      await supabase.from('class_schedule').update({ reminder_sent_on: ymd }).eq('id', row.id);
+      await notify('warning', `⚠️ Class reminder skipped for ${student?.full_name || row.student_id} — no usable phone or student missing.`);
+      continue;
+    }
+
+    const timeLabel = localTimeLabel(classUtc, row.student_tz || 'Asia/Kolkata');
+
+    if (!studentSendsOn()) {
+      console.log(`WA dry-run: would send class reminder to ${student.full_name} (${timeLabel})`);
+      continue;
+    }
+
+    const result = await sendTemplate(student.phone, CLASS_REMINDER_TEMPLATE, [firstName(student.full_name), timeLabel, row.zoom_link]);
+    if (result.ok) {
+      await supabase.from('class_schedule').update({ reminder_sent_on: ymd }).eq('id', row.id);
+      await notify('info', `⏰ Class reminder sent to ${student.full_name} on WhatsApp — today at ${timeLabel}.`);
+      sent++;
+    } else {
+      const key = 'cls:' + row.id + ':' + ymd;
+      failCounts[key] = (failCounts[key] || 0) + 1;
+      if (failCounts[key] >= MAX_ATTEMPTS) {
+        await supabase.from('class_schedule').update({ reminder_sent_on: ymd }).eq('id', row.id);
+        await notify('warning', `⚠️ Class reminder to ${student.full_name} failed ${MAX_ATTEMPTS} times — ${result.error}. Remind them manually.`);
+      }
+    }
+  }
+  return { reminders: sent };
+}
+
 // ── ONE WORKER PASS ──
 async function processPending() {
   if (!supabase || !configured()) return { skipped: 'not configured' };
@@ -253,7 +347,10 @@ async function processPending() {
     await notify('warning', `⏰ ${student?.full_name || request.student_id}'s fee (${request.id}, ${packageLabel(request.classes, request.month)}) is unpaid 7 days after the WhatsApp link. Might be time for a personal follow-up.`);
   }
 
-  return { fresh: fresh.length, reminders: due.length, escalated: stale.length };
+  // 4. Class reminders (about an hour before each scheduled class).
+  const cls = await processClassReminders();
+
+  return { fresh: fresh.length, reminders: due.length, escalated: stale.length, classReminders: cls.reminders };
 }
 
 // ── WORKER LOOP ──
