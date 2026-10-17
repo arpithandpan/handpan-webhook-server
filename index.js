@@ -1384,6 +1384,13 @@ app.post('/api/zoom/process-now', requireAdmin, async (req, res) => {
   catch (err) { return res.status(500).json({ error: err.message }); }
 });
 
+// Reconcile next week's Zoom meetings with the schedule right now,
+// instead of waiting for the sync engine's next 6 hour pass.
+app.post('/api/zoom/sync-now', requireAdmin, async (req, res) => {
+  try { return res.json(await zoom.syncMeetings()); }
+  catch (err) { return res.status(500).json({ error: err.message }); }
+});
+
 // ── RAZORPAY WEBHOOK ──
 app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
