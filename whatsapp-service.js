@@ -277,16 +277,27 @@ async function processClassReminders() {
 
   const { data: meets } = await supabase
     .from('class_meetings')
-    .select('id, student_id, class_date, time_ist, student_tz, join_url, status, reminder_sent_on')
+    .select('id, student_id, class_date, time_ist, student_tz, join_url, status, reminder_sent_on, self_reminder_on')
     .eq('class_date', ymd);
   for (const m of (meets || [])) {
     studentsWithMeetingToday.add(m.student_id);
-    if (m.status !== 'scheduled' || m.reminder_sent_on === ymd || !m.join_url) continue;
+    if (m.status !== 'scheduled') continue;
     const hhmm = String(m.time_ist).slice(0, 5);
     const classUtc = new Date(`${ymd}T${hhmm}:00+05:30`);
     if (isNaN(classUtc)) continue;
     const minutesUntil = (classUtc - now) / 60000;
     if (minutesUntil <= 0 || minutesUntil > CLASS_REMINDER_WINDOW_MIN) continue;
+
+    // Arpit's own heads-up, independent of student sends and Meta approvals:
+    // one dashboard notification per class, which the alert pipeline already
+    // delivers to his WhatsApp and email.
+    if (m.self_reminder_on !== ymd) {
+      const { data: s0 } = await supabase.from('students').select('full_name').eq('id', m.student_id).maybeSingle();
+      await notify('info', `⏰ Upcoming class: ${s0?.full_name || m.student_id} today at ${hhmm} IST (in about ${Math.round(minutesUntil)} min).`);
+      await supabase.from('class_meetings').update({ self_reminder_on: ymd }).eq('id', m.id);
+    }
+
+    if (m.reminder_sent_on === ymd || !m.join_url) continue;
 
     const { data: student } = await supabase.from('students')
       .select('id, full_name, phone, archived').eq('id', m.student_id).maybeSingle();
@@ -317,7 +328,7 @@ async function processClassReminders() {
 
   const { data: rows, error } = await supabase
     .from('class_schedule')
-    .select('id, student_id, weekday, time_ist, student_tz, zoom_link, active, reminder_sent_on')
+    .select('id, student_id, weekday, time_ist, student_tz, zoom_link, active, reminder_sent_on, self_reminder_on')
     .eq('active', true)
     .eq('weekday', weekday);
   if (error) { console.error('class_schedule query error:', error.message); return { reminders: sent }; }
@@ -325,8 +336,6 @@ async function processClassReminders() {
 
   for (const row of rows) {
     if (studentsWithMeetingToday.has(row.student_id)) continue;   // engine row already handled today
-    if (row.reminder_sent_on === ymd) continue;              // already reminded today
-    if (!row.zoom_link) continue;                             // nothing to send without a link
 
     // Today's class moment in UTC, built from the IST date + IST slot time.
     const hhmm = String(row.time_ist).slice(0, 5);
@@ -334,6 +343,16 @@ async function processClassReminders() {
     if (isNaN(classUtc)) continue;
     const minutesUntil = (classUtc - now) / 60000;
     if (minutesUntil <= 0 || minutesUntil > CLASS_REMINDER_WINDOW_MIN) continue;
+
+    // Arpit's own heads-up (works today, no Meta approval needed).
+    if (row.self_reminder_on !== ymd) {
+      const { data: s0 } = await supabase.from('students').select('full_name').eq('id', row.student_id).maybeSingle();
+      await notify('info', `⏰ Upcoming class: ${s0?.full_name || row.student_id} today at ${hhmm} IST (in about ${Math.round(minutesUntil)} min).`);
+      await supabase.from('class_schedule').update({ self_reminder_on: ymd }).eq('id', row.id);
+    }
+
+    if (row.reminder_sent_on === ymd) continue;              // already reminded today
+    if (!row.zoom_link) continue;                             // nothing to send without a link
 
     const { data: student } = await supabase.from('students')
       .select('id, full_name, phone, archived').eq('id', row.student_id).maybeSingle();
