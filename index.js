@@ -1585,6 +1585,30 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
           read: false
         });
 
+        // Paid but not in the weekly schedule yet (new student after a trial,
+        // or someone coming back from a break): remind Arpit to set them up,
+        // because class reminders only go to students with an active slot.
+        // Best-effort only; never blocks the payment flow.
+        try {
+          if (studentId) {
+            const { data: slots } = await supabase.from('class_schedule')
+              .select('id').eq('student_id', studentId).eq('active', true).limit(1);
+            const onBreak = student && /break/i.test(String(student.status || ''));
+            if (!slots || !slots.length || onBreak) {
+              const todo = [
+                onBreak ? 'set their status to Active' : null,
+                (!slots || !slots.length) ? 'add (or resume) their weekly slot on the Schedule page' : null,
+                'send them the Zoom invite'
+              ].filter(Boolean).join(', ');
+              await supabase.from('notifications').insert({
+                type: 'payment',
+                message: `🗓️ ${studentName} has paid but isn't scheduled yet. Next: ${todo}.`,
+                read: false
+              });
+            }
+          }
+        } catch (e) { console.error('schedule check after payment failed:', e.message); }
+
         // Auto invoice: number, row, PDF, storage, email. Never throws; any
         // failure becomes a dashboard notification and the fee stays saved.
         // Email and phone typed on pay.html (notes) or on Razorpay's page (fields).
