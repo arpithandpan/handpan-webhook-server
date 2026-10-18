@@ -148,15 +148,101 @@ async function sendTemplate(toPhone, templateName, bodyParams) {
     if (!res.ok) {
       const msg = data?.error?.message || `HTTP ${res.status}`;
       console.error(`WA send failed (${templateName} → ${to}):`, msg);
+      await logOutgoingTemplate(to, templateName, bodyParams, null, msg);
       return { ok: false, error: msg };
     }
     const id = data?.messages?.[0]?.id || null;
     console.log(`WA sent: ${templateName} → ${to} (${id})`);
+    await logOutgoingTemplate(to, templateName, bodyParams, id, null);
     return { ok: true, id };
   } catch (e) {
     console.error(`WA send error (${templateName}):`, e.message);
+    await logOutgoingTemplate(to, templateName, bodyParams, null, e.message);
     return { ok: false, error: e.message };
   }
+}
+
+// ── CONVERSATION LOG (wa_messages) ──
+// Every message in and out of the studio number is saved so the dashboard
+// can show whole conversations. Logging must never break sending, so all
+// of this swallows its own errors.
+// Returns 'dup' when Meta re-delivers a message we already have.
+async function logMessage(row) {
+  try {
+    const { error } = await supabase.from('wa_messages').insert(row);
+    if (error && /duplicate key/i.test(error.message)) return 'dup';
+    if (error) console.error('wa_messages insert failed:', error.message);
+  } catch (e) { console.error('wa_messages insert error:', e.message); }
+  return 'ok';
+}
+
+// Template bodies come from Meta, so the log shows the exact text the
+// student saw. Cached for 6 hours; refreshed early (at most every 10 min)
+// when a template is missing, e.g. one approved this morning.
+let _tplCache = null, _tplAt = 0, _tplTriedAt = 0;
+async function templateBodies(force) {
+  const fresh = _tplCache && Date.now() - _tplAt < 6 * 3600 * 1000;
+  if (fresh && !force) return _tplCache;
+  if (Date.now() - _tplTriedAt < 10 * 60 * 1000) return _tplCache || {};
+  _tplTriedAt = Date.now();
+  const waba = process.env.WHATSAPP_PROD_WABA_ID || '1652322909800354';
+  try {
+    const res = await fetch(`${GRAPH_BASE}/${waba}/message_templates?fields=name,language,components&limit=200`, {
+      headers: { 'Authorization': `Bearer ${process.env.WHATSAPP_PROD_TOKEN}` }
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+    const map = {};
+    for (const t of (data.data || [])) {
+      const body = (t.components || []).find(c => c.type === 'BODY');
+      if (body && body.text && (!map[t.name] || t.language === TEMPLATE_LANG)) map[t.name] = body.text;
+    }
+    _tplCache = map; _tplAt = Date.now();
+  } catch (e) {
+    console.error('WA template list fetch failed:', e.message);
+  }
+  return _tplCache || {};
+}
+
+function renderTemplate(text, params) {
+  return String(text).replace(/\{\{(\d+)\}\}/g, (m, n) => {
+    const v = (params || [])[Number(n) - 1];
+    return v == null ? m : String(v);
+  });
+}
+
+async function logOutgoingTemplate(to, templateName, bodyParams, waId, error) {
+  let bodies = await templateBodies();
+  if (!bodies[templateName]) bodies = await templateBodies(true);
+  const text = bodies[templateName];
+  await logMessage({
+    direction: 'out',
+    phone: to,
+    wa_id: waId || null,
+    type: 'template',
+    template: templateName,
+    params: (bodyParams || []).map(String),
+    body: text ? renderTemplate(text, bodyParams) : null,
+    status: waId ? 'sent' : 'failed',
+    status_at: new Date().toISOString(),
+    error: error || null
+  });
+}
+
+// Delivery receipts from Meta: sent → delivered → read, or failed.
+// Never move backwards (a late 'delivered' must not undo 'read').
+const STATUS_RANK = { sent: 1, delivered: 2, read: 3 };
+async function applyStatus(st) {
+  try {
+    const next = String(st.status || '');
+    if (!st.id || !next) return;
+    const { data: row } = await supabase.from('wa_messages').select('id, status').eq('wa_id', st.id).maybeSingle();
+    if (!row) return;
+    if (next !== 'failed' && (STATUS_RANK[row.status] || 0) >= (STATUS_RANK[next] || 0)) return;
+    const err = next === 'failed' ? (st.errors?.[0]?.title || st.errors?.[0]?.message || 'failed') : null;
+    const when = st.timestamp ? new Date(Number(st.timestamp) * 1000).toISOString() : new Date().toISOString();
+    await supabase.from('wa_messages').update({ status: next, status_at: when, ...(err ? { error: err } : {}) }).eq('id', row.id);
+  } catch (e) { console.error('WA status update failed:', e.message); }
 }
 
 // ── DASHBOARD NOTIFICATION HELPER ──
@@ -599,6 +685,7 @@ function describeMessage(msg) {
   if (msg.type === 'document') return '[document]';
   if (msg.type === 'sticker') return '[sticker]';
   if (msg.type === 'location') return '[location]';
+  if (msg.type === 'reaction') return msg.reaction?.emoji ? `reacted ${msg.reaction.emoji}` : 'removed a reaction';
   return '[' + (msg.type || 'message') + ']';
 }
 
@@ -612,13 +699,41 @@ async function incomingHandler(req, res) {
       for (const change of (entry.changes || [])) {
         const value = change.value || {};
         const contactName = value.contacts?.[0]?.profile?.name || null;
+        // Only the studio number's traffic belongs in the conversation log.
+        const prodId = process.env.WHATSAPP_PROD_PHONE_ID;
+        const isStudio = !prodId || !value.metadata?.phone_number_id || value.metadata.phone_number_id === prodId;
+        if (isStudio) for (const st of (value.statuses || [])) await applyStatus(st);
         for (const msg of (value.messages || [])) {
           const from = msg.from;                       // e.g. '919739742036'
           const text = describeMessage(msg);
+          const isReaction = msg.type === 'reaction';
+          let dup = false;
+          if (isStudio) {
+            const media = msg.image || msg.audio || msg.video || msg.document || msg.sticker || null;
+            dup = (await logMessage({
+              direction: 'in',
+              phone: String(from || '').replace(/\D/g, ''),
+              contact_name: contactName,
+              wa_id: msg.id || null,
+              type: msg.type || 'text',
+              body: isReaction ? null : (msg.type === 'text' ? (msg.text?.body || '') : (media?.caption || text)),
+              reaction_to: isReaction ? (msg.reaction?.message_id || null) : null,
+              emoji: isReaction ? (msg.reaction?.emoji || '') : null,
+              media_id: media?.id || null,
+              created_at: msg.timestamp ? new Date(Number(msg.timestamp) * 1000).toISOString() : new Date().toISOString(),
+              // A reaction needs no attention, so it never counts as unread.
+              read_at: isReaction ? new Date().toISOString() : null
+            })) === 'dup';
+          }
+          if (dup) continue;   // Meta retried a webhook we already handled
           const student = await studentByPhone(from);
           const who = student ? student.full_name : (contactName ? `${contactName} (+${from})` : '+' + from);
           const preview = String(text).slice(0, 160);
-          await notify('info', `💬 WhatsApp reply to Handpan with Arpit — ${who}: "${preview}"${String(text).length > 160 ? '…' : ''} Reply from your main number.`);
+          // A thumbs-up on a reminder is not worth a phone alert. It still
+          // shows in the dashboard conversation.
+          if (!isReaction) {
+            await notify('info', `💬 WhatsApp reply to Handpan with Arpit — ${who}: "${preview}"${String(text).length > 160 ? '…' : ''} Reply from your main number`);
+          }
           console.log('WA incoming:', who, '-', preview);
         }
       }
