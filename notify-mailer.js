@@ -90,6 +90,9 @@ async function sendEmail(n) {
 // this, but keep it short — it's a phone alert.
 function whatsappText(n) {
   let s = String(n.message || 'Dashboard notification').replace(/\s+/g, ' ').trim();
+  // The template already adds ". Open the dashboard for details." after
+  // {{1}}, so a message ending in "." would show up as "..".
+  s = s.replace(/[.\s]+$/, '');
   if (s.length > 900) s = s.slice(0, 897) + '...';
   return s;
 }
