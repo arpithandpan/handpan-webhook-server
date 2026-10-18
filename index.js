@@ -1359,6 +1359,9 @@ app.get('/api/zoom/status', (req, res) => res.json(zoom.status()));
 // ── TRIAL BOOKING (public trial page) ──
 app.get('/api/trial/slots', (req, res) => trialBooking.slotsHandler(req, res));
 app.post('/api/trial/book', express.json({ limit: '20kb' }), (req, res) => trialBooking.bookHandler(req, res));
+// Dashboard ✕ on an upcoming trial: cancel + delete Zoom + email. requireAdmin
+// is defined further down as a function declaration, so it is hoisted here.
+app.post('/api/trial/:id/cancel', requireAdmin, (req, res) => trialBooking.cancelHandler(req, res));
 
 // ── WHATSAPP (student messages, logic lives in whatsapp-service.js) ──
 // Webhook for the studio number: GET is Meta's one-time verification
