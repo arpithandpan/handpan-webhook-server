@@ -179,7 +179,7 @@ async function logMessage(row) {
 // Template bodies come from Meta, so the log shows the exact text the
 // student saw. Cached for 6 hours; refreshed early (at most every 10 min)
 // when a template is missing, e.g. one approved this morning.
-let _tplCache = null, _tplAt = 0, _tplTriedAt = 0;
+let _tplCache = null, _tplAt = 0, _tplTriedAt = 0, _tplApproved = new Set();
 async function templateBodies(force) {
   const fresh = _tplCache && Date.now() - _tplAt < 6 * 3600 * 1000;
   if (fresh && !force) return _tplCache;
@@ -193,10 +193,13 @@ async function templateBodies(force) {
     const data = await res.json();
     if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
     const map = {};
+    const approved = new Set();
     for (const t of (data.data || [])) {
       const body = (t.components || []).find(c => c.type === 'BODY');
       if (body && body.text && (!map[t.name] || t.language === TEMPLATE_LANG)) map[t.name] = body.text;
+      if (String(t.status || '').toUpperCase() === 'APPROVED') approved.add(t.name);
     }
+    _tplApproved = approved;
     _tplCache = map; _tplAt = Date.now();
   } catch (e) {
     console.error('WA template list fetch failed:', e.message);
@@ -658,6 +661,97 @@ function verifyWebhook(req, res) {
   return res.sendStatus(403);
 }
 
+// ── REPLIES FROM THE DASHBOARD ──
+// Meta lets a business send free text only within 24 hours of the person's
+// last message ("customer service window"). After that only approved
+// templates go through; REPLY_TEMPLATE is the one that reopens the chat.
+const REPLY_TEMPLATE = process.env.WA_REPLY_TEMPLATE || 'arpit_replied';
+const WINDOW_MS = 24 * 60 * 60 * 1000;
+
+async function lastIncomingAt(phone) {
+  const { data } = await supabase.from('wa_messages')
+    .select('created_at').eq('phone', phone).eq('direction', 'in').neq('type', 'reaction')
+    .order('created_at', { ascending: false }).limit(1);
+  const t = data && data[0] ? new Date(data[0].created_at).getTime() : 0;
+  return isNaN(t) ? 0 : t;
+}
+
+async function sendText(toPhone, text) {
+  if (!configured()) return { ok: false, error: 'WhatsApp prod env vars missing' };
+  const to = normalizePhone(toPhone);
+  if (!to) return { ok: false, error: 'No usable phone number' };
+  try {
+    const res = await fetch(`${GRAPH_BASE}/${process.env.WHATSAPP_PROD_PHONE_ID}/messages`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${process.env.WHATSAPP_PROD_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messaging_product: 'whatsapp', recipient_type: 'individual', to, type: 'text', text: { preview_url: true, body: text } })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      const code = data?.error?.code;
+      // 131047 = more than 24 hours since the person's last message
+      const msg = code === 131047 ? 'window_closed' : (data?.error?.message || `HTTP ${res.status}`);
+      console.error(`WA text failed (→ ${to}):`, data?.error?.message || res.status);
+      return { ok: false, error: msg };
+    }
+    const id = data?.messages?.[0]?.id || null;
+    console.log(`WA text sent → ${to} (${id})`);
+    return { ok: true, id, to };
+  } catch (e) {
+    console.error('WA text error:', e.message);
+    return { ok: false, error: e.message };
+  }
+}
+
+// POST /api/wa/reply  { phone, text }   (admin only)
+async function replyHandler(req, res) {
+  try {
+    const phone = String(req.body?.phone || '').replace(/\D/g, '');
+    const text = String(req.body?.text || '').replace(/\r\n/g, '\n').trim();
+    if (!phone) return res.status(400).json({ error: 'No phone number' });
+    if (!text) return res.status(400).json({ error: 'Write a message first' });
+    if (text.length > 4000) return res.status(400).json({ error: 'Message is too long (max 4,000 characters)' });
+    const last = await lastIncomingAt(phone);
+    if (!last || Date.now() - last > WINDOW_MS) return res.status(409).json({ error: 'window_closed' });
+    const r = await sendText(phone, text);
+    if (!r.ok) return res.status(r.error === 'window_closed' ? 409 : 502).json({ error: r.error });
+    const row = {
+      direction: 'out', phone: r.to, wa_id: r.id, type: 'text', body: text,
+      status: 'sent', status_at: new Date().toISOString(), created_at: new Date().toISOString()
+    };
+    await logMessage(row);
+    res.json({ ok: true, row });
+  } catch (e) {
+    console.error('WA reply handler error:', e.message);
+    res.status(500).json({ error: 'Could not send right now' });
+  }
+}
+
+// GET /api/wa/reply-template  →  { name, available, body }   (admin only)
+async function replyTemplateStatus(req, res) {
+  let bodies = await templateBodies();
+  if (!_tplApproved.has(REPLY_TEMPLATE)) bodies = await templateBodies(true);
+  res.json({ name: REPLY_TEMPLATE, available: _tplApproved.has(REPLY_TEMPLATE), body: bodies[REPLY_TEMPLATE] || null });
+}
+
+// POST /api/wa/reopen  { phone, name }   (admin only)
+// Sends the approved reply template so the person can answer and reopen
+// the 24-hour window.
+async function reopenHandler(req, res) {
+  try {
+    const phone = String(req.body?.phone || '').replace(/\D/g, '');
+    if (!phone) return res.status(400).json({ error: 'No phone number' });
+    await templateBodies();
+    if (!_tplApproved.has(REPLY_TEMPLATE)) return res.status(409).json({ error: 'The "' + REPLY_TEMPLATE + '" template is not approved yet' });
+    const r = await sendTemplate(phone, REPLY_TEMPLATE, [firstName(req.body?.name || '')]);
+    if (!r.ok) return res.status(502).json({ error: r.error });
+    res.json({ ok: true, id: r.id });
+  } catch (e) {
+    console.error('WA reopen handler error:', e.message);
+    res.status(500).json({ error: 'Could not send right now' });
+  }
+}
+
 // Find which student a phone number belongs to, for a friendly name.
 async function studentByPhone(waPhone) {
   const digits = String(waPhone || '').replace(/\D/g, '');
@@ -761,4 +855,4 @@ function startWorker() {
   timer = setInterval(tick, TICK_MS);
 }
 
-module.exports = { init, status, startWorker, processPending, sendTemplate, normalizePhone, verifyWebhook, incomingHandler, _test: { planScheduleOccurrences, zonedToUtc, tzOffsetMin } };
+module.exports = { init, status, startWorker, processPending, sendTemplate, normalizePhone, verifyWebhook, incomingHandler, replyHandler, replyTemplateStatus, reopenHandler, _test: { planScheduleOccurrences, zonedToUtc, tzOffsetMin } };
