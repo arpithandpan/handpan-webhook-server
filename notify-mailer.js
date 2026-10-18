@@ -42,7 +42,9 @@ function channelFor(n) {
     || /payment failed/i.test(msg)             // student tried to pay, failed
     || /not linked to a student/i.test(msg)    // zoom review needed
     || /WhatsApp reply to/i.test(msg)          // student replied on the studio number
-    || /Upcoming class/i.test(msg);            // Arpit's own class heads-up
+    || /Upcoming class/i.test(msg)             // Arpit's own class heads-up
+    || /New trial booked/i.test(msg)           // someone booked on the trial page
+    || /Zoom meeting could not be created/i.test(msg);  // trial booked, link must go by hand
   return { email: true, whatsapp: urgent };
 }
 
