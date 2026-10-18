@@ -263,6 +263,34 @@ function computeSlots(settings, busy, nowMs, lengthMin) {
   }
   return [...new Set(out)].sort((a, b) => a - b);
 }
+// Grid candidates that are gone ONLY because a real class or trial sits on
+// them (direct overlap). Buffer and night-rest casualties stay hidden, and
+// blocked dates never show as "booked" - that would be fake scarcity.
+function computeBooked(settings, busy, nowMs, lengthMin) {
+  const s = settings;
+  const len = (lengthMin || s.trial_min) * MIN;
+  const step = (s.class_min + s.buffer_min) * MIN;
+  const earliest = nowMs + s.min_notice_hours * 60 * MIN;
+  const today = istYmd(new Date(nowMs));
+  const lastMs = istMidnight(addDays(today, s.days_ahead + 1));
+  const blocked = new Set(s.blocked_dates || []);
+  const out = [];
+  for (let i = 0; i <= s.days_ahead; i++) {
+    const day = addDays(today, i);
+    if (!s.weekdays.includes(weekdayOf(day))) continue;
+    if (blocked.has(day)) continue;
+    const base = istMidnight(day);
+    for (const [ws, we] of s.windows) {
+      for (let t = base + ws * MIN; t + s.class_min * MIN <= base + we * MIN; t += step) {
+        if (t < earliest || t >= lastMs) continue;
+        if (blocked.has(istYmd(new Date(t)))) continue;
+        const end = t + len;
+        if (busy.some(b => t < b.e && end > b.s)) out.push(t);
+      }
+    }
+  }
+  return [...new Set(out)].sort((a, b) => a - b);
+}
 function spans3am(a, b) {
   // Is there an IST 03:00 inside (a, b)?
   const day = istYmd(new Date(a));
@@ -277,7 +305,7 @@ async function freeSlots(lengthMin) {
   const settings = await getSettings();
   const now = Date.now();
   const busy = await busyIntervals(now, now + (settings.days_ahead + 2) * 86400000);
-  return { settings, slots: computeSlots(settings, busy, now, lengthMin) };
+  return { settings, slots: computeSlots(settings, busy, now, lengthMin), booked: computeBooked(settings, busy, now, lengthMin) };
 }
 
 // ── 5. EXCHANGE RATES (approximate local price) ──
@@ -298,9 +326,15 @@ function roundNice(n) {
 }
 
 // ── 6. PUBLIC: GET /api/trial/slots?cur=EUR ──
+let _fullAlertAt = 0;
 async function slotsHandler(req, res) {
   try {
-    const { settings, slots } = await freeSlots();
+    const { settings, slots, booked } = await freeSlots();
+    // Every bookable slot for the whole window is taken - tell Arpit, once a day.
+    if (settings.enabled && !slots.length && booked.length && Date.now() - _fullAlertAt > 22 * 3600 * 1000) {
+      _fullAlertAt = Date.now();
+      notify('trial_full', 'Trial slots full: every bookable trial slot for the next ' + settings.days_ahead + ' days is taken. Open more windows in Trial booking settings if you want more trials.');
+    }
     let approx = null;
     const cur = String(req.query.cur || '').toUpperCase();
     if (/^[A-Z]{3}$/.test(cur) && cur !== 'USD' && cur !== 'INR') {
@@ -312,6 +346,7 @@ async function slotsHandler(req, res) {
       ok: true,
       open: settings.enabled,
       slots: settings.enabled ? slots.map(t => new Date(t).toISOString()) : [],
+      booked: settings.enabled ? booked.map(t => new Date(t).toISOString()) : [],
       trialMin: settings.trial_min,
       bookerDay: settings.booker_day,
       prices: { inr: settings.price_inr, usd: settings.price_usd },
@@ -677,5 +712,5 @@ async function markAttended(meetingId, minutes) {
 
 module.exports = {
   init, slotsHandler, bookHandler, cancelHandler, cancelTrial, startWorker, markAttended, getSettings, freeSlots,
-  _test: { computeSlots, sanitizeSettings, DEFAULTS, buildIcs, spans3am, istYmd, zonedToUtc }
+  _test: { computeSlots, computeBooked, sanitizeSettings, DEFAULTS, buildIcs, spans3am, istYmd, zonedToUtc }
 };
