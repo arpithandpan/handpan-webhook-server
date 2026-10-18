@@ -1369,6 +1369,10 @@ app.post('/api/trial/:id/cancel', requireAdmin, (req, res) => trialBooking.cance
 // dashboard notification (and from there an alert to Arpit).
 app.get('/api/webhooks/whatsapp', (req, res) => whatsapp.verifyWebhook(req, res));
 app.post('/api/webhooks/whatsapp', express.json(), (req, res) => whatsapp.incomingHandler(req, res));
+// Replies from the dashboard's WhatsApp section (studio number).
+app.post('/api/wa/reply', requireAdmin, express.json({ limit: '32kb' }), (req, res) => whatsapp.replyHandler(req, res));
+app.get('/api/wa/reply-template', requireAdmin, (req, res) => whatsapp.replyTemplateStatus(req, res));
+app.post('/api/wa/reopen', requireAdmin, express.json({ limit: '8kb' }), (req, res) => whatsapp.reopenHandler(req, res));
 
 // Quick check that the prod WhatsApp env vars are loaded. No secrets in the reply.
 app.get('/api/whatsapp/status', (req, res) => res.json(whatsapp.status()));
