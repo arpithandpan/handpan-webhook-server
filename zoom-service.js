@@ -43,6 +43,8 @@ const IGNORE_NAMES = ['Arpit Pandey', 'Arpit', 'Ankita Sinha', 'Ankita', 'iPad (
 
 let supabase = null;
 function init(client) { supabase = client; }
+let trialHook = null;
+function setTrialHook(fn) { trialHook = fn; }
 
 function isConfigured() { return !!(ACCOUNT_ID && CLIENT_ID && CLIENT_SECRET); }
 
@@ -510,6 +512,19 @@ async function processMeeting(m) {
     }
     for (const l of plan.learn) await learnNames(l.student.id, l.names, l.email);
 
+    // A trial booked from the website: mark that booking attended instead of
+    // adding a second trials row for the same person.
+    if (trialHook && m.meeting_id) {
+      const mins = Math.max(0, ...people.map(p => p.minutes || 0));
+      let booked = false;
+      try { booked = await trialHook(m.meeting_id, mins); } catch (e) { console.error('trial hook failed:', e.message); }
+      if (booked) {
+        if (plan.trials.length) await notify('info', `🎥 Booked trial attended: ${plan.trials.map(p => p.name || p.email).join(', ')} (${mins} min). Marked on the Students page.`);
+        plan.trials = [];
+        plan.review = plan.review.filter(p => !plan.isTrial);
+      }
+    }
+
     // Trial attendees → trials table. One row per meeting + person, so a retry
     // never duplicates. If the insert fails, the person falls back to review.
     const trialsAdded = [];
@@ -775,6 +790,6 @@ async function resolveUnmatched(id, studentId) {
 }
 
 module.exports = {
-  init, webhookHandler, startWorker, processPending, resolveUnmatched, status, syncMeetings,
+  init, setTrialHook, zoomApi, webhookHandler, startWorker, processPending, resolveUnmatched, status, syncMeetings,
   _test: { cleanParticipants, planMeeting, buildIndex, matchPerson, studentsInTopic, isTrialTopic, encodeUuid, istDate, normName, hmac, MIN_MINUTES, TRIAL_MIN_MINUTES }
 };
