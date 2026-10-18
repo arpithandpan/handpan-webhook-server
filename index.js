@@ -6,6 +6,7 @@ const zoom = require('./zoom-service');
 const notifyMailer = require('./notify-mailer');
 const settlementWorker = require('./settlement-worker');
 const whatsapp = require('./whatsapp-service');
+const trialBooking = require('./trial-booking');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -102,6 +103,8 @@ zoom.init(supabase);
 notifyMailer.init(supabase);
 settlementWorker.init(supabase);
 whatsapp.init(supabase);
+trialBooking.init(supabase, { whatsapp, zoomApi: zoom.zoomApi });
+zoom.setTrialHook(trialBooking.markAttended);
 
 // ── GENERAL PAYMENT PAGE ID ──
 const GENERAL_PAYMENT_PAGE_ID = 'pl_SvxuRdqY2rd7ge';
@@ -1353,6 +1356,10 @@ app.post('/api/webhooks/zoom', express.raw({ type: '*/*' }), zoom.webhookHandler
 // Quick check that the Zoom env vars are loaded. No secrets in the reply.
 app.get('/api/zoom/status', (req, res) => res.json(zoom.status()));
 
+// ── TRIAL BOOKING (public trial page) ──
+app.get('/api/trial/slots', (req, res) => trialBooking.slotsHandler(req, res));
+app.post('/api/trial/book', express.json({ limit: '20kb' }), (req, res) => trialBooking.bookHandler(req, res));
+
 // ── WHATSAPP (student messages, logic lives in whatsapp-service.js) ──
 // Webhook for the studio number: GET is Meta's one-time verification
 // handshake, POST delivers every incoming message, which becomes a
@@ -1940,4 +1947,5 @@ app.listen(PORT, () => {
   notifyMailer.startWorker();
   settlementWorker.startWorker();
   whatsapp.startWorker();
+  trialBooking.startWorker();
 });
