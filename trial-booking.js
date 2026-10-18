@@ -490,7 +490,7 @@ function buildIcs(t, method) {
     'ORGANIZER;CN=Arpit Pandey:mailto:' + FROM_EMAIL,
     'ATTENDEE;CN=' + icsEscape(t.full_name) + ';ROLE=REQ-PARTICIPANT;RSVP=FALSE:mailto:' + t.email,
     'ATTENDEE;CN=Arpit Pandey;ROLE=REQ-PARTICIPANT;RSVP=FALSE:mailto:' + ARPIT_EMAIL,
-    'STATUS:CONFIRMED', 'SEQUENCE:0',
+    'STATUS:' + (method === 'CANCEL' ? 'CANCELLED' : 'CONFIRMED'), 'SEQUENCE:' + (method === 'CANCEL' ? '1' : '0'),
     'BEGIN:VALARM', 'TRIGGER:-PT15M', 'ACTION:DISPLAY', 'DESCRIPTION:Handpan trial in 15 minutes', 'END:VALARM',
     'END:VEVENT', 'END:VCALENDAR'
   ].join('\r\n');
@@ -509,7 +509,10 @@ function googleCalUrl(t) {
 async function sendMail({ to, subject, html, text, ics, replyTo }) {
   if (!RESEND_API_KEY) return { ok: false, error: 'RESEND_API_KEY not set' };
   const body = { from: 'Arpit Pandey <' + FROM_EMAIL + '>', to: [to], subject, html, text, reply_to: replyTo || ARPIT_EMAIL };
-  if (ics) body.attachments = [{ filename: 'invite.ics', content: Buffer.from(ics).toString('base64'), content_type: 'text/calendar; method=REQUEST; charset=UTF-8' }];
+  if (ics) {
+    const method = /METHOD:CANCEL/.test(ics) ? 'CANCEL' : 'REQUEST';
+    body.attachments = [{ filename: method === 'CANCEL' ? 'cancel.ics' : 'invite.ics', content: Buffer.from(ics).toString('base64'), content_type: 'text/calendar; method=' + method + '; charset=UTF-8' }];
+  }
   const r = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: { 'Authorization': 'Bearer ' + RESEND_API_KEY, 'Content-Type': 'application/json' },
@@ -561,7 +564,59 @@ async function sendArpitInvite(t) {
   return sendMail({ to: ARPIT_EMAIL, subject: 'Trial booked · ' + t.full_name + ' · ' + prettyIn(start, IST) + ' IST', html, text: 'New trial: ' + t.full_name, ics: buildIcs(t), replyTo: t.email });
 }
 
-// ── 9. WORKER: reminders + no-shows ──
+// ── 9. CANCEL (dashboard ✕ button) ──
+// Marks the trial cancelled, deletes its Zoom meeting, and emails the person
+// and Arpit a calendar cancellation so the event disappears from both
+// calendars. The person also gets a link to book a new time.
+async function cancelTrial(id) {
+  const { data: t, error } = await supabase.from('trials').select('*').eq('id', id).maybeSingle();
+  if (error || !t) return { status: 404, error: 'Trial not found' };
+  if (t.status !== 'booked') return { status: 409, error: 'Only upcoming trials can be cancelled' };
+
+  const { error: upErr } = await supabase.from('trials').update({ status: 'cancelled' }).eq('id', id);
+  if (upErr) return { status: 500, error: 'Could not update: ' + upErr.message };
+
+  const done = { zoom: null, email: null, calendar: null };
+  if (t.zoom_meeting_id && zoomApi) {
+    const z = await zoomApi('DELETE', '/meetings/' + t.zoom_meeting_id).catch(e => ({ ok: false, error: e.message }));
+    done.zoom = z.ok || z.status === 404 ? 'deleted' : ('failed: ' + z.error);
+  }
+  const settings = await getSettings();
+  if (t.email && t.start_at) {
+    const start = new Date(t.start_at);
+    const when = prettyIn(start, t.tz || IST) + ' (' + tzLabel(t.tz || IST) + ')';
+    const wa = 'https://wa.me/' + settings.whatsapp + '?text=' + encodeURIComponent('Hi Arpit, my trial on ' + prettyIn(start, t.tz || IST) + ' was cancelled.');
+    const r = await sendMail({
+      to: t.email, subject: 'Your handpan trial was cancelled · ' + prettyIn(start, t.tz || IST),
+      html: mailShell(`
+        <h1 style="margin:0 0 14px;font-size:20px;color:#500018;font-weight:600;">Your trial was cancelled</h1>
+        <p style="margin:0 0 16px;line-height:1.6;">Hi ${esc(firstName(t.full_name))}, your free handpan trial on ${esc(when)} has been cancelled. Sorry for the change.</p>
+        <p style="margin:0 0 20px;"><a href="https://arpitpandey.com/pages/trial" style="display:inline-block;background:#500018;color:#F5EEE5;text-decoration:none;padding:12px 22px;border-radius:40px;font-weight:600;">Pick a new time</a></p>
+        <p style="margin:0;line-height:1.6;">Questions? <a href="${esc(wa)}" style="color:#500018;">Message me on WhatsApp</a>.</p>`),
+      text: `Hi ${firstName(t.full_name)}, your handpan trial on ${when} has been cancelled. Pick a new time: https://arpitpandey.com/pages/trial`,
+      ics: buildIcs(t, 'CANCEL')
+    }).catch(e => ({ ok: false, error: e.message }));
+    done.email = r.ok ? 'sent' : ('failed: ' + r.error);
+    const a = await sendMail({
+      to: ARPIT_EMAIL, subject: 'Trial cancelled · ' + t.full_name + ' · ' + prettyIn(start, IST) + ' IST',
+      html: mailShell(`<p style="margin:0;">You cancelled ${esc(t.full_name)}'s trial on ${esc(prettyIn(start, IST))} IST. The calendar event is removed and they were emailed.</p>`),
+      text: 'Trial cancelled: ' + t.full_name, ics: buildIcs(t, 'CANCEL')
+    }).catch(e => ({ ok: false, error: e.message }));
+    done.calendar = a.ok ? 'removed' : ('failed: ' + a.error);
+  }
+  return { status: 200, ok: true, ...done };
+}
+async function cancelHandler(req, res) {
+  try {
+    const r = await cancelTrial(String(req.params.id || ''));
+    res.status(r.status).json(r);
+  } catch (e) {
+    console.error('trial cancel error:', e.message);
+    res.status(500).json({ error: 'Could not cancel right now' });
+  }
+}
+
+// ── 10. WORKER: reminders + no-shows ──
 let _timer = null, _busy = false;
 async function tick() {
   if (_busy || !supabase) return;
@@ -605,7 +660,7 @@ function startWorker() {
   console.log('Trial booking worker started');
 }
 
-// ── 10. ZOOM ATTENDANCE HOOK ──
+// ── 11. ZOOM ATTENDANCE HOOK ──
 // Called by zoom-service when a meeting ends. If the meeting is a booked
 // trial, mark it attended (status pending = took the trial, not yet a
 // student) and tell the caller so it doesn't add a duplicate trials row.
@@ -621,6 +676,6 @@ async function markAttended(meetingId, minutes) {
 }
 
 module.exports = {
-  init, slotsHandler, bookHandler, startWorker, markAttended, getSettings, freeSlots,
+  init, slotsHandler, bookHandler, cancelHandler, cancelTrial, startWorker, markAttended, getSettings, freeSlots,
   _test: { computeSlots, sanitizeSettings, DEFAULTS, buildIcs, spans3am, istYmd, zonedToUtc }
 };
