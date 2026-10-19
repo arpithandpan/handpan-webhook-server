@@ -104,6 +104,8 @@ notifyMailer.init(supabase);
 settlementWorker.init(supabase);
 whatsapp.init(supabase);
 trialBooking.init(supabase, { whatsapp, zoomApi: zoom.zoomApi });
+const workshopMessages = require('./workshop-messages');
+workshopMessages.init(supabase, { whatsapp });
 zoom.setTrialHook(trialBooking.markAttended);
 
 // ── GENERAL PAYMENT PAGE ID ──
@@ -1373,6 +1375,8 @@ app.post('/api/webhooks/whatsapp', express.json(), (req, res) => whatsapp.incomi
 app.post('/api/wa/reply', requireAdmin, express.json({ limit: '32kb' }), (req, res) => whatsapp.replyHandler(req, res));
 app.get('/api/wa/reply-template', requireAdmin, (req, res) => whatsapp.replyTemplateStatus(req, res));
 app.post('/api/wa/reopen', requireAdmin, express.json({ limit: '8kb' }), (req, res) => whatsapp.reopenHandler(req, res));
+app.get('/api/wa/media/:waId', requireAdmin, (req, res) => whatsapp.mediaHandler(req, res));
+app.post('/api/wa/send-media', requireAdmin, express.json({ limit: '24mb' }), (req, res) => whatsapp.sendMediaHandler(req, res));
 
 // Quick check that the prod WhatsApp env vars are loaded. No secrets in the reply.
 app.get('/api/whatsapp/status', (req, res) => res.json(whatsapp.status()));
@@ -1955,4 +1959,5 @@ app.listen(PORT, () => {
   settlementWorker.startWorker();
   whatsapp.startWorker();
   trialBooking.startWorker();
+  workshopMessages.startWorker();
 });

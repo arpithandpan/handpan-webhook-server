@@ -703,6 +703,146 @@ async function sendText(toPhone, text) {
   }
 }
 
+// ── MEDIA (photos, voice notes, videos, documents) ──
+// Meta keeps incoming files only for a while, so each one is copied into the
+// private Supabase Storage bucket 'wa-media' as it arrives. Its path goes into
+// wa_messages.params.media { path, mime, size, name }. The dashboard asks this
+// server for the file (GET /api/wa/media/:waId); the bucket itself stays private.
+const MEDIA_BUCKET = 'wa-media';
+const MEDIA_MAX = 16 * 1024 * 1024;   // WhatsApp's own limit for audio/video; plenty for photos
+let _bucketReady = false;
+async function ensureMediaBucket() {
+  if (_bucketReady) return;
+  try {
+    const { error } = await supabase.storage.createBucket(MEDIA_BUCKET, { public: false });
+    if (error && !/already exists|duplicate/i.test(error.message)) console.error('wa-media bucket:', error.message);
+  } catch (e) { console.error('wa-media bucket error:', e.message); }
+  _bucketReady = true;
+}
+const MEDIA_EXT = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'audio/ogg': 'ogg', 'audio/mpeg': 'mp3', 'audio/mp4': 'm4a', 'audio/aac': 'aac', 'audio/amr': 'amr', 'video/mp4': 'mp4', 'video/3gpp': '3gp', 'application/pdf': 'pdf' };
+function mediaExt(mime, name) {
+  const m = String(mime || '').split(';')[0].trim();
+  if (MEDIA_EXT[m]) return MEDIA_EXT[m];
+  const n = String(name || '').match(/\.([a-z0-9]{1,5})$/i);
+  return n ? n[1].toLowerCase() : 'bin';
+}
+async function fetchMetaMedia(mediaId) {
+  const auth = { 'Authorization': `Bearer ${process.env.WHATSAPP_PROD_TOKEN}` };
+  const meta = await (await fetch(`${GRAPH_BASE}/${mediaId}`, { headers: auth })).json();
+  if (!meta || !meta.url) throw new Error(meta?.error?.message || 'Meta gave no file link');
+  if (Number(meta.file_size) > MEDIA_MAX) throw new Error('file is bigger than 16 MB');
+  const r = await fetch(meta.url, { headers: auth });
+  if (!r.ok) throw new Error('download HTTP ' + r.status);
+  const buf = Buffer.from(await r.arrayBuffer());
+  return { buf, mime: String(meta.mime_type || r.headers.get('content-type') || 'application/octet-stream').split(';')[0].trim() };
+}
+async function storeMedia(waId, buf, mime, name) {
+  await ensureMediaBucket();
+  const path = new Date().toISOString().slice(0, 7) + '/' + String(waId).replace(/[^A-Za-z0-9._-]/g, '_') + '.' + mediaExt(mime, name);
+  const { error } = await supabase.storage.from(MEDIA_BUCKET).upload(path, buf, { contentType: mime, upsert: true });
+  if (error) throw new Error(error.message);
+  return { path, mime, size: buf.length, name: name || null };
+}
+async function saveIncomingMedia(waId, mediaId, name) {
+  try {
+    const m = await fetchMetaMedia(mediaId);
+    const info = await storeMedia(waId, m.buf, m.mime, name);
+    await supabase.from('wa_messages').update({ params: { media: info } }).eq('wa_id', waId);
+    return info;
+  } catch (e) {
+    console.error('WA media save failed (' + waId + '):', e.message);
+    return null;
+  }
+}
+
+// GET /api/wa/media/:waId   (admin only) → the file itself
+async function mediaHandler(req, res) {
+  try {
+    const waId = String(req.params.waId || '');
+    const { data } = await supabase.from('wa_messages').select('wa_id, media_id, params').eq('wa_id', waId).limit(1);
+    const row = data && data[0];
+    if (!row) return res.status(404).json({ error: 'Message not found' });
+    let info = row.params && !Array.isArray(row.params) ? row.params.media : null;
+    // Arrived before this feature, or the copy failed: try Meta once more.
+    if ((!info || !info.path) && row.media_id) info = await saveIncomingMedia(row.wa_id, row.media_id, null);
+    if (!info || !info.path) return res.status(410).json({ error: 'This file is no longer available' });
+    const { data: blob, error } = await supabase.storage.from(MEDIA_BUCKET).download(info.path);
+    if (error || !blob) return res.status(404).json({ error: 'File missing from storage' });
+    res.setHeader('Content-Type', info.mime || 'application/octet-stream');
+    res.setHeader('Cache-Control', 'private, max-age=86400');
+    if (info.name) res.setHeader('Content-Disposition', 'inline; filename="' + String(info.name).replace(/["\r\n]/g, '') + '"');
+    res.send(Buffer.from(await blob.arrayBuffer()));
+  } catch (e) {
+    console.error('WA media handler error:', e.message);
+    res.status(500).json({ error: 'Could not load the file' });
+  }
+}
+
+// What WhatsApp accepts for each message type. Anything else goes as a document.
+function mediaKind(mime) {
+  if (mime === 'image/jpeg' || mime === 'image/png') return 'image';
+  if (['audio/aac', 'audio/amr', 'audio/mpeg', 'audio/mp4', 'audio/ogg'].includes(mime)) return 'audio';
+  if (mime === 'video/mp4' || mime === 'video/3gpp') return 'video';
+  return 'document';
+}
+
+// POST /api/wa/send-media  { phone, name, mime, data (base64), caption }   (admin only)
+async function sendMediaHandler(req, res) {
+  try {
+    if (!configured()) return res.status(503).json({ error: 'WhatsApp is not configured' });
+    const phone = String(req.body?.phone || '').replace(/\D/g, '');
+    const name = String(req.body?.name || 'file').slice(0, 120);
+    const mime = String(req.body?.mime || 'application/octet-stream').split(';')[0].trim().toLowerCase();
+    const caption = String(req.body?.caption || '').replace(/\r\n/g, '\n').trim().slice(0, 1000);
+    const buf = Buffer.from(String(req.body?.data || ''), 'base64');
+    if (!phone) return res.status(400).json({ error: 'No phone number' });
+    if (!buf.length) return res.status(400).json({ error: 'No file attached' });
+    if (buf.length > MEDIA_MAX) return res.status(400).json({ error: 'File is bigger than 16 MB' });
+    const kind = mediaKind(mime);
+    if (kind === 'image' && buf.length > 5 * 1024 * 1024) return res.status(400).json({ error: 'Photos can be up to 5 MB on WhatsApp' });
+    const last = await lastIncomingAt(phone);
+    if (!last || Date.now() - last > WINDOW_MS) return res.status(409).json({ error: 'window_closed' });
+    const to = normalizePhone(phone);
+    const auth = { 'Authorization': `Bearer ${process.env.WHATSAPP_PROD_TOKEN}` };
+    // 1. Upload the file to Meta
+    const fd = new FormData();
+    fd.append('messaging_product', 'whatsapp');
+    fd.append('type', mime);
+    fd.append('file', new Blob([buf], { type: mime }), name);
+    const up = await fetch(`${GRAPH_BASE}/${process.env.WHATSAPP_PROD_PHONE_ID}/media`, { method: 'POST', headers: auth, body: fd });
+    const upJ = await up.json();
+    if (!up.ok || !upJ.id) return res.status(502).json({ error: upJ?.error?.message || 'Upload to WhatsApp failed' });
+    // 2. Send it
+    const part = { id: upJ.id };
+    if (caption && kind !== 'audio') part.caption = caption;
+    if (kind === 'document') part.filename = name;
+    const sr = await fetch(`${GRAPH_BASE}/${process.env.WHATSAPP_PROD_PHONE_ID}/messages`, {
+      method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messaging_product: 'whatsapp', recipient_type: 'individual', to, type: kind, [kind]: part })
+    });
+    const sj = await sr.json();
+    if (!sr.ok) {
+      const code = sj?.error?.code;
+      return res.status(code === 131047 ? 409 : 502).json({ error: code === 131047 ? 'window_closed' : (sj?.error?.message || 'Send failed') });
+    }
+    const waId = sj?.messages?.[0]?.id || null;
+    // 3. Keep our own copy so it shows in the dashboard later
+    let info = null;
+    try { info = await storeMedia(waId || ('out-' + Date.now()), buf, mime, name); } catch (e) { console.error('WA media copy failed:', e.message); }
+    const row = {
+      direction: 'out', phone: to, wa_id: waId, type: kind, body: caption || (kind === 'document' ? name : null),
+      media_id: upJ.id, params: info ? { media: info } : null,
+      status: 'sent', status_at: new Date().toISOString(), created_at: new Date().toISOString()
+    };
+    await logMessage(row);
+    console.log(`WA ${kind} sent → ${to} (${waId})`);
+    res.json({ ok: true, row });
+  } catch (e) {
+    console.error('WA send-media error:', e.message);
+    res.status(500).json({ error: 'Could not send right now' });
+  }
+}
+
 // POST /api/wa/reply  { phone, text }   (admin only)
 async function replyHandler(req, res) {
   try {
@@ -802,8 +942,8 @@ async function incomingHandler(req, res) {
           const text = describeMessage(msg);
           const isReaction = msg.type === 'reaction';
           let dup = false;
+          const media = msg.image || msg.audio || msg.video || msg.document || msg.sticker || null;
           if (isStudio) {
-            const media = msg.image || msg.audio || msg.video || msg.document || msg.sticker || null;
             dup = (await logMessage({
               direction: 'in',
               phone: String(from || '').replace(/\D/g, ''),
@@ -820,6 +960,8 @@ async function incomingHandler(req, res) {
             })) === 'dup';
           }
           if (dup) continue;   // Meta retried a webhook we already handled
+          // Copy the file now, while Meta still has it. Runs in the background.
+          if (isStudio && media && media.id && msg.id) saveIncomingMedia(msg.id, media.id, media.filename || null);
           const student = await studentByPhone(from);
           const who = student ? student.full_name : (contactName ? `${contactName} (+${from})` : '+' + from);
           const preview = String(text).slice(0, 160);
@@ -855,4 +997,4 @@ function startWorker() {
   timer = setInterval(tick, TICK_MS);
 }
 
-module.exports = { init, status, startWorker, processPending, sendTemplate, normalizePhone, verifyWebhook, incomingHandler, replyHandler, replyTemplateStatus, reopenHandler, _test: { planScheduleOccurrences, zonedToUtc, tzOffsetMin } };
+module.exports = { init, status, startWorker, processPending, sendTemplate, normalizePhone, verifyWebhook, incomingHandler, replyHandler, replyTemplateStatus, reopenHandler, mediaHandler, sendMediaHandler, _test: { planScheduleOccurrences, zonedToUtc, tzOffsetMin } };

@@ -407,7 +407,7 @@ async function bookHandler(req, res) {
 
     if (name.length < 2) return res.status(400).json({ ok: false, field: 'name', error: 'Please enter your name.' });
     if (!isEmail(email)) return res.status(400).json({ ok: false, field: 'email', error: 'Please enter a valid email.' });
-    if (!dial || local.length < 6 || phone.length > 15) return res.status(400).json({ ok: false, field: 'phone', error: 'Please enter a valid WhatsApp number.' });
+    if (!dial || local.length < 6 || phone.length > 15) return res.status(400).json({ ok: false, field: 'phone', error: 'Please enter a valid phone number.' });
     if (!handpan) return res.status(400).json({ ok: false, field: 'handpan', error: 'Please tell me if you have a handpan.' });
     if (isNaN(start)) return res.status(400).json({ ok: false, error: 'Please pick a time.' });
 
