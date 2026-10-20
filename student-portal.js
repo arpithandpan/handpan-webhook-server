@@ -24,6 +24,7 @@
 // Env:
 //   WA_PORTAL_TEMPLATES  – 'on' once class_changed + my_classes_link are approved
 //   PORTAL_CHARGE_SKIPS  – 'off' stops the month-end count of un-made-up skips
+//   WA_LOGIN_TEMPLATE    – 'on' once the login_code (Authentication) template is approved
 
 const crypto = require('crypto');
 
@@ -519,6 +520,140 @@ async function requestLinkHandler(req, res) {
   }
 }
 
+// ── LOGIN CODE (6 digits, WhatsApp + email) ──
+// POST /api/my/request-code { contact }  → always { ok, resendIn }
+// POST /api/my/verify-code  { contact, code } → { ok, token } or { ok:false, left }
+// Codes live in memory for 10 minutes (a restart only means "send again").
+// A contact that matches nobody still gets a code record (with a random
+// code nobody knows), so the page behaves the same either way and nobody
+// can test which numbers belong to students. Only a hash of the code is kept.
+const CODE_TTL_MS = 10 * 60 * 1000;
+const CODE_MAX_TRIES = 5;
+const CODE_RESEND_S = 30;
+const _codes = new Map();   // contactKey → { hash, token, exp, tries, sentAt }
+
+function loginTemplateOn() { return String(process.env.WA_LOGIN_TEMPLATE || '').trim().toLowerCase() === 'on'; }
+function contactKey(raw) {
+  const v = String(raw || '').trim().slice(0, 120);
+  if (!v) return null;
+  if (v.includes('@')) return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(v) ? { key: v.toLowerCase(), mail: true } : null;
+  const d = last10(v);
+  return d.length >= 7 ? { key: d, mail: false } : null;
+}
+function hashCode(key, code) { return crypto.createHash('sha256').update(key + '|' + code).digest('hex'); }
+
+async function findStudent(c) {
+  const { data: students } = await supabase.from('students').select('id, full_name, phone, extra_phones, email, archived');
+  return (students || []).find(s => {
+    if (s.archived) return false;
+    if (c.mail) return String(s.email || '').trim().toLowerCase() === c.key;
+    const phones = [s.phone].concat(Array.isArray(s.extra_phones) ? s.extra_phones : []);
+    return phones.some(p => last10(p) && last10(p) === c.key);
+  }) || null;
+}
+
+// WhatsApp Authentication template: body "{{1}} is your verification code"
+// plus a Copy code button, both carrying the code.
+async function sendLoginCodeWa(phone, code) {
+  const to = whatsapp && whatsapp.normalizePhone ? whatsapp.normalizePhone(phone) : String(phone || '').replace(/\D/g, '');
+  if (!to || !process.env.WHATSAPP_PROD_TOKEN || !process.env.WHATSAPP_PROD_PHONE_ID) return { ok: false };
+  try {
+    const r = await fetch('https://graph.facebook.com/v21.0/' + process.env.WHATSAPP_PROD_PHONE_ID + '/messages', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + process.env.WHATSAPP_PROD_TOKEN, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp', to, type: 'template',
+        template: {
+          name: 'login_code', language: { code: 'en' },
+          components: [
+            { type: 'body', parameters: [{ type: 'text', text: code }] },
+            { type: 'button', sub_type: 'url', index: '0', parameters: [{ type: 'text', text: code }] }
+          ]
+        }
+      })
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { console.error('login code WA failed:', j && j.error && j.error.message); return { ok: false }; }
+    return { ok: true };
+  } catch (e) { console.error('login code WA error:', e.message); return { ok: false }; }
+}
+
+async function requestCodeHandler(req, res) {
+  try {
+    const ip = String(req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim();
+    const c = contactKey((req.body || {}).contact);
+    if (!c) return res.status(400).json({ ok: false, error: 'Please enter a valid phone number or email.' });
+    const prev = _codes.get(c.key);
+    if (prev && Date.now() - prev.sentAt < CODE_RESEND_S * 1000) {
+      return res.json({ ok: true, resendIn: Math.ceil((CODE_RESEND_S * 1000 - (Date.now() - prev.sentAt)) / 1000) });
+    }
+    if (tooMany('ip:' + ip, 10, HOUR) || tooMany('c:' + c.key, 5, HOUR)) {
+      return res.status(429).json({ ok: false, error: 'Too many tries. Please wait a while and try again.' });
+    }
+    for (const [k, v] of _codes) if (Date.now() > v.exp) _codes.delete(k);
+    const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+    const match = await findStudent(c);
+    let token = null;
+    if (match) {
+      const link = await linkForStudent(match.id, false);
+      if (!link.error) token = link.token;
+    }
+    _codes.set(c.key, { hash: hashCode(c.key, code), token, exp: Date.now() + CODE_TTL_MS, tries: 0, sentAt: Date.now() });
+    res.json({ ok: true, resendIn: CODE_RESEND_S });
+
+    if (!match || !token) return;
+    let waOk = false, mailOk = false;
+    if (loginTemplateOn()) {
+      const phones = c.mail ? [match.phone] : [match.phone].concat(match.extra_phones || []).filter(p => last10(p) === c.key);
+      for (const p of phones.filter(Boolean)) { const r = await sendLoginCodeWa(p, code); if (r.ok) waOk = true; }
+    }
+    if (match.email) {
+      const url = linkFor(token);
+      const r = await sendMail({
+        to: match.email,
+        subject: code + ' is your login code',
+        html: mailShell(`
+          <p style="margin:0 0 8px;">Hi ${esc(firstName(match.full_name))}, your login code is</p>
+          <p style="margin:0 0 18px;font-size:34px;letter-spacing:8px;font-weight:700;color:#500018;">${code}</p>
+          <p style="margin:0 0 20px;line-height:1.6;">It works for 10 minutes. Or just tap the button to log in.</p>
+          <p style="margin:0 0 20px;"><a href="${esc(url)}" style="display:inline-block;background:#500018;color:#F5EEE5;text-decoration:none;padding:12px 22px;border-radius:40px;font-weight:600;">Log in</a></p>
+          <p style="margin:0;font-size:13px;line-height:1.6;color:#6B5150;">Didn't ask for this? You can ignore this email.</p>`),
+        text: `Your login code is ${code}. It works for 10 minutes. Or log in here: ${url}`
+      }).catch(() => ({ ok: false }));
+      mailOk = !!r.ok;
+    }
+    if (!waOk && !mailOk) {
+      await notify('warning', `🔗 ${match.full_name} tried to log in, but the code could not be sent (no email on file${loginTemplateOn() ? ' and WhatsApp failed' : ', WhatsApp login code is off'}). Copy their My classes link from the Students page and send it.`);
+    }
+  } catch (e) {
+    console.error('portal request-code error:', e.message);
+    if (!res.headersSent) res.json({ ok: true, resendIn: CODE_RESEND_S });
+  }
+}
+
+async function verifyCodeHandler(req, res) {
+  try {
+    const c = contactKey((req.body || {}).contact);
+    const code = String((req.body || {}).code || '').replace(/\D/g, '');
+    if (!c || code.length !== 6) return res.status(400).json({ ok: false, error: 'Please enter the 6-digit code.' });
+    const rec = _codes.get(c.key);
+    if (!rec || Date.now() > rec.exp) { _codes.delete(c.key); return res.status(410).json({ ok: false, code: 'expired', error: 'This code has expired. Please send a new one.' }); }
+    if (rec.tries >= CODE_MAX_TRIES) return res.status(429).json({ ok: false, code: 'locked', error: 'Too many wrong tries. Please send a new code.' });
+    const a = Buffer.from(rec.hash), b = Buffer.from(hashCode(c.key, code));
+    if (rec.token && a.length === b.length && crypto.timingSafeEqual(a, b)) {
+      _codes.delete(c.key);
+      return res.json({ ok: true, token: rec.token });
+    }
+    rec.tries++;
+    const left = CODE_MAX_TRIES - rec.tries;
+    if (left <= 0) return res.status(429).json({ ok: false, code: 'locked', error: 'Too many wrong tries. Please send a new code.' });
+    res.status(401).json({ ok: false, code: 'wrong', left, error: `That code didn't match. ${left} ${left === 1 ? 'try' : 'tries'} left.` });
+  } catch (e) {
+    console.error('portal verify-code error:', e.message);
+    res.status(500).json({ ok: false, error: 'Something went wrong. Please try again.' });
+  }
+}
+
 // ── PUBLIC: GET /api/my/:token/invoice/:id ── (only the person's own invoices)
 async function invoiceHandler(req, res, deps) {
   try {
@@ -601,10 +736,10 @@ function startWorker() {
   if (_timer) return;
   setTimeout(tick, 60 * 1000);
   _timer = setInterval(tick, 30 * 60 * 1000);
-  console.log('My classes worker started (WhatsApp ' + (templatesOn() ? 'on' : 'off, email only') + ')');
+  console.log('My classes worker started (WhatsApp ' + (templatesOn() ? 'on' : 'off, email only') + ', login code on WhatsApp ' + (loginTemplateOn() ? 'on' : 'off') + ')');
 }
 
 module.exports = {
-  init, startWorker, dataHandler, timesHandler, changeHandler, requestLinkHandler, invoiceHandler, adminLinkHandler, linkForStudent,
-  _test: { buildClasses, changesUsed, pendingMakeups, monthEnd, freeTimes, loadStudent, tick, tooMany, _reqHits }
+  init, startWorker, dataHandler, timesHandler, changeHandler, requestLinkHandler, requestCodeHandler, verifyCodeHandler, invoiceHandler, adminLinkHandler, linkForStudent,
+  _test: { _codes, buildClasses, changesUsed, pendingMakeups, monthEnd, freeTimes, loadStudent, tick, tooMany, _reqHits }
 };
