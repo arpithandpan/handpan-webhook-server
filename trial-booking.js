@@ -711,6 +711,6 @@ async function markAttended(meetingId, minutes) {
 }
 
 module.exports = {
-  init, slotsHandler, bookHandler, cancelHandler, cancelTrial, startWorker, markAttended, getSettings, freeSlots,
+  init, slotsHandler, bookHandler, cancelHandler, cancelTrial, startWorker, markAttended, getSettings, freeSlots, busyIntervals,
   _test: { computeSlots, computeBooked, sanitizeSettings, DEFAULTS, buildIcs, spans3am, istYmd, zonedToUtc }
 };

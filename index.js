@@ -106,6 +106,8 @@ whatsapp.init(supabase);
 trialBooking.init(supabase, { whatsapp, zoomApi: zoom.zoomApi });
 const workshopMessages = require('./workshop-messages');
 workshopMessages.init(supabase, { whatsapp });
+const studentPortal = require('./student-portal');
+studentPortal.init(supabase, { whatsapp, trialBooking });
 zoom.setTrialHook(trialBooking.markAttended);
 
 // ── GENERAL PAYMENT PAGE ID ──
@@ -1378,6 +1380,14 @@ app.post('/api/wa/reopen', requireAdmin, express.json({ limit: '8kb' }), (req, r
 app.get('/api/wa/media/:waId', requireAdmin, (req, res) => whatsapp.mediaHandler(req, res));
 app.post('/api/wa/send-media', requireAdmin, express.json({ limit: '24mb' }), (req, res) => whatsapp.sendMediaHandler(req, res));
 
+// ── MY CLASSES (personal page arpitpandey.com/my#<token>) ──
+app.post('/api/my/request-link', express.json({ limit: '4kb' }), (req, res) => studentPortal.requestLinkHandler(req, res));
+app.get('/api/my/:token', (req, res) => studentPortal.dataHandler(req, res));
+app.get('/api/my/:token/times', (req, res) => studentPortal.timesHandler(req, res));
+app.post('/api/my/:token/change', express.json({ limit: '4kb' }), (req, res) => studentPortal.changeHandler(req, res));
+app.get('/api/my/:token/invoice/:id', (req, res) => studentPortal.invoiceHandler(req, res, { getPdf, pdfFilename }));
+app.post('/api/portal/link', requireAdmin, express.json({ limit: '4kb' }), (req, res) => studentPortal.adminLinkHandler(req, res));
+
 // Quick check that the prod WhatsApp env vars are loaded. No secrets in the reply.
 app.get('/api/whatsapp/status', (req, res) => res.json(whatsapp.status()));
 
@@ -1960,4 +1970,5 @@ app.listen(PORT, () => {
   whatsapp.startWorker();
   trialBooking.startWorker();
   workshopMessages.startWorker();
+  studentPortal.startWorker();
 });
