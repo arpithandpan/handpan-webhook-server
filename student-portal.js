@@ -634,9 +634,18 @@ async function requestCodeHandler(req, res) {
       const link = await linkForStudent(match.id, false);
       if (!link.error) token = link.token;
     }
+    // Where the code can go. Email always; WhatsApp only once the login_code
+    // template is approved (Meta needs business verification for it).
+    const viaWa = loginTemplateOn() && !!match.phone;
+    const viaMail = !!match.email;
+    if (!viaMail && !viaWa) {
+      await notify('warning', `🔗 ${match.full_name} tried to log in, but there is no email on file for a login code. Copy their My classes link from the Students page and send it on WhatsApp.`);
+      return res.status(409).json({ ok: false, code: 'no_channel',
+        error: 'There\'s no email on your booking, so we can\'t send a code. Arpit will send you a login link on WhatsApp shortly.' });
+    }
     _codes.set(c.key, { hash: hashCode(c.key, code), token, exp: Date.now() + CODE_TTL_MS, tries: 0, sentAt: Date.now() });
     tooMany(sentKey, 5, HOUR);   // counts this code towards the 5 an hour
-    res.json({ ok: true, resendIn: CODE_RESEND_S });
+    res.json({ ok: true, resendIn: CODE_RESEND_S, sentTo: viaMail ? maskEmail(match.email) : '', wa: viaWa });
 
     if (!match || !token) return;
     let waOk = false, mailOk = false;
@@ -660,12 +669,19 @@ async function requestCodeHandler(req, res) {
       mailOk = !!r.ok;
     }
     if (!waOk && !mailOk) {
-      await notify('warning', `🔗 ${match.full_name} tried to log in, but the code could not be sent (no email on file${loginTemplateOn() ? ' and WhatsApp failed' : ', WhatsApp login code is off'}). Copy their My classes link from the Students page and send it.`);
+      await notify('warning', `🔗 ${match.full_name} tried to log in, but the code could not be delivered (${viaMail ? 'email failed' : 'no email'}${viaWa ? ', WhatsApp failed' : ''}). Copy their My classes link from the Students page and send it.`);
     }
   } catch (e) {
     console.error('portal request-code error:', e.message);
     if (!res.headersSent) res.json({ ok: true, resendIn: CODE_RESEND_S });
   }
+}
+
+// "arpithandpan@gmail.com" -> "ar•••@gmail.com": enough to recognise, not to read.
+function maskEmail(e) {
+  const [u, d] = String(e || '').split('@');
+  if (!d) return '';
+  return u.slice(0, Math.min(2, Math.max(1, u.length - 1))) + '•••@' + d;
 }
 
 async function verifyCodeHandler(req, res) {
