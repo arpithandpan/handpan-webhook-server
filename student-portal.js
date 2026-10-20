@@ -592,10 +592,18 @@ async function requestCodeHandler(req, res) {
     if (prev && Date.now() - prev.sentAt < CODE_RESEND_S * 1000) {
       return res.json({ ok: true, resendIn: Math.ceil((CODE_RESEND_S * 1000 - (Date.now() - prev.sentAt)) / 1000) });
     }
-    if (tooMany('ip:' + ip, 10, HOUR) || tooMany('c:' + c.key, 5, HOUR)) {
-      const mins = Math.max(waitMinutes('ip:' + ip, 10, HOUR), waitMinutes('c:' + c.key, 5, HOUR)) || 60;
-      return res.status(429).json({ ok: false, code: 'limit', retryMin: mins,
-        error: 'Too many codes asked for. You can ask for a new one in ' + mins + (mins === 1 ? ' minute.' : ' minutes.') });
+    // Limits: 30 tries an hour from one network (offices and homes share one
+    // address, and this also stops anyone checking lots of numbers), and 5
+    // codes an hour to one person (only codes actually sent count).
+    const mins = (n) => n + (n === 1 ? ' minute.' : ' minutes.');
+    if (tooMany('ipc:' + ip, 30, HOUR)) {
+      const m = waitMinutes('ipc:' + ip, 30, HOUR) || 60;
+      return res.status(429).json({ ok: false, code: 'limit', retryMin: m, error: 'Too many tries. Please try again in ' + mins(m) });
+    }
+    const sentKey = 'sent:' + c.key;
+    const waitSent = waitMinutes(sentKey, 5, HOUR);
+    if (waitSent) {
+      return res.status(429).json({ ok: false, code: 'limit', retryMin: waitSent, error: 'Too many codes asked for. You can ask for a new one in ' + mins(waitSent) });
     }
     for (const [k, v] of _codes) if (Date.now() > v.exp) _codes.delete(k);
     const match = await findStudent(c);
@@ -613,6 +621,7 @@ async function requestCodeHandler(req, res) {
       if (!link.error) token = link.token;
     }
     _codes.set(c.key, { hash: hashCode(c.key, code), token, exp: Date.now() + CODE_TTL_MS, tries: 0, sentAt: Date.now() });
+    tooMany(sentKey, 5, HOUR);   // counts this code towards the 5 an hour
     res.json({ ok: true, resendIn: CODE_RESEND_S });
 
     if (!match || !token) return;
