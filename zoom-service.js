@@ -512,6 +512,19 @@ async function processMeeting(m) {
     }
     for (const l of plan.learn) await learnNames(l.student.id, l.names, l.email);
 
+    // A known student who was there, but for less than MIN_MINUTES in this
+    // meeting: not counted. Say so, so a dropped connection never goes
+    // unnoticed. Quiet if that day's class is already logged (for example
+    // from a second meeting after a restart).
+    for (const x of plan.short) {
+      if (!x.minutes) continue;
+      const { data: sameDay } = await supabase.from('class_log').select('id')
+        .eq('student_id', x.student.id).eq('class_date', classDate).limit(1);
+      if (sameDay && sameDay.length) continue;
+      const name = x.student.full_name || x.student.id;
+      await notify('warning', `⏱️ ${name} joined only ${x.minutes} min on ${prettyDate(classDate)}, so the class wasn't counted. Log it from the dashboard if the class happened.`);
+    }
+
     // A trial booked from the website: mark that booking attended instead of
     // adding a second trials row for the same person.
     if (trialHook && m.meeting_id) {
@@ -791,5 +804,5 @@ async function resolveUnmatched(id, studentId) {
 
 module.exports = {
   init, setTrialHook, zoomApi, webhookHandler, startWorker, processPending, resolveUnmatched, status, syncMeetings,
-  _test: { cleanParticipants, planMeeting, buildIndex, matchPerson, studentsInTopic, isTrialTopic, encodeUuid, istDate, normName, hmac, MIN_MINUTES, TRIAL_MIN_MINUTES }
+  _test: { processMeeting, cleanParticipants, planMeeting, buildIndex, matchPerson, studentsInTopic, isTrialTopic, encodeUuid, istDate, normName, hmac, MIN_MINUTES, TRIAL_MIN_MINUTES }
 };
