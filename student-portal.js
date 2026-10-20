@@ -456,6 +456,12 @@ async function confirmToStudent(ctx, token, was, nowText) {
 // ── PUBLIC: POST /api/my/request-link { contact } ──
 // Always answers the same way, so nobody can test which numbers are students.
 const _reqHits = new Map();
+// Minutes until `key` may try again (0 = now).
+function waitMinutes(key, max, windowMs) {
+  const list = (_reqHits.get(key) || []).filter(t => Date.now() - t < windowMs);
+  if (list.length < max) return 0;
+  return Math.max(1, Math.ceil((list[0] + windowMs - Date.now()) / 60000));
+}
 function tooMany(key, max, windowMs) {
   const now = Date.now();
   const list = (_reqHits.get(key) || []).filter(t => now - t < windowMs);
@@ -588,7 +594,9 @@ async function requestCodeHandler(req, res) {
       return res.json({ ok: true, resendIn: Math.ceil((CODE_RESEND_S * 1000 - (Date.now() - prev.sentAt)) / 1000) });
     }
     if (tooMany('ip:' + ip, 10, HOUR) || tooMany('c:' + c.key, 5, HOUR)) {
-      return res.status(429).json({ ok: false, error: 'Too many tries. Please wait a while and try again.' });
+      const mins = Math.max(waitMinutes('ip:' + ip, 10, HOUR), waitMinutes('c:' + c.key, 5, HOUR)) || 60;
+      return res.status(429).json({ ok: false, code: 'limit', retryMin: mins,
+        error: 'Too many codes asked for. You can ask for a new one in ' + mins + (mins === 1 ? ' minute.' : ' minutes.') });
     }
     for (const [k, v] of _codes) if (Date.now() > v.exp) _codes.delete(k);
     const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
