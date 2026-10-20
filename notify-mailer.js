@@ -45,7 +45,7 @@ function channelFor(n) {
     || /Upcoming class/i.test(msg)             // Arpit's own class heads-up
     || /New trial booked/i.test(msg)           // someone booked on the trial page
     || /Zoom meeting could not be created/i.test(msg)   // trial booked, link must go by hand
-    || /via My classes:/i.test(msg);                     // a student moved / skipped / booked a make-up
+    || /via My (classes|bookings):/i.test(msg);                     // a student moved / skipped / booked a make-up
   return { email: true, whatsapp: urgent };
 }
 
