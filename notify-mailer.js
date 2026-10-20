@@ -41,6 +41,7 @@ function channelFor(n) {
     n.type === 'payment'                       // money in, fee reminders
     || /payment failed/i.test(msg)             // student tried to pay, failed
     || /not linked to a student/i.test(msg)    // zoom review needed
+    || /joined only \d+ min/i.test(msg)       // short Zoom attendance, class not counted
     || /WhatsApp reply to/i.test(msg)          // student replied on the studio number
     || /Upcoming class/i.test(msg)             // Arpit's own class heads-up
     || /New trial booked/i.test(msg)           // someone booked on the trial page
