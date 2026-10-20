@@ -530,9 +530,8 @@ async function requestLinkHandler(req, res) {
 // POST /api/my/request-code { contact }  → always { ok, resendIn }
 // POST /api/my/verify-code  { contact, code } → { ok, token } or { ok:false, left }
 // Codes live in memory for 10 minutes (a restart only means "send again").
-// A contact that matches nobody still gets a code record (with a random
-// code nobody knows), so the page behaves the same either way and nobody
-// can test which numbers belong to students. Only a hash of the code is kept.
+// A contact that matches no student gets "No booking found". Only a hash of
+// the code is kept.
 const CODE_TTL_MS = 10 * 60 * 1000;
 const CODE_MAX_TRIES = 5;
 const CODE_RESEND_S = 30;
@@ -599,8 +598,15 @@ async function requestCodeHandler(req, res) {
         error: 'Too many codes asked for. You can ask for a new one in ' + mins + (mins === 1 ? ' minute.' : ' minutes.') });
     }
     for (const [k, v] of _codes) if (Date.now() > v.exp) _codes.delete(k);
-    const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
     const match = await findStudent(c);
+    // Say plainly when nobody matches, so a student who typed another email
+    // knows right away. (Only "is a student or not" is revealed, and the
+    // limits above stop anyone checking many numbers.)
+    if (!match) {
+      return res.status(404).json({ ok: false, code: 'not_found',
+        error: 'No booking found with this ' + (c.mail ? 'email.' : 'number.') });
+    }
+    const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
     let token = null;
     if (match) {
       const link = await linkForStudent(match.id, false);
