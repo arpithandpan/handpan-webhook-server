@@ -535,7 +535,9 @@ async function requestLinkHandler(req, res) {
 const CODE_TTL_MS = 10 * 60 * 1000;
 const CODE_MAX_TRIES = 5;
 const CODE_RESEND_S = 30;
-const _codes = new Map();   // contactKey → { hash, token, exp, tries, sentAt }
+const _codes = new Map();
+const _miss = new Map();   // ip → { n: misses in a row, until: pause end }
+const IP_TRIES_PER_HOUR = 15, MISSES_BEFORE_PAUSE = 3, PAUSE_SEC = 30;   // contactKey → { hash, token, exp, tries, sentAt }
 
 function loginTemplateOn() { return String(process.env.WA_LOGIN_TEMPLATE || '').trim().toLowerCase() === 'on'; }
 function contactKey(raw) {
@@ -592,13 +594,19 @@ async function requestCodeHandler(req, res) {
     if (prev && Date.now() - prev.sentAt < CODE_RESEND_S * 1000) {
       return res.json({ ok: true, resendIn: Math.ceil((CODE_RESEND_S * 1000 - (Date.now() - prev.sentAt)) / 1000) });
     }
-    // Limits: 30 tries an hour from one network (offices and homes share one
-    // address, and this also stops anyone checking lots of numbers), and 5
-    // codes an hour to one person (only codes actually sent count).
+    // Limits, per network (homes and offices share one address):
+    //  • 3 "no booking found" in a row → wait 30 seconds
+    //  • 15 tries an hour in all → wait until the hour frees up
+    // and per person: 5 codes an hour (only codes actually sent count).
     const mins = (n) => n + (n === 1 ? ' minute.' : ' minutes.');
-    if (tooMany('ipc:' + ip, 30, HOUR)) {
-      const m = waitMinutes('ipc:' + ip, 30, HOUR) || 60;
-      return res.status(429).json({ ok: false, code: 'limit', retryMin: m, error: 'Too many tries. Please try again in ' + mins(m) });
+    const miss = _miss.get(ip);
+    if (miss && miss.until > Date.now()) {
+      const sec = Math.ceil((miss.until - Date.now()) / 1000);
+      return res.status(429).json({ ok: false, code: 'cooldown', waitSec: sec, error: 'Too many tries. Please wait ' + sec + ' seconds.' });
+    }
+    if (tooMany('ipc:' + ip, IP_TRIES_PER_HOUR, HOUR)) {
+      const m = waitMinutes('ipc:' + ip, IP_TRIES_PER_HOUR, HOUR) || 60;
+      return res.status(429).json({ ok: false, code: 'limit', retryMin: m, waitSec: m * 60, error: 'Too many tries. Please try again in ' + mins(m) });
     }
     const sentKey = 'sent:' + c.key;
     const waitSent = waitMinutes(sentKey, 5, HOUR);
@@ -611,9 +619,15 @@ async function requestCodeHandler(req, res) {
     // knows right away. (Only "is a student or not" is revealed, and the
     // limits above stop anyone checking many numbers.)
     if (!match) {
-      return res.status(404).json({ ok: false, code: 'not_found',
+      const m = _miss.get(ip) || { n: 0, until: 0 };
+      m.n++;
+      let waitSec = 0;
+      if (m.n >= MISSES_BEFORE_PAUSE) { m.n = 0; m.until = Date.now() + PAUSE_SEC * 1000; waitSec = PAUSE_SEC; }
+      _miss.set(ip, m);
+      return res.status(404).json({ ok: false, code: 'not_found', waitSec,
         error: 'No booking found with this ' + (c.mail ? 'email.' : 'number.') });
     }
+    _miss.delete(ip);
     const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
     let token = null;
     if (match) {
@@ -764,5 +778,5 @@ function startWorker() {
 
 module.exports = {
   init, startWorker, dataHandler, timesHandler, changeHandler, requestLinkHandler, requestCodeHandler, verifyCodeHandler, invoiceHandler, adminLinkHandler, linkForStudent,
-  _test: { _codes, buildClasses, changesUsed, pendingMakeups, monthEnd, freeTimes, loadStudent, tick, tooMany, _reqHits }
+  _test: { _codes, _miss, buildClasses, changesUsed, pendingMakeups, monthEnd, freeTimes, loadStudent, tick, tooMany, _reqHits }
 };
