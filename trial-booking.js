@@ -168,14 +168,28 @@ async function busyIntervals(fromMs, toMs) {
   const fromYmd = addDays(istYmd(new Date(fromMs)), -2);
   const toYmd = addDays(istYmd(new Date(toMs)), 2);
 
-  const { data: rows, error } = await supabase.from('class_schedule')
-    .select('student_id, weekday, time_ist, local_weekday, local_time, student_tz, duration_min, active')
-    .eq('active', true);
+  // All the reads at once (they don't depend on each other), so the trial
+  // page and My bookings wait for one round trip instead of five.
+  const [sch, exq, tq, gq, wq] = await Promise.all([
+    supabase.from('class_schedule')
+      .select('student_id, weekday, time_ist, local_weekday, local_time, student_tz, duration_min, active')
+      .eq('active', true),
+    supabase.from('class_exceptions')
+      .select('student_id, original_date, action, new_date, new_time_ist')
+      .gte('original_date', addDays(fromYmd, -14)).lte('original_date', addDays(toYmd, 14)),
+    supabase.from('trials')
+      .select('id, start_at, duration_min, status')
+      .eq('status', 'booked')
+      .gte('start_at', new Date(fromMs - 86400000).toISOString())
+      .lte('start_at', new Date(toMs + 86400000).toISOString()),
+    supabase.from('gigs').select('id, event_date, event_time, duration, status, archived')
+      .gte('event_date', fromYmd).lte('event_date', toYmd),
+    supabase.from('workshops').select('id, date, workshop_time, cancelled, archived')
+      .gte('date', fromYmd).lte('date', toYmd)
+  ]);
+  const { data: rows, error } = sch;
   if (error) throw new Error('class_schedule: ' + error.message);
-
-  const { data: exRows, error: exErr } = await supabase.from('class_exceptions')
-    .select('student_id, original_date, action, new_date, new_time_ist')
-    .gte('original_date', addDays(fromYmd, -14)).lte('original_date', addDays(toYmd, 14));
+  const { data: exRows, error: exErr } = exq;
   if (exErr) throw new Error('class_exceptions: ' + exErr.message);
   const exKey = {};
   for (const e of (exRows || [])) exKey[e.student_id + '|' + String(e.original_date).slice(0, 10)] = e;
@@ -207,17 +221,62 @@ async function busyIntervals(fromMs, toMs) {
   }
 
   // Booked trials.
-  const { data: trials, error: tErr } = await supabase.from('trials')
-    .select('id, start_at, duration_min, status')
-    .eq('status', 'booked')
-    .gte('start_at', new Date(fromMs - 86400000).toISOString())
-    .lte('start_at', new Date(toMs + 86400000).toISOString());
+  const { data: trials, error: tErr } = tq;
   if (tErr) throw new Error('trials: ' + tErr.message);
   for (const t of (trials || [])) {
     const s = new Date(t.start_at).getTime();
     if (!isNaN(s)) busy.push({ s, e: s + (Number(t.duration_min) || 45) * MIN, what: 'trial ' + t.id });
   }
+
+  // Performances and workshops: Arpit is away, plus travel and setup time.
+  // A read error here only logs; it never stops trials or class moves.
+  if (gq.error) console.error('busy: gigs read failed:', gq.error.message);
+  for (const g of (gq.data || [])) {
+    if (g.archived || g.status === 'cancelled') continue;
+    const b = eventBlock(String(g.event_date).slice(0, 10), g.event_time, durationMin(g.duration) || 120);
+    if (b) busy.push({ ...b, what: 'performance ' + g.id });
+  }
+  if (wq.error) console.error('busy: workshops read failed:', wq.error.message);
+  for (const w of (wq.data || [])) {
+    if (w.archived || w.cancelled) continue;
+    const b = eventBlock(String(w.date).slice(0, 10), w.workshop_time, 150);
+    if (b) busy.push({ ...b, what: 'workshop ' + w.id });
+  }
   return busy.filter(b => b.e >= fromMs - 86400000 && b.s <= toMs + 86400000);
+}
+
+// "7 PM", "19:00", "4:00 PM - 6:30 PM" → minutes after midnight, or null.
+function clockMin(txt) {
+  const m = String(txt || '').match(/(\d{1,2})(?::(\d{2}))?\s*(AM|PM)?/i);
+  if (!m) return null;
+  let h = Number(m[1]); const mi = Number(m[2] || 0); const mer = (m[3] || '').toUpperCase();
+  if (h > 23 || mi > 59) return null;
+  if (mer === 'PM' && h < 12) h += 12;
+  if (mer === 'AM' && h === 12) h = 0;
+  return h * 60 + mi;
+}
+// "2 hours", "90 min", "1.5 hrs" → minutes, or 0.
+function durationMin(txt) {
+  const t = String(txt || '').toLowerCase();
+  const n = parseFloat(t);
+  if (!n) return 0;
+  return /h/.test(t) ? Math.round(n * 60) : /m/.test(t) ? Math.round(n) : Math.round(n * 60);
+}
+// Block 2 hours before (travel, setup) to 1 hour after. No time given →
+// the whole day, to be safe.
+const EVENT_BEFORE_MIN = 120, EVENT_AFTER_MIN = 60;
+function eventBlock(ymd, timeTxt, defaultLen) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return null;
+  const dayStart = new Date(`${ymd}T00:00:00+05:30`).getTime();
+  const parts = String(timeTxt || '').split(/\s*(?:-|–|to)\s*/i);
+  const s = clockMin(parts[0]);
+  if (s == null) return { s: dayStart, e: dayStart + 24 * 60 * MIN };
+  let e = parts[1] ? clockMin(parts[1]) : null;
+  // "4 - 6 PM": the first part has no AM/PM, borrow the second one's.
+  let start = s;
+  if (e != null && !/AM|PM/i.test(parts[0]) && /PM/i.test(parts[1]) && start < 12 * 60 && start + 12 * 60 < e + 60) start += 12 * 60;
+  if (e == null || e <= start) e = start + defaultLen;
+  return { s: dayStart + (start - EVENT_BEFORE_MIN) * MIN, e: dayStart + (e + EVENT_AFTER_MIN) * MIN };
 }
 
 // ── 4. SLOT ENGINE ──
@@ -712,5 +771,5 @@ async function markAttended(meetingId, minutes) {
 
 module.exports = {
   init, slotsHandler, bookHandler, cancelHandler, cancelTrial, startWorker, markAttended, getSettings, freeSlots, busyIntervals,
-  _test: { computeSlots, computeBooked, sanitizeSettings, DEFAULTS, buildIcs, spans3am, istYmd, zonedToUtc }
+  _test: { eventBlock, durationMin, computeSlots, computeBooked, sanitizeSettings, DEFAULTS, buildIcs, spans3am, istYmd, zonedToUtc }
 };
