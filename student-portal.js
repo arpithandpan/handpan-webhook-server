@@ -37,7 +37,11 @@ function init(client, deps) {
 }
 
 const NOTICE_HOURS = 12;
-const MAX_CHANGES = 2;
+// 0 = no monthly limit (Arpit's choice, Oct 2026: he is flexible with his
+// few students). Set PORTAL_MAX_CHANGES on Railway to bring a limit back.
+const MAX_CHANGES = Math.max(0, Number(process.env.PORTAL_MAX_CHANGES) || 0);
+const NO_LIMIT_LEFT = 99;
+function leftIn(ctx, ym) { return MAX_CHANGES ? Math.max(0, MAX_CHANGES - changesUsed(ctx, ym)) : NO_LIMIT_LEFT; }
 const HORIZON_DAYS = 28;
 const MOVE_WINDOW_DAYS = 6;
 const MOVE_MAX_AHEAD_DAYS = 35;
@@ -79,6 +83,15 @@ function localMinutes(ms, tz) {
   const p = new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date(ms)).split(':');
   return (+p[0]) * 60 + (+p[1]);
 }
+// Day number in the student's own time zone (for "a day apart" checks).
+function localDayNo(ms, tz) {
+  const ymd = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(new Date(ms));
+  return Math.round(new Date(ymd + 'T00:00:00Z').getTime() / DAY);
+}
+// A moved class or make-up never lands on the same day as, or the day
+// next to, another of the student's classes (their own calendar days).
+const MIN_DAYS_APART = 2;
+
 function tzLabel(tz) {
   if (tz === IST || tz === 'Asia/Calcutta') return 'IST';
   try {
@@ -361,7 +374,7 @@ async function classesView(ctx) {
   const months = {};
   const view = list.map((o, i) => {
     const ym = o.key.slice(0, 7);
-    if (months[ym] == null) months[ym] = Math.max(0, MAX_CHANGES - changesUsed(ctx, ym));
+    if (months[ym] == null) months[ym] = leftIn(ctx, ym);
     return {
       key: o.key, start: new Date(o.start).toISOString(), min: o.dur,
       moved: o.moved, makeup: o.makeup,
@@ -370,10 +383,10 @@ async function classesView(ctx) {
     };
   });
   const thisMonth = istYmd(now).slice(0, 7);
-  if (months[thisMonth] == null) months[thisMonth] = Math.max(0, MAX_CHANGES - changesUsed(ctx, thisMonth));
+  if (months[thisMonth] == null) months[thisMonth] = leftIn(ctx, thisMonth);
   for (const m of pendingMakeups(ctx, now)) {
     const ym = m.key.slice(0, 7);
-    if (months[ym] == null) months[ym] = Math.max(0, MAX_CHANGES - changesUsed(ctx, ym));
+    if (months[ym] == null) months[ym] = leftIn(ctx, ym);
   }
 
   // Payments + invoices (newest first).
@@ -387,7 +400,7 @@ async function classesView(ctx) {
   return {
     tz: ctx.tz, tzCity: tzCity(ctx.tz), tzLabel: tzLabel(ctx.tz),
     zoom: ctx.zoom,
-    noticeHours: NOTICE_HOURS, maxChanges: MAX_CHANGES,
+    noticeHours: NOTICE_HOURS, maxChanges: MAX_CHANGES, chargeSkips: chargeSkipsOn(),
     changesLeft: months,
     upcoming: view,
     makeups: pendingMakeups(ctx, now),
@@ -425,10 +438,15 @@ async function freeTimes(ctx, mode, key) {
   const len = 60;
   const slots = trialBooking._test.computeSlots(s, busy, now, len);
   const [ds, de] = Array.isArray(settings.booker_day) ? settings.booker_day : [420, 1380];
+  const others = buildClasses(ctx, now - 3 * DAY, now + (daysAhead + 4) * DAY)
+    .filter(o => !cur || o.key !== cur.key)
+    .map(o => localDayNo(o.start, ctx.tz));
   return slots.filter(t => {
     if (istYmd(t) > lastYmd || t < lo || t > hi) return false;
     const m = localMinutes(t, ctx.tz);
-    return m >= ds && m + len <= de;
+    if (m < ds || m + len > de) return false;
+    const d = localDayNo(t, ctx.tz);
+    return others.every(o => Math.abs(o - d) >= MIN_DAYS_APART);
   });
 }
 
@@ -500,9 +518,9 @@ async function changeHandler(req, res) {
       const free = await freeTimes(ctx, 'makeup', key);
       if (isNaN(newStart) || !free.includes(newStart)) return res.status(409).json({ ok: false, code: 'taken', error: 'Sorry, that time was just taken. Please pick another one.' });
       await upsertException(sid, key, { action: 'move', new_date: istYmd(newStart), new_time_ist: istHhmm(newStart), makeup: true, student_changes: prevChanges });
-      was = 'Skipped class from ' + prettyDate(key);
-      nowText = prettyIn(newStart, tz) + ' (' + tzLabel(tz) + ')';
-      arpitText = `🔁 ${name} booked a make-up via My classes: ${prettyIn(newStart, IST)} IST (${prettyIn(newStart, tz)} their time), for the class skipped on ${prettyDate(key)}.`;
+      was = 'Your skipped ' + prettyDate(key) + ' class';
+      nowText = 'Make-up on ' + prettyIn(newStart, tz) + ' (' + tzLabel(tz) + ')';
+      arpitText = `🔁 ${name} booked a make-up via My bookings: ${prettyIn(newStart, IST)} IST${theirTime(newStart, tz)}, for the class skipped on ${prettyDate(key)}.`;
     } else {
       const cur = buildClasses(ctx, now - DAY, now + 60 * DAY).find(o => o.key === key);
       if (!cur) return res.status(409).json({ ok: false, error: 'That class is not on your schedule any more.' });
@@ -510,7 +528,7 @@ async function changeHandler(req, res) {
         return res.status(409).json({ ok: false, code: 'too_late', error: `Changes need at least ${NOTICE_HOURS} hours notice. Please message Arpit on WhatsApp.` });
       }
       const ym = key.slice(0, 7);
-      if (changesUsed(ctx, ym) >= MAX_CHANGES) {
+      if (MAX_CHANGES && changesUsed(ctx, ym) >= MAX_CHANGES) {
         return res.status(409).json({ ok: false, code: 'limit', error: `You've used both changes for ${monthName(key)}. Please message Arpit on WhatsApp.` });
       }
       was = prettyIn(cur.start, tz) + ' (' + tzLabel(tz) + ')';
@@ -520,12 +538,14 @@ async function changeHandler(req, res) {
         if (isNaN(newStart) || !free.includes(newStart)) return res.status(409).json({ ok: false, code: 'taken', error: 'Sorry, that time was just taken. Please pick another one.' });
         await upsertException(sid, key, { action: 'move', new_date: istYmd(newStart), new_time_ist: istHhmm(newStart), makeup: !!cur.makeup, student_changes: prevChanges + 1 });
         nowText = prettyIn(newStart, tz) + ' (' + tzLabel(tz) + ')';
-        arpitText = `📅 ${name} moved a class via My classes: ${prettyIn(cur.start, IST)} IST → ${prettyIn(newStart, IST)} IST (${prettyIn(newStart, tz)} their time).`;
+        arpitText = `📅 ${name} moved a class via My bookings: ${prettyIn(cur.start, IST)} IST → ${prettyIn(newStart, IST)} IST${theirTime(newStart, tz)}.`;
       } else {
         await upsertException(sid, key, { action: 'skip', new_date: null, new_time_ist: null, makeup: false, student_changes: prevChanges + 1 });
         const deadline = prettyDate(monthEnd(key));
-        nowText = 'Skipped. You can pick a make-up time until ' + deadline;
-        arpitText = `⏸️ ${name} skipped a class via My classes: ${prettyIn(cur.start, IST)} IST. They can book a make-up until ${deadline}.`;
+        nowText = chargeSkipsOn()
+          ? 'Skipped. You can pick a make-up time until ' + deadline
+          : 'Skipped, and not counted. You can take it another day, any time until ' + deadline;
+        arpitText = `⏸️ ${name} skipped a class via My bookings: ${prettyIn(cur.start, IST)} IST. They can book a make-up until ${deadline}.`;
       }
     }
 
@@ -537,6 +557,9 @@ async function changeHandler(req, res) {
     res.status(500).json({ ok: false, error: 'Could not save that change. Please try again, or message Arpit on WhatsApp.' });
   }
 }
+
+// "(7:15 AM their time)" only when the student lives outside India.
+function theirTime(ms, tz) { return tz && tz !== IST ? ` (${prettyIn(ms, tz)} their time)` : ''; }
 
 async function confirmToStudent(ctx, token, was, nowText) {
   const s = ctx.student;
@@ -554,8 +577,8 @@ async function confirmToStudent(ctx, token, was, nowText) {
         <p style="margin:0 0 6px;"><strong style="color:#500018;">Was:</strong> ${esc(was)}</p>
         <p style="margin:0 0 18px;"><strong style="color:#500018;">Now:</strong> ${esc(nowText)}</p>
         <p style="margin:0 0 20px;line-height:1.6;">Your Zoom link stays the same.</p>
-        <p style="margin:0;"><a href="${esc(linkFor(token))}" style="display:inline-block;background:#500018;color:#F5EEE5;text-decoration:none;padding:12px 22px;border-radius:40px;font-weight:600;">Open My classes</a></p>`),
-      text: `Your handpan class was changed. Was: ${was}. Now: ${nowText}. Your Zoom link stays the same. My classes: ${linkFor(token)}`
+        <p style="margin:0;"><a href="${esc(linkFor(token))}" style="display:inline-block;background:#500018;color:#F5EEE5;text-decoration:none;padding:12px 22px;border-radius:40px;font-weight:600;">Open My bookings</a></p>`),
+      text: `Your handpan class was changed. Was: ${was}. Now: ${nowText}. Your Zoom link stays the same. My bookings: ${linkFor(token)}`
     }).catch(() => ({ ok: false }));
     out.email = !!r.ok;
   }
@@ -609,18 +632,18 @@ async function requestLinkHandler(req, res) {
     if (match.email) {
       const r = await sendMail({
         to: match.email,
-        subject: 'Your My classes link',
+        subject: 'Your My bookings link',
         html: mailShell(`
           <h1 style="margin:0 0 14px;font-size:20px;color:#500018;font-weight:600;">Hi ${esc(firstName(match.full_name))}</h1>
           <p style="margin:0 0 20px;line-height:1.6;">Here is your personal link. It has your schedule, Zoom link and payments, and you can move a class from there.</p>
-          <p style="margin:0 0 20px;"><a href="${esc(link.url)}" style="display:inline-block;background:#500018;color:#F5EEE5;text-decoration:none;padding:12px 22px;border-radius:40px;font-weight:600;">Open My classes</a></p>
+          <p style="margin:0 0 20px;"><a href="${esc(link.url)}" style="display:inline-block;background:#500018;color:#F5EEE5;text-decoration:none;padding:12px 22px;border-radius:40px;font-weight:600;">Open My bookings</a></p>
           <p style="margin:0;font-size:13px;line-height:1.6;color:#6B5150;">This link is just for you, so please don't share it.</p>`),
-        text: `Hi ${firstName(match.full_name)}, here is your My classes link: ${link.url} (just for you, please don't share it).`
+        text: `Hi ${firstName(match.full_name)}, here is your My bookings link: ${link.url} (just for you, please don't share it).`
       }).catch(() => ({ ok: false }));
       mailOk = !!r.ok;
     }
     if (!waOk && !mailOk) {
-      await notify('warning', `🔗 ${match.full_name} asked for their My classes link, but it could not be sent automatically. Copy it from their row on the Students page and send it.`);
+      await notify('warning', `🔗 ${match.full_name} asked for their My bookings link, but it could not be sent automatically. Copy it from their row on the Students page and send it.`);
     }
     res.json(generic);
   } catch (e) {
@@ -753,7 +776,7 @@ async function requestCodeHandler(req, res) {
     const viaWa = loginTemplateOn() && !!match.phone;
     const viaMail = !!match.email;
     if (!viaMail && !viaWa) {
-      await notify('warning', `🔗 ${match.full_name} tried to log in, but there is no email on file for a login code. Copy their My classes link from the Students page and send it on WhatsApp.`);
+      await notify('warning', `🔗 ${match.full_name} tried to log in, but there is no email on file for a login code. Copy their My bookings link from the Students page and send it on WhatsApp.`);
       return res.status(409).json({ ok: false, code: 'no_channel',
         error: 'There\'s no email on your booking, so we can\'t send a code. Arpit will send you a login link on WhatsApp shortly.' });
     }
@@ -783,7 +806,7 @@ async function requestCodeHandler(req, res) {
       mailOk = !!r.ok;
     }
     if (!waOk && !mailOk) {
-      await notify('warning', `🔗 ${match.full_name} tried to log in, but the code could not be delivered (${viaMail ? 'email failed' : 'no email'}${viaWa ? ', WhatsApp failed' : ''}). Copy their My classes link from the Students page and send it.`);
+      await notify('warning', `🔗 ${match.full_name} tried to log in, but the code could not be delivered (${viaMail ? 'email failed' : 'no email'}${viaWa ? ', WhatsApp failed' : ''}). Copy their My bookings link from the Students page and send it.`);
     }
   } catch (e) {
     console.error('portal request-code error:', e.message);
