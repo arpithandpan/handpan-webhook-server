@@ -1382,6 +1382,8 @@ app.post('/api/wa/send-media', requireAdmin, express.json({ limit: '24mb' }), (r
 
 // ── MY CLASSES (personal page arpitpandey.com/my#<token>) ──
 app.post('/api/my/request-link', express.json({ limit: '4kb' }), (req, res) => studentPortal.requestLinkHandler(req, res));
+app.post('/api/my/request-code', express.json({ limit: '4kb' }), (req, res) => studentPortal.requestCodeHandler(req, res));
+app.post('/api/my/verify-code', express.json({ limit: '4kb' }), (req, res) => studentPortal.verifyCodeHandler(req, res));
 app.get('/api/my/:token', (req, res) => studentPortal.dataHandler(req, res));
 app.get('/api/my/:token/times', (req, res) => studentPortal.timesHandler(req, res));
 app.post('/api/my/:token/change', express.json({ limit: '4kb' }), (req, res) => studentPortal.changeHandler(req, res));
