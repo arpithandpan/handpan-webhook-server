@@ -142,6 +142,107 @@ async function linkForStudent(studentId, reset) {
   return { token, url: linkFor(token) };
 }
 
+// Workshop-only people (no student row) get a link row keyed by their phone/email.
+async function linkForGuest(g) {
+  const key10 = last10(g.phone), mail = String(g.email || '').trim().toLowerCase();
+  const { data: rows } = await supabase.from('portal_people').select('*').is('student_id', null);
+  const existing = (rows || []).find(p => (mail && String(p.email || '').trim().toLowerCase() === mail) || (key10 && last10(p.phone) === key10));
+  if (existing) return { token: existing.token, url: linkFor(existing.token) };
+  const token = newToken();
+  const { error } = await supabase.from('portal_people').insert({ token, student_id: null, name: g.full_name, phone: g.phone || null, email: g.email || null });
+  if (error) return { error: error.message };
+  return { token, url: linkFor(token) };
+}
+function linkForMatch(m, reset) { return m.kind === 'guest' ? linkForGuest(m) : linkForStudent(m.id, reset); }
+
+// ── WORKSHOPS ──
+// Bookings are matched by the person's phone numbers or email. One booking =
+// the booker's row plus any guest rows that share its Razorpay payment.
+// Read-only on purpose: tickets can't be moved or refunded here, and the
+// own-handpan answer is fixed at booking (Arpit rents handpans from it).
+function contactsOf(person, student) {
+  const phones = new Set(), mails = new Set();
+  const add = (p) => { const k = last10(p); if (k.length >= 7) phones.add(k); };
+  const addM = (e) => { const m = String(e || '').trim().toLowerCase(); if (m.includes('@')) mails.add(m); };
+  add(person.phone); addM(person.email);
+  if (student) { add(student.phone); (Array.isArray(student.extra_phones) ? student.extra_phones : []).forEach(add); addM(student.email); }
+  return { phones, mails };
+}
+function matchesContact(row, c) {
+  return (row.phone && c.phones.has(last10(row.phone))) || (row.email && c.mails.has(String(row.email).trim().toLowerCase()));
+}
+async function workshopsView(c) {
+  if (!c.phones.size && !c.mails.size) return null;
+  const { data: rows, error } = await supabase.from('participants')
+    .select('id, full_name, phone, email, workshop_id, amount_paid, participant_count, observer_count, bringing_own_handpan, lead_name, razorpay_payment_id, archived');
+  if (error) throw new Error('participants: ' + error.message);
+  const live = (rows || []).filter(r => !r.archived);
+  const leads = live.filter(r => !r.lead_name && matchesContact(r, c));
+  if (!leads.length) return null;
+  const wsIds = [...new Set(leads.map(r => r.workshop_id).filter(Boolean))];
+  const { data: wss } = await supabase.from('workshops').select('id, date, workshop_time, venue, venue_map_url, cancelled, archived').in('id', wsIds);
+  const wsById = {}; for (const w of (wss || [])) wsById[w.id] = w;
+  const today = istYmd(Date.now());
+  const bookings = [];
+  for (const lead of leads) {
+    const w = wsById[lead.workshop_id];
+    if (!w || w.archived) continue;
+    const group = [lead].concat(lead.razorpay_payment_id ? live.filter(r => r.lead_name && r.razorpay_payment_id === lead.razorpay_payment_id) : []);
+    const people = group.reduce((a, r) => a + (Number(r.participant_count) || 1), 0);
+    bookings.push({
+      id: lead.id, ids: group.map(r => r.id),
+      date: String(w.date).slice(0, 10), time: w.workshop_time || '', venue: w.venue || '', map: w.venue_map_url || '',
+      cancelled: !!w.cancelled,
+      people, names: group.map(r => firstName(r.full_name)), observers: Number(lead.observer_count) || 0,
+      own: lead.bringing_own_handpan || ''
+    });
+  }
+  if (!bookings.length) return null;
+  const allIds = bookings.flatMap(b => b.ids);
+  const { data: inv } = await supabase.from('invoices').select('id, source_id, cancelled').eq('source_table', 'participants').in('source_id', allIds);
+  const invBy = {}; for (const i of (inv || [])) if (!i.cancelled) invBy[i.source_id] = i.id;
+  const out = bookings.map(b => {
+    const invoice = b.ids.map(id => invBy[id]).find(Boolean) || null;
+    const { ids, ...rest } = b;
+    return { ...rest, invoice };
+  });
+  return {
+    upcoming: out.filter(b => b.date >= today && !b.cancelled).sort((a, b) => a.date.localeCompare(b.date)),
+    past: out.filter(b => b.date < today || b.cancelled).sort((a, b) => b.date.localeCompare(a.date)).slice(0, 6)
+  };
+}
+async function waitlistView(c) {
+  const { data } = await supabase.from('workshop_waitlist').select('*');
+  const mine = (data || []).filter(r => !r.archived && matchesContact(r, c));
+  if (!mine.length) return null;
+  mine.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+  return { month: mine[0].preferred_month || '' };
+}
+// Invoice ids a token may open (fee payments and workshop bookings).
+async function invoiceOwner(token) {
+  const person = await personByToken(token);
+  if (!person) return null;
+  let student = null, fees = [];
+  if (person.student_id) {
+    const { data: st } = await supabase.from('students').select('id, phone, extra_phones, email, archived').eq('id', person.student_id).maybeSingle();
+    if (st && !st.archived) {
+      student = st;
+      const { data: fp } = await supabase.from('fee_payments').select('id, paid').eq('student_id', st.id);
+      fees = (fp || []).filter(f => f.paid !== false).map(f => f.id);
+    }
+  }
+  const c = contactsOf(person, student);
+  const { data: rows } = await supabase.from('participants').select('id, phone, email, lead_name, razorpay_payment_id, archived');
+  const live = (rows || []).filter(r => !r.archived);
+  const leads = live.filter(r => !r.lead_name && matchesContact(r, c));
+  const parts = new Set();
+  for (const l of leads) {
+    parts.add(l.id);
+    if (l.razorpay_payment_id) live.filter(r => r.lead_name && r.razorpay_payment_id === l.razorpay_payment_id).forEach(r => parts.add(r.id));
+  }
+  return { fees: new Set(fees), parts };
+}
+
 // ── STUDENT DATA ──
 async function loadStudent(studentId) {
   const [st, sch, ex, fp, fr, cl] = await Promise.all([
@@ -230,14 +331,22 @@ async function dataHandler(req, res) {
     if (!person) return res.status(404).json({ ok: false, code: 'bad_link', error: 'This link is not valid any more.' });
     supabase.from('portal_people').update({ last_seen_at: new Date().toISOString() }).eq('id', person.id).then(() => {}, () => {});
 
-    const out = { ok: true, name: firstName(person.name), whatsapp: '919019576583', classes: null };
+    const out = { ok: true, name: firstName(person.name), whatsapp: '919019576583', classes: null, workshops: null, waitlist: null };
+    let student = null;
     if (person.student_id) {
       const ctx = await loadStudent(person.student_id);
       if (ctx && !ctx.student.archived) {
+        student = ctx.student;
         out.name = firstName(ctx.student.full_name);
         out.classes = await classesView(ctx);
       }
     }
+    const c = contactsOf(person, student);
+    const [ws, wl] = await Promise.all([workshopsView(c), waitlistView(c)]);
+    out.workshops = ws;
+    // The waitlist only matters while nothing is booked yet.
+    out.waitlist = ws && ws.upcoming.length ? null : wl;
+    out.role = out.classes ? 'Student' : ws ? 'Workshop participant' : '';
     res.json(out);
   } catch (e) {
     console.error('portal data error:', e.message);
@@ -483,16 +592,10 @@ async function requestLinkHandler(req, res) {
       return res.status(429).json({ ok: false, error: 'Too many tries. Please wait a while and try again.' });
     }
 
-    const { data: students } = await supabase.from('students').select('id, full_name, phone, extra_phones, email, archived');
-    const match = (students || []).find(s => {
-      if (s.archived) return false;
-      if (isMail) return String(s.email || '').trim().toLowerCase() === key;
-      const phones = [s.phone].concat(Array.isArray(s.extra_phones) ? s.extra_phones : []);
-      return phones.some(p => last10(p) && last10(p) === key);
-    });
+    const match = await findPerson({ key, mail: isMail });
     if (!match) { res.json(generic); return; }
 
-    const link = await linkForStudent(match.id, false);
+    const link = await linkForMatch(match, false);
     if (link.error) { console.error('portal link error:', link.error); res.json(generic); return; }
 
     let waOk = false, mailOk = false;
@@ -549,14 +652,25 @@ function contactKey(raw) {
 }
 function hashCode(key, code) { return crypto.createHash('sha256').update(key + '|' + code).digest('hex'); }
 
-async function findStudent(c) {
+// A student first; otherwise someone who booked a workshop (the booker's row).
+async function findPerson(c) {
   const { data: students } = await supabase.from('students').select('id, full_name, phone, extra_phones, email, archived');
-  return (students || []).find(s => {
+  const st = (students || []).find(s => {
     if (s.archived) return false;
     if (c.mail) return String(s.email || '').trim().toLowerCase() === c.key;
     const phones = [s.phone].concat(Array.isArray(s.extra_phones) ? s.extra_phones : []);
     return phones.some(p => last10(p) && last10(p) === c.key);
-  }) || null;
+  });
+  if (st) return { ...st, kind: 'student' };
+  const { data: parts } = await supabase.from('participants').select('id, full_name, phone, email, lead_name, archived, created_at');
+  const mine = (parts || []).filter(p => !p.archived && !p.lead_name
+    && (c.mail ? String(p.email || '').trim().toLowerCase() === c.key : last10(p.phone) === c.key));
+  if (!mine.length) return null;
+  mine.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+  // Newest booking gives the name; borrow an email/phone from any of their bookings.
+  const g = mine[0];
+  return { id: g.id, kind: 'guest', full_name: g.full_name, phone: g.phone || (mine.find(p => p.phone) || {}).phone || null,
+    email: g.email || (mine.find(p => p.email) || {}).email || null, extra_phones: [] };
 }
 
 // WhatsApp Authentication template: body "{{1}} is your verification code"
@@ -614,7 +728,7 @@ async function requestCodeHandler(req, res) {
       return res.status(429).json({ ok: false, code: 'limit', retryMin: waitSent, error: 'Too many codes asked for. You can ask for a new one in ' + mins(waitSent) });
     }
     for (const [k, v] of _codes) if (Date.now() > v.exp) _codes.delete(k);
-    const match = await findStudent(c);
+    const match = await findPerson(c);
     // Say plainly when nobody matches, so a student who typed another email
     // knows right away. (Only "is a student or not" is revealed, and the
     // limits above stop anyone checking many numbers.)
@@ -631,7 +745,7 @@ async function requestCodeHandler(req, res) {
     const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
     let token = null;
     if (match) {
-      const link = await linkForStudent(match.id, false);
+      const link = await linkForMatch(match, false);
       if (!link.error) token = link.token;
     }
     // Where the code can go. Email always; WhatsApp only once the login_code
@@ -710,10 +824,11 @@ async function verifyCodeHandler(req, res) {
 // ── PUBLIC: GET /api/my/:token/invoice/:id ── (only the person's own invoices)
 async function invoiceHandler(req, res, deps) {
   try {
-    const ctx = await ctxForToken(req.params.token);
-    if (!ctx) return res.status(404).json({ error: 'Not found' });
+    const own = await invoiceOwner(req.params.token);
+    if (!own) return res.status(404).json({ error: 'Not found' });
     const { data: row } = await supabase.from('invoices').select('*').eq('id', req.params.id).maybeSingle();
-    const mine = row && row.source_table === 'fee_payments' && !row.cancelled && ctx.paidRows.some(p => p.id === row.source_id);
+    const mine = row && !row.cancelled && ((row.source_table === 'fee_payments' && own.fees.has(row.source_id))
+      || (row.source_table === 'participants' && own.parts.has(row.source_id)));
     if (!mine) return res.status(404).json({ error: 'Not found' });
     const { pdf } = await deps.getPdf(supabase, row);
     res.setHeader('Content-Type', 'application/pdf');
