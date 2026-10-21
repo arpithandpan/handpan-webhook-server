@@ -368,4 +368,14 @@ async function invoiceFeePayment(supabase, { feeId, studentName, student, classe
   });
 }
 
-module.exports = { createAndSendInvoice, invoiceWorkshopBooking, invoiceFeePayment, invoiceFromRow, renderAndStore, getPdf, emailInvoice, pdfFilename, buildInvoicePdf };
+// A short-lived link to an invoice's stored PDF, for the WhatsApp Document
+// header. Meta downloads the file when the message is sent, so one hour is
+// plenty. Returns null if the invoice has no stored PDF yet.
+async function invoiceDocLink(supabase, row) {
+  if (!row || !row.pdf_path) return null;
+  const { data, error } = await supabase.storage.from(BUCKET).createSignedUrl(row.pdf_path, 3600);
+  if (error || !data?.signedUrl) { console.error('invoiceDocLink:', error?.message || 'no url'); return null; }
+  return { link: data.signedUrl, filename: String(row.pdf_path).split('/').pop() };
+}
+
+module.exports = { invoiceDocLink, createAndSendInvoice, invoiceWorkshopBooking, invoiceFeePayment, invoiceFromRow, renderAndStore, getPdf, emailInvoice, pdfFilename, buildInvoicePdf };

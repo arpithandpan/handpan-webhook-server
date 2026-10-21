@@ -118,7 +118,9 @@ function packageLabel(classes, month) {
 // ── SEND ONE TEMPLATE ──
 // bodyParams is an array of strings for {{1}}, {{2}}, … in order.
 // Returns { ok, id } or { ok:false, error }.
-async function sendTemplate(toPhone, templateName, bodyParams) {
+// opts.document = { link, filename } puts a PDF in the template's Document
+// header (the template must have been approved with a Document header).
+async function sendTemplate(toPhone, templateName, bodyParams, opts) {
   if (!configured()) return { ok: false, error: 'WhatsApp prod env vars missing' };
   const to = normalizePhone(toPhone);
   if (!to) return { ok: false, error: 'No usable phone number' };
@@ -137,10 +139,16 @@ async function sendTemplate(toPhone, templateName, bodyParams) {
         template: {
           name: templateName,
           language: { code: TEMPLATE_LANG },
-          components: [{
-            type: 'body',
-            parameters: (bodyParams || []).map(t => ({ type: 'text', text: String(t) }))
-          }]
+          components: [
+            ...(opts && opts.document && opts.document.link ? [{
+              type: 'header',
+              parameters: [{ type: 'document', document: { link: opts.document.link, filename: opts.document.filename || 'Invoice.pdf' } }]
+            }] : []),
+            {
+              type: 'body',
+              parameters: (bodyParams || []).map(t => ({ type: 'text', text: String(t) }))
+            }
+          ]
         }
       })
     });

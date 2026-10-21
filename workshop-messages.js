@@ -21,6 +21,22 @@ const FALLBACK_MAP = 'https://arpitpandey.com/workshops';
 let supabase = null, whatsapp = null, timer = null, running = false;
 function init(client, deps) { supabase = client; whatsapp = deps.whatsapp; }
 function on() { return String(process.env.WA_WORKSHOP_TEMPLATES || '').trim().toLowerCase() === 'on'; }
+// Railway WA_INVOICE_DOCS=on: the confirmation goes as workshop_confirmation_v2
+// with the invoice PDF on top. Off (or no invoice in time) = the old text-only one.
+function docsOn() { return String(process.env.WA_INVOICE_DOCS || '').trim().toLowerCase() === 'on'; }
+const INVOICE_WAIT_MS = 5 * 60 * 1000;   // how long a confirmation waits for its invoice PDF
+const firstSeen = new Map();             // participant id -> when this worker first saw it unconfirmed
+const { invoiceDocLink } = require('./invoice-service');
+
+// The stored invoice for this booking: the lead's row or any guest row of the group.
+async function bookingInvoice(p, all) {
+  const ids = [p.id].concat(all.filter(x => x.lead_name && x.lead_name === p.full_name).map(x => x.id));
+  const { data } = await supabase.from('invoices')
+    .select('id, pdf_path, cancelled').eq('source_table', 'participants').in('source_id', ids)
+    .not('pdf_path', 'is', null).order('invoice_number', { ascending: false }).limit(1);
+  const row = (data || []).find(r => !r.cancelled);
+  return row || null;
+}
 
 // Same parsing as the booking code: "4:00 PM", "16:00", "4:00 PM - 5:30 PM".
 function startUtc(dateStr, timeStr) {
@@ -55,10 +71,16 @@ async function notify(type, message) {
   try { await supabase.from('notifications').insert({ type, message, read: false }); } catch (e) {}
 }
 
-async function send(p, kind, template, params, stampCol, ws) {
+async function send(p, kind, template, params, stampCol, ws, opts) {
   const who = clean(p.full_name) || p.id;
   if (!on()) { console.log(`Workshop dry-run: would send ${template} (${kind}) to ${who} for ${ws.id}`); return; }
-  const r = await whatsapp.sendTemplate(p.phone, template, params.map(clean));
+  let r = await whatsapp.sendTemplate(p.phone, template, params.map(clean), opts);
+  // The invoice version failed (template not approved yet, PDF link refused):
+  // send the plain confirmation instead, so the booking message never goes missing.
+  if (!r.ok && opts && opts.fallbackTemplate) {
+    console.error(`Workshop ${template} to ${who} failed (${r.error}), sending ${opts.fallbackTemplate}`);
+    r = await whatsapp.sendTemplate(p.phone, opts.fallbackTemplate, params.map(clean));
+  }
   // Stamp either way so a bad number never loops; a failure becomes one alert.
   await supabase.from('participants').update({ [stampCol]: new Date().toISOString() }).eq('id', p.id);
   if (!r.ok) await notify('warning', `⚠️ Workshop ${kind} to ${who} (${ws.id}) failed: ${r.error}. Message them by hand.`);
@@ -96,7 +118,22 @@ async function processPending() {
         const confirmedAgo = p.wa_confirm_at ? now - new Date(p.wa_confirm_at).getTime() : Infinity;
         // 1. Confirmation, while the workshop is still ahead
         if (!p.wa_confirm_at && now < start.getTime()) {
-          await send(p, 'confirmation', 'workshop_confirmation', [name, date, time, venue, map], 'wa_confirm_at', ws);
+          const params = [name, date, time, venue, map];
+          if (docsOn()) {
+            const inv = await bookingInvoice(p, all);
+            const doc = inv ? await invoiceDocLink(supabase, inv) : null;
+            if (doc) {
+              await send(p, 'confirmation', 'workshop_confirmation_v2', params, 'wa_confirm_at', ws,
+                { document: doc, fallbackTemplate: 'workshop_confirmation' });
+              firstSeen.delete(p.id);
+              continue;
+            }
+            // No invoice PDF yet: the webhook may still be making it. Wait a few ticks.
+            if (!firstSeen.has(p.id)) firstSeen.set(p.id, now);
+            if (now - firstSeen.get(p.id) < INVOICE_WAIT_MS) continue;
+            firstSeen.delete(p.id);
+          }
+          await send(p, 'confirmation', 'workshop_confirmation', params, 'wa_confirm_at', ws);
           continue;   // reminders wait for the next tick
         }
         // 2. Day before, 7 PM (skip if they only just got the confirmation)
