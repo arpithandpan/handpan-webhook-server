@@ -75,6 +75,10 @@ function lateWindow(workshop, code, now = new Date()) {
 }
 // Can this booking go ahead right now? { ok, late } or { ok:false, status, reason, error }.
 function bookingGate(workshop, code, now = new Date()) {
+  // "Coming soon" in the dashboard: listed on the site, not bookable yet.
+  if (workshop.booking_open === false) {
+    return { ok: false, status: 403, reason: 'not_open', error: "Bookings for this workshop haven't opened yet" };
+  }
   const start = workshopStartUtc(workshop.date, workshop.workshop_time);
   if (start && now >= start) {
     return { ok: false, status: 403, reason: 'started', error: 'This workshop has already started' };
@@ -554,7 +558,7 @@ app.post('/api/create-payment-link', express.json(), async (req, res) => {
     // 1. Look up the workshop, its capacity (if set), and its prices
     const { data: workshop, error: wsError } = await supabase
       .from('workshops')
-      .select('id, date, workshop_time, late_code_hash, late_expires_at, participant_capacity, observer_capacity, price_per_head, observer_price, archived, cancelled')
+      .select('*')
       .eq('id', workshopId)
       .single();
 
@@ -709,7 +713,7 @@ app.post('/api/create-booking-order', express.json(), async (req, res) => {
 
     const { data: workshop, error: wsError } = await supabase
       .from('workshops')
-      .select('id, date, venue, workshop_time, late_code_hash, late_expires_at, participant_capacity, observer_capacity, price_per_head, observer_price, archived, cancelled')
+      .select('*')
       .eq('id', workshopId)
       .single();
 
@@ -828,6 +832,50 @@ app.post('/api/create-booking-order', express.json(), async (req, res) => {
 // render itself for this workshop: date, time, venue, prices, and how many
 // participant / audience pass slots are left. book.html no longer hardcodes
 // any of this — it's a single template that works for any workshop ID.
+// ── UPCOMING WORKSHOPS (public list for the home and workshops pages) ──
+// Everything comes from the dashboard's Workshops table, so the site never
+// shows a stale date or venue. Only public fields go out. A workshop with
+// booking_open = false shows as "Coming soon" without a Book button.
+app.get('/api/workshops/upcoming', async (req, res) => {
+  try {
+    const today = new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
+    const { data: wss, error } = await supabase.from('workshops')
+      .select('*').gte('date', today).order('date', { ascending: true }).limit(12);
+    if (error) throw new Error(error.message);
+    const list = (wss || []).filter(w => !w.archived && !w.cancelled);
+    const sold = {};
+    if (list.length) {
+      const { data: rows, error: pErr } = await supabase.from('participants')
+        .select('workshop_id, participant_count, observer_count').in('workshop_id', list.map(w => w.id));
+      if (pErr) throw new Error(pErr.message);
+      for (const r of (rows || [])) {
+        const c = rowPeopleCounts(r);
+        const s = sold[r.workshop_id] || (sold[r.workshop_id] = { p: 0, o: 0 });
+        s.p += c.participantCount; s.o += c.observerCount;
+      }
+    }
+    res.set('Cache-Control', 'public, max-age=60');
+    return res.json({
+      workshops: list.map(w => {
+        const s = sold[w.id] || { p: 0, o: 0 };
+        return {
+          id: w.id,
+          date: String(w.date).slice(0, 10),
+          title: w.title || null,
+          venue: w.venue || null,
+          time: w.workshop_time || null,
+          bookingOpen: w.booking_open !== false,
+          participantsRemaining: w.participant_capacity != null ? Math.max(0, w.participant_capacity - s.p) : null,
+          observersRemaining: w.observer_capacity != null ? Math.max(0, w.observer_capacity - s.o) : null
+        };
+      })
+    });
+  } catch (err) {
+    console.error('upcoming workshops error:', err.message);
+    return res.status(500).json({ error: 'Could not load workshops' });
+  }
+});
+
 app.get('/api/workshop/:id/availability', async (req, res) => {
   try {
     const workshopId = req.params.id;
