@@ -1427,6 +1427,42 @@ app.post('/api/zoom/sync-now', requireAdmin, async (req, res) => {
   catch (err) { return res.status(500).json({ error: err.message }); }
 });
 
+// One-off test for the calendar sync (21 Oct 2026): change or cancel ONE
+// date of a recurring Zoom meeting, the way the sync will. Run from the
+// dashboard console. body: { meetingId, date: 'YYYY-MM-DD' (meeting's own
+// time zone), time: 'HH:MM' to move, or cancel: true }.  list: true only
+// shows the meeting and its next dates.
+app.post('/api/zoom/occurrence-test', requireAdmin, express.json(), async (req, res) => {
+  try {
+    const b = req.body || {};
+    const id = String(b.meetingId || '').replace(/\D/g, '');
+    if (!id) return res.status(400).json({ error: 'meetingId needed' });
+    const m = await zoom.zoomApi('GET', '/meetings/' + id + '?show_previous_occurrences=false');
+    if (!m.ok) return res.status(m.status || 500).json({ step: 'read meeting', error: m.error });
+    const tz = m.data.timezone || 'Asia/Kolkata';
+    const local = (iso) => new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date(iso)).replace(', ', ' ');
+    const occ = (m.data.occurrences || []).map(o => ({ id: o.occurrence_id, local: local(o.start_time), status: o.status, duration: o.duration }));
+    const info = { topic: m.data.topic, timezone: tz, type: m.data.type, next: occ.slice(0, 6) };
+    if (b.list) return res.json(info);
+    const hit = occ.find(o => o.local.slice(0, 10) === String(b.date || ''));
+    if (!hit) return res.status(404).json({ error: 'No date ' + b.date + ' in this meeting', ...info });
+    let r;
+    if (b.cancel) {
+      r = await zoom.zoomApi('DELETE', '/meetings/' + id + '?occurrence_id=' + hit.id + '&cancel_meeting_reminder=true');
+    } else {
+      if (!/^\d{2}:\d{2}$/.test(String(b.time || ''))) return res.status(400).json({ error: 'time HH:MM needed' });
+      r = await zoom.zoomApi('PATCH', '/meetings/' + id + '?occurrence_id=' + hit.id, { start_time: b.date + 'T' + b.time + ':00', timezone: tz, duration: hit.duration || m.data.duration || 60 });
+    }
+    if (!r.ok) return res.status(r.status || 500).json({ step: b.cancel ? 'cancel' : 'move', error: r.error });
+    const after = await zoom.zoomApi('GET', '/meetings/' + id + '?show_previous_occurrences=false');
+    res.json({ ok: true, did: b.cancel ? 'cancelled ' + hit.local : 'moved ' + hit.local + ' to ' + b.date + ' ' + b.time + ' (' + tz + ')',
+      next: after.ok ? (after.data.occurrences || []).slice(0, 6).map(o => ({ local: local(o.start_time), status: o.status })) : null });
+  } catch (e) {
+    console.error('occurrence-test error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── RAZORPAY WEBHOOK ──
 app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
