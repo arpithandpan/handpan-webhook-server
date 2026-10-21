@@ -193,7 +193,7 @@ async function workshopsView(c) {
   const leads = live.filter(r => !r.lead_name && matchesContact(r, c));
   if (!leads.length) return null;
   const wsIds = [...new Set(leads.map(r => r.workshop_id).filter(Boolean))];
-  const { data: wss } = await supabase.from('workshops').select('id, date, workshop_time, venue, venue_map_url, cancelled, archived').in('id', wsIds);
+  const { data: wss } = await supabase.from('workshops').select('*').in('id', wsIds);
   const wsById = {}; for (const w of (wss || [])) wsById[w.id] = w;
   const today = istYmd(Date.now());
   const bookings = [];
@@ -204,7 +204,7 @@ async function workshopsView(c) {
     const people = group.reduce((a, r) => a + (Number(r.participant_count) || 1), 0);
     bookings.push({
       id: lead.id, ids: group.map(r => r.id),
-      date: String(w.date).slice(0, 10), time: w.workshop_time || '', venue: w.venue || '', map: w.venue_map_url || '',
+      date: String(w.date).slice(0, 10), time: w.workshop_time || '', title: w.title || '', venue: w.venue || '', map: w.venue_map_url || '',
       cancelled: !!w.cancelled,
       people, names: group.map(r => firstName(r.full_name)), observers: Number(lead.observer_count) || 0,
       own: lead.bringing_own_handpan || ''
