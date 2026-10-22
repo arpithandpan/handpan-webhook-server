@@ -44,7 +44,10 @@ const ESCALATE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;   // 7 days
 // The worker ticks every 2 minutes, so a 65 minute window with a
 // once-per-day stamp means exactly one reminder, roughly an hour before.
 const CLASS_REMINDER_WINDOW_MIN = 65;
-const CLASS_REMINDER_TEMPLATE = 'class_reminder_v2';
+// v3 (Active 22 Oct 2026) adds a "See you there" quick-reply button; a tap
+// arrives as a normal inbound message and opens the 24 h window.
+// Railway CLASS_REMINDER_TEMPLATE=class_reminder_v2 switches back if needed.
+const CLASS_REMINDER_TEMPLATE = (process.env.CLASS_REMINDER_TEMPLATE || 'class_reminder_v3').trim();
 
 // Friendly timezone labels for the reminder text. Anything not listed
 // falls back to the raw offset Intl gives us.
