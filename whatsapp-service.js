@@ -70,6 +70,12 @@ const MAX_ATTEMPTS = 3;
 
 function init(client) { supabase = client; }
 
+// The WhatsApp agent (agent-service.js) plugs in here, so this file never
+// needs to require it: onIncoming(phone, type) for every new incoming
+// message, onManualReply(phone, draftId) whenever Arpit sends by hand.
+let hooks = {};
+function setHooks(h) { hooks = Object.assign({}, hooks, h || {}); }
+
 function configured() {
   return !!(process.env.WHATSAPP_PROD_TOKEN && process.env.WHATSAPP_PROD_PHONE_ID);
 }
@@ -854,24 +860,35 @@ async function sendMediaHandler(req, res) {
   }
 }
 
-// POST /api/wa/reply  { phone, text }   (admin only)
+// Free-text reply inside the 24-hour window, logged like every other message.
+// Used by the reply box and by the agent's "Send draft".
+// → { ok, row } or { ok: false, status, error }
+async function sendReply(phoneRaw, textRaw) {
+  const phone = String(phoneRaw || '').replace(/\D/g, '');
+  const text = String(textRaw || '').replace(/\r\n/g, '\n').trim();
+  if (!phone) return { ok: false, status: 400, error: 'No phone number' };
+  if (!text) return { ok: false, status: 400, error: 'Write a message first' };
+  if (text.length > 4000) return { ok: false, status: 400, error: 'Message is too long (max 4,000 characters)' };
+  const last = await lastIncomingAt(phone);
+  if (!last || Date.now() - last > WINDOW_MS) return { ok: false, status: 409, error: 'window_closed' };
+  const r = await sendText(phone, text);
+  if (!r.ok) return { ok: false, status: r.error === 'window_closed' ? 409 : 502, error: r.error };
+  const row = {
+    direction: 'out', phone: r.to, wa_id: r.id, type: 'text', body: text,
+    status: 'sent', status_at: new Date().toISOString(), created_at: new Date().toISOString()
+  };
+  await logMessage(row);
+  return { ok: true, row };
+}
+
+// POST /api/wa/reply  { phone, text, draftId? }   (admin only)
+// draftId: the agent draft Arpit edited before sending, if any.
 async function replyHandler(req, res) {
   try {
-    const phone = String(req.body?.phone || '').replace(/\D/g, '');
-    const text = String(req.body?.text || '').replace(/\r\n/g, '\n').trim();
-    if (!phone) return res.status(400).json({ error: 'No phone number' });
-    if (!text) return res.status(400).json({ error: 'Write a message first' });
-    if (text.length > 4000) return res.status(400).json({ error: 'Message is too long (max 4,000 characters)' });
-    const last = await lastIncomingAt(phone);
-    if (!last || Date.now() - last > WINDOW_MS) return res.status(409).json({ error: 'window_closed' });
-    const r = await sendText(phone, text);
-    if (!r.ok) return res.status(r.error === 'window_closed' ? 409 : 502).json({ error: r.error });
-    const row = {
-      direction: 'out', phone: r.to, wa_id: r.id, type: 'text', body: text,
-      status: 'sent', status_at: new Date().toISOString(), created_at: new Date().toISOString()
-    };
-    await logMessage(row);
-    res.json({ ok: true, row });
+    const r = await sendReply(req.body?.phone, req.body?.text);
+    if (!r.ok) return res.status(r.status).json({ error: r.error });
+    if (hooks.onManualReply) hooks.onManualReply(r.row.phone, req.body?.draftId || null);
+    res.json({ ok: true, row: r.row });
   } catch (e) {
     console.error('WA reply handler error:', e.message);
     res.status(500).json({ error: 'Could not send right now' });
@@ -971,6 +988,9 @@ async function incomingHandler(req, res) {
             })) === 'dup';
           }
           if (dup) continue;   // Meta retried a webhook we already handled
+          if (isStudio && hooks.onIncoming) {
+            try { hooks.onIncoming(String(from || '').replace(/\D/g, ''), msg.type); } catch (e) { console.error('agent hook error:', e.message); }
+          }
           // Copy the file now, while Meta still has it. Runs in the background.
           if (isStudio && media && media.id && msg.id) saveIncomingMedia(msg.id, media.id, media.filename || null);
           const student = await studentByPhone(from);
@@ -979,7 +999,7 @@ async function incomingHandler(req, res) {
           // A thumbs-up on a reminder is not worth a phone alert. It still
           // shows in the dashboard conversation.
           if (!isReaction) {
-            await notify('info', `💬 WhatsApp reply to Handpan with Arpit — ${who}: "${preview}"${String(text).length > 160 ? '…' : ''} Reply from your main number`);
+            await notify('info', `💬 WhatsApp reply to Handpan with Arpit — ${who}: "${preview}"${String(text).length > 160 ? '…' : ''} Reply in the dashboard (WhatsApp page)`);
           }
           console.log('WA incoming:', who, '-', preview);
         }
@@ -1008,4 +1028,4 @@ function startWorker() {
   timer = setInterval(tick, TICK_MS);
 }
 
-module.exports = { init, status, startWorker, processPending, sendTemplate, normalizePhone, verifyWebhook, incomingHandler, replyHandler, replyTemplateStatus, reopenHandler, mediaHandler, sendMediaHandler, _test: { planScheduleOccurrences, zonedToUtc, tzOffsetMin } };
+module.exports = { init, setHooks, sendReply, status, startWorker, processPending, sendTemplate, normalizePhone, verifyWebhook, incomingHandler, replyHandler, replyTemplateStatus, reopenHandler, mediaHandler, sendMediaHandler, _test: { planScheduleOccurrences, zonedToUtc, tzOffsetMin } };

@@ -113,6 +113,9 @@ workshopMessages.init(supabase, { whatsapp });
 const studentPortal = require('./student-portal');
 studentPortal.init(supabase, { whatsapp, trialBooking });
 zoom.setTrialHook(trialBooking.markAttended);
+const agent = require('./agent-service');
+agent.init(supabase, { whatsapp, studentPortal, trialBooking });
+whatsapp.setHooks({ onIncoming: agent.onIncoming, onManualReply: agent.onManualReply });
 
 // ── GENERAL PAYMENT PAGE ID ──
 const GENERAL_PAYMENT_PAGE_ID = 'pl_SvxuRdqY2rd7ge';
@@ -1425,6 +1428,11 @@ app.post('/api/webhooks/whatsapp', express.json(), (req, res) => whatsapp.incomi
 app.post('/api/wa/reply', requireAdmin, express.json({ limit: '32kb' }), (req, res) => whatsapp.replyHandler(req, res));
 app.get('/api/wa/reply-template', requireAdmin, (req, res) => whatsapp.replyTemplateStatus(req, res));
 app.post('/api/wa/reopen', requireAdmin, express.json({ limit: '8kb' }), (req, res) => whatsapp.reopenHandler(req, res));
+// WhatsApp agent drafts (agent-service.js)
+app.get('/api/agent/drafts', requireAdmin, (req, res) => agent.listHandler(req, res));
+app.post('/api/agent/drafts/:id/send', requireAdmin, express.json({ limit: '32kb' }), (req, res) => agent.sendHandler(req, res));
+app.post('/api/agent/drafts/:id/dismiss', requireAdmin, (req, res) => agent.dismissHandler(req, res));
+app.post('/api/agent/redraft', requireAdmin, express.json({ limit: '8kb' }), (req, res) => agent.redraftHandler(req, res));
 app.get('/api/wa/media/:waId', requireAdmin, (req, res) => whatsapp.mediaHandler(req, res));
 app.post('/api/wa/send-media', requireAdmin, express.json({ limit: '24mb' }), (req, res) => whatsapp.sendMediaHandler(req, res));
 
@@ -2075,6 +2083,7 @@ app.listen(PORT, () => {
   notifyMailer.startWorker();
   settlementWorker.startWorker();
   whatsapp.startWorker();
+  agent.startWorker();
   trialBooking.startWorker();
   workshopMessages.startWorker();
   studentPortal.startWorker();
