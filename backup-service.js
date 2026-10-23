@@ -99,8 +99,9 @@ async function run(reason) {
 async function due() {
   const ist = new Date(Date.now() + 330 * 60000);
   if (ist.getUTCDay() !== 0 || ist.getUTCHours() < 9) return false;
-  const since = new Date(Date.now() - 3 * 86400000).toISOString();
-  const { data } = await supabase.from('notifications').select('id').like('message', '💾 Weekly backup sent%').gte('created_at', since).limit(1);
+  // Only a backup sent today (Sunday, IST) counts; one sent by hand earlier in the week doesn't skip Sunday's.
+  const since = new Date(Date.UTC(ist.getUTCFullYear(), ist.getUTCMonth(), ist.getUTCDate()) - 330 * 60000).toISOString();
+  const { data } = await supabase.from('notifications').select('id').like('message', '💾 Weekly backup sent%').not('message', 'like', '%sent by hand%').gte('created_at', since).limit(1);
   return !(data && data.length);
 }
 

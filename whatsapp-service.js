@@ -156,7 +156,12 @@ async function sendTemplate(toPhone, templateName, bodyParams, opts) {
             {
               type: 'body',
               parameters: (bodyParams || []).map(t => ({ type: 'text', text: String(t) }))
-            }
+            },
+            // Dynamic URL button (e.g. weekly_classes_invite: …/enroll/{{1}}).
+            ...(opts && opts.buttonUrlParam ? [{
+              type: 'button', sub_type: 'url', index: '0',
+              parameters: [{ type: 'text', text: String(opts.buttonUrlParam) }]
+            }] : [])
           ]
         }
       })

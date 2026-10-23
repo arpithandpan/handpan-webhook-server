@@ -119,6 +119,8 @@ const agent = require('./agent-service');
 agent.init(supabase, { whatsapp, studentPortal, trialBooking, onDraft: push.onDraft });
 whatsapp.setHooks({ onIncoming: agent.onIncoming, onManualReply: agent.onManualReply, onPush: push.onWhatsApp });
 notifyMailer.setPushHook(push.onNotification);
+const enrolment = require('./enrolment');
+enrolment.init(supabase, { whatsapp, zoomApi: zoom.zoomApi, push, studentPortal });
 const backup = require('./backup-service');
 backup.init(supabase);
 const calendarInvites = require('./calendar-invites');
@@ -1421,6 +1423,18 @@ app.get('/api/zoom/status', (req, res) => res.json(zoom.status()));
 // ── TRIAL BOOKING (public trial page) ──
 app.get('/api/trial/slots', (req, res) => trialBooking.slotsHandler(req, res));
 app.post('/api/trial/book', express.json({ limit: '20kb' }), (req, res) => trialBooking.bookHandler(req, res));
+// Weekly classes self-enrolment (person's page arpitpandey.com/enroll/<token>)
+app.get('/api/enrol/:token', (req, res) => enrolment.getHandler(req, res));
+app.post('/api/enrol/:token/request', express.json({ limit: '8kb' }), (req, res) => enrolment.requestHandler(req, res));
+app.post('/api/enrol/:token/accept', express.json({ limit: '8kb' }), (req, res) => enrolment.acceptHandler(req, res));
+app.post('/api/enrol/:token/plan', express.json({ limit: '8kb' }), (req, res) => enrolment.planHandler(req, res));
+app.post('/api/enrol/:token/release', express.json({ limit: '8kb' }), (req, res) => enrolment.releaseHandler(req, res));
+// Admin side (dashboard)
+app.get('/api/admin/enrol', requireAdmin, (req, res) => enrolment.listHandler(req, res));
+app.post('/api/admin/enrol/invite', requireAdmin, express.json({ limit: '8kb' }), (req, res) => enrolment.inviteHandler(req, res));
+app.post('/api/admin/enrol/:id/approve', requireAdmin, express.json({ limit: '8kb' }), (req, res) => enrolment.approveHandler(req, res));
+app.post('/api/admin/enrol/:id/offer', requireAdmin, express.json({ limit: '8kb' }), (req, res) => enrolment.offerHandler(req, res));
+app.post('/api/admin/enrol/:id/decline', requireAdmin, express.json({ limit: '8kb' }), (req, res) => enrolment.declineHandler(req, res));
 // Dashboard ✕ on an upcoming trial: cancel + delete Zoom + email. requireAdmin
 // is defined further down as a function declaration, so it is hoisted here.
 app.post('/api/trial/:id/cancel', requireAdmin, (req, res) => trialBooking.cancelHandler(req, res));
@@ -1720,6 +1734,10 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
             } catch (e) { console.error('warning notification failed too:', e.message); }
           }
         }
+
+        // Self-enrolment: paid → weekly slot, Zoom meeting, student Active.
+        // Runs before the "paid but not scheduled" check below.
+        if (requestId) await enrolment.onFeePaid(requestId);
 
         // Income ledger (payments table) is in rupees. INR goes straight in.
         // Foreign currency is NOT inserted — Razorpay's INR settlement amount
@@ -2134,4 +2152,5 @@ app.listen(PORT, () => {
   studentPortal.startWorker();
   calendarInvites.startWorker();
   backup.startWorker();
+  enrolment.startWorker();
 });

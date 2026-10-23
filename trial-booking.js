@@ -170,7 +170,7 @@ async function busyIntervals(fromMs, toMs) {
 
   // All the reads at once (they don't depend on each other), so the trial
   // page and My bookings wait for one round trip instead of five.
-  const [sch, exq, tq, gq, wq] = await Promise.all([
+  const [sch, exq, tq, gq, wq, hq] = await Promise.all([
     supabase.from('class_schedule')
       .select('student_id, weekday, time_ist, local_weekday, local_time, student_tz, duration_min, active')
       .eq('active', true),
@@ -185,7 +185,10 @@ async function busyIntervals(fromMs, toMs) {
     supabase.from('gigs').select('id, event_date, event_time, duration, status, archived')
       .gte('event_date', fromYmd).lte('event_date', toYmd),
     supabase.from('workshops').select('id, date, workshop_time, cancelled, archived')
-      .gte('date', fromYmd).lte('date', toYmd)
+      .gte('date', fromYmd).lte('date', toYmd),
+    // Weekly times held by a self-enrolment request (requested / offered / approved, not yet paid).
+    supabase.from('enrol_requests').select('id, slot_weekday, slot_time, local_weekday, local_time, tz')
+      .in('status', ['requested', 'offered', 'approved'])
   ]);
   const { data: rows, error } = sch;
   if (error) throw new Error('class_schedule: ' + error.message);
@@ -193,8 +196,10 @@ async function busyIntervals(fromMs, toMs) {
   if (exErr) throw new Error('class_exceptions: ' + exErr.message);
   const exKey = {};
   for (const e of (exRows || [])) exKey[e.student_id + '|' + String(e.original_date).slice(0, 10)] = e;
+  const holds = (hq && !hq.error ? hq.data || [] : []).filter(h => h.slot_weekday != null && h.slot_time)
+    .map(h => ({ student_id: 'hold-' + h.id, weekday: h.slot_weekday, time_ist: h.slot_time, local_weekday: h.local_weekday, local_time: h.local_time, student_tz: h.tz, duration_min: 60 }));
 
-  for (const row of (rows || [])) {
+  for (const row of [...(rows || []), ...holds]) {
     const dur = (Number(row.duration_min) || 60) * MIN;
     const tz = row.student_tz || IST;
     const anchoredLocal = row.local_time != null && row.local_weekday != null && tz !== IST;
