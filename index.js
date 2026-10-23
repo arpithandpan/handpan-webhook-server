@@ -1416,6 +1416,8 @@ app.post('/api/invoice/preview', requireAdmin, express.json({ limit: '200kb' }),
 // ── ZOOM (attendance auto-log, logic lives in zoom-service.js) ──
 // Webhook: Zoom calls this when a meeting ends. Raw body for the signature check.
 app.post('/api/webhooks/zoom', express.raw({ type: '*/*' }), zoom.webhookHandler);
+// Who is in each Zoom meeting right now (Today card: waiting / live / done).
+app.get('/api/admin/zoom/live', requireAdmin, zoom.liveHandler);
 
 // Quick check that the Zoom env vars are loaded. No secrets in the reply.
 app.get('/api/zoom/status', (req, res) => res.json(zoom.status()));
