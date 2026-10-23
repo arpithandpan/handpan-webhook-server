@@ -1529,6 +1529,31 @@ app.post('/api/zoom/occurrence-test', requireAdmin, express.json(), async (req, 
   }
 });
 
+// One-off test for the Zoom plan (23 Oct 2026): can an existing recurring
+// meeting become "recurring, no fixed time" (type 3) and keep its ID and
+// join link? body: { meetingId, apply: true }. Without apply it only reads.
+// Run it on the "Sync test" meeting first, never on a student's meeting.
+app.post('/api/zoom/type3-test', requireAdmin, express.json(), async (req, res) => {
+  try {
+    const b = req.body || {};
+    const id = String(b.meetingId || '').replace(/\D/g, '');
+    if (!id) return res.status(400).json({ error: 'meetingId needed' });
+    const pick = m => ({ id: m.id, topic: m.topic, type: m.type, join_url: m.join_url, has_password: !!m.password, timezone: m.timezone, recurrence: m.recurrence || null, occurrences: (m.occurrences || []).length });
+    const before = await zoom.zoomApi('GET', '/meetings/' + id);
+    if (!before.ok) return res.status(before.status || 500).json({ step: 'read', error: before.error });
+    if (!b.apply) return res.json({ before: pick(before.data) });
+    const r = await zoom.zoomApi('PATCH', '/meetings/' + id, { type: 3 });
+    if (!r.ok) return res.status(r.status || 500).json({ step: 'patch to type 3', error: r.error, before: pick(before.data) });
+    const after = await zoom.zoomApi('GET', '/meetings/' + id);
+    if (!after.ok) return res.status(after.status || 500).json({ step: 'read after', error: after.error });
+    const A = pick(before.data), B = pick(after.data);
+    res.json({ ok: true, same_id: String(A.id) === String(B.id), same_link: A.join_url === B.join_url, before: A, after: B });
+  } catch (e) {
+    console.error('type3-test error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── RAZORPAY WEBHOOK ──
 app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
