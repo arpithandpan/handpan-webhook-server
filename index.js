@@ -112,7 +112,13 @@ const workshopMessages = require('./workshop-messages');
 workshopMessages.init(supabase, { whatsapp });
 const studentPortal = require('./student-portal');
 studentPortal.init(supabase, { whatsapp, trialBooking });
-zoom.setTrialHook(trialBooking.markAttended);
+// A booked trial ended: mark it attended, then (if they stayed 10+ min) ask
+// Arpit with one push whether to send the weekly classes link.
+zoom.setTrialHook(async (meetingId, minutes) => {
+  const ok = await trialBooking.markAttended(meetingId, minutes);
+  if (ok) enrolment.onTrialAttended(meetingId, minutes).catch(() => {});
+  return ok;
+});
 const push = require('./push-service');
 push.init(supabase);
 const agent = require('./agent-service');
@@ -1426,6 +1432,7 @@ app.get('/api/zoom/status', (req, res) => res.json(zoom.status()));
 app.get('/api/trial/slots', (req, res) => trialBooking.slotsHandler(req, res));
 app.post('/api/trial/book', express.json({ limit: '20kb' }), (req, res) => trialBooking.bookHandler(req, res));
 // Weekly classes self-enrolment (person's page arpitpandey.com/enroll/<token>)
+app.post('/api/enrol/start', express.json({ limit: '8kb' }), (req, res) => enrolment.startHandler(req, res));
 app.get('/api/enrol/:token', (req, res) => enrolment.getHandler(req, res));
 app.post('/api/enrol/:token/request', express.json({ limit: '8kb' }), (req, res) => enrolment.requestHandler(req, res));
 app.post('/api/enrol/:token/accept', express.json({ limit: '8kb' }), (req, res) => enrolment.acceptHandler(req, res));
@@ -1433,6 +1440,7 @@ app.post('/api/enrol/:token/plan', express.json({ limit: '8kb' }), (req, res) =>
 app.post('/api/enrol/:token/release', express.json({ limit: '8kb' }), (req, res) => enrolment.releaseHandler(req, res));
 // Admin side (dashboard)
 app.get('/api/admin/enrol', requireAdmin, (req, res) => enrolment.listHandler(req, res));
+app.post('/api/admin/enrol/followup/:trialId/dismiss', requireAdmin, (req, res) => enrolment.dismissFollowupHandler(req, res));
 app.post('/api/admin/enrol/invite', requireAdmin, express.json({ limit: '8kb' }), (req, res) => enrolment.inviteHandler(req, res));
 app.post('/api/admin/enrol/:id/approve', requireAdmin, express.json({ limit: '8kb' }), (req, res) => enrolment.approveHandler(req, res));
 app.post('/api/admin/enrol/:id/offer', requireAdmin, express.json({ limit: '8kb' }), (req, res) => enrolment.offerHandler(req, res));
