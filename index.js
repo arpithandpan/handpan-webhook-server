@@ -119,6 +119,8 @@ const agent = require('./agent-service');
 agent.init(supabase, { whatsapp, studentPortal, trialBooking, onDraft: push.onDraft });
 whatsapp.setHooks({ onIncoming: agent.onIncoming, onManualReply: agent.onManualReply, onPush: push.onWhatsApp });
 notifyMailer.setPushHook(push.onNotification);
+const backup = require('./backup-service');
+backup.init(supabase);
 const calendarInvites = require('./calendar-invites');
 calendarInvites.init(supabase, { notify: async (type, message) => { await supabase.from('notifications').insert({ type, message, read: false }); } });
 
@@ -1439,6 +1441,8 @@ app.post('/api/wa/reopen', requireAdmin, express.json({ limit: '8kb' }), (req, r
 app.get('/api/calendar/status', requireAdmin, (req, res) => calendarInvites.statusHandler(req, res));
 app.get('/api/calendar/preview', requireAdmin, (req, res) => calendarInvites.previewHandler(req, res));
 app.post('/api/calendar/run', requireAdmin, (req, res) => calendarInvites.runHandler(req, res));
+// Weekly data backup (Sundays 9 AM IST); this sends one now
+app.post('/api/backup/run', requireAdmin, (req, res) => backup.runHandler(req, res));
 app.get('/api/push/key', requireAdmin, (req, res) => push.keyHandler(req, res));
 app.post('/api/push/subscribe', requireAdmin, express.json({ limit: '16kb' }), (req, res) => push.subscribeHandler(req, res));
 app.post('/api/push/prefs', requireAdmin, express.json({ limit: '8kb' }), (req, res) => push.prefsHandler(req, res));
@@ -2129,4 +2133,5 @@ app.listen(PORT, () => {
   workshopMessages.startWorker();
   studentPortal.startWorker();
   calendarInvites.startWorker();
+  backup.startWorker();
 });
