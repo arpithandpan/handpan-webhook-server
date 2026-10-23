@@ -254,12 +254,12 @@ function liveEntry(o) {
   return m;
 }
 function liveRecalc(m, at) {
-  const both = m.hostIn && m.people.size > 0;
+  const both = m.hostIn && [...m.people.values()].some(p => p.n > 0);
   if (both && !m.bothSince) m.bothSince = at;
 }
 function liveEvent(body) {
   const ev = body.event || '';
-  if (!/^meeting\.(started|ended|participant_joined|participant_left)$/.test(ev)) return;
+  if (!/^meeting\.(started|ended|participant_joined|participant_left|participant_jbh_waiting)$/.test(ev)) return;
   const o = (body.payload && body.payload.object) || {};
   if (!o.id) return;
   const now = new Date(body.event_ts || Date.now()).toISOString();
@@ -267,6 +267,17 @@ function liveEvent(body) {
   if (ev === 'meeting.started') { m.startedAt = o.start_time || now; m.endedAt = null; return; }
   if (ev === 'meeting.ended') { m.endedAt = o.end_time || now; m.hostIn = false; m.people.clear(); return; }
   const pt = o.participant || {};
+  // Waiting in the lobby because the host has not started the meeting yet.
+  // The person shows as "waiting" but holds no device count, so the real
+  // join (when the host starts) and the leave still pair up.
+  if (ev === 'meeting.participant_jbh_waiting') {
+    if (isHostish(pt, o.host_id)) return;
+    const k = normEmail(pt.email) || normName(pt.user_name) || String(pt.user_id || pt.participant_uuid || '');
+    if (!k || m.people.has(k)) return;
+    m.people.set(k, { name: String(pt.user_name || pt.email || 'Someone').trim(), since: pt.date_time || now, n: 0, lobby: true });
+    m.endedAt = null;
+    return;
+  }
   if (!m.startedAt) m.startedAt = now;
   m.endedAt = null;
   const at = (ev === 'meeting.participant_joined' ? pt.join_time : pt.leave_time) || now;
@@ -281,7 +292,8 @@ function liveEvent(body) {
   if (!key) return;
   const cur = m.people.get(key) || { name: String(pt.user_name || pt.email || 'Someone').trim(), since: at, n: 0 };
   if (ev === 'meeting.participant_joined') {
-    cur.n += 1; if (cur.n === 1) cur.since = at;
+    cur.n += 1; if (cur.n === 1 && !cur.lobby) cur.since = at;
+    cur.lobby = false;
     m.people.set(key, cur);
     liveRecalc(m, at);
   } else {
@@ -298,7 +310,7 @@ function liveList() {
     out.push({
       meetingId: m.meetingId, topic: m.topic, startedAt: m.startedAt, endedAt: m.endedAt,
       hostIn: m.hostIn, bothSince: m.bothSince,
-      people: [...m.people.values()].map(p => ({ name: p.name, since: p.since }))
+      people: [...m.people.values()].map(p => ({ name: p.name, since: p.since, lobby: !!p.lobby }))
     });
   }
   return out;
