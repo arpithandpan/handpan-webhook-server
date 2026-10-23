@@ -260,7 +260,7 @@ async function requestHandler(req, res) {
     await update(row.id, fields);
     const r2 = { ...row, ...fields };
     const changed = before.status !== 'invited';
-    const msg = (changed ? '🔁 Weekly class request changed: ' : '🔴 New weekly class request: ') + row.full_name + ' · ' + DAYS[r2.slot_weekday].slice(0, 3) + ' ' + time12(r2.slot_time) + ' IST' +
+    const msg = (changed ? '🔁 Weekly class request changed: ' : '🔴 New weekly class request' + (row.source === 'site' ? ' (from the website, no trial)' : '') + ': ') + row.full_name + ' · ' + DAYS[r2.slot_weekday].slice(0, 3) + ' ' + time12(r2.slot_time) + ' IST' +
       (tz !== IST ? ' (' + time12(partsIn(start, tz).hhmm) + ' ' + tzName(tz) + ')' : '') + ' · ' + p.label + ' ' + money(p.amount, price) + '. Approve it in Today.';
     await notify('trial', msg);
     pushArpit('🗓️ ' + firstName(row.full_name) + ' wants weekly classes', DAYS[r2.slot_weekday].slice(0, 3) + ' ' + time12(r2.slot_time) + ' IST · ' + p.label, 'enrol-' + row.id);
@@ -496,6 +496,7 @@ async function invite({ trialId, name, phone, email, tz, country, send }) {
 }
 async function finishInvite(row, send, reused) {
   const link = linkFor(row);
+  if (row.trial_id) { try { await supabase.from('trials').update({ followup: 'sent' }).eq('id', row.trial_id); } catch (e) {} }
   let wa = null;
   if (send !== false && templateOn() && whatsapp && row.phone) {
     wa = await whatsapp.sendTemplate(row.phone, TEMPLATE, [firstName(row.full_name)], { buttonUrlParam: row.token });
@@ -521,9 +522,10 @@ async function listHandler(req, res) {
         slotIst: DAYS[r.slot_weekday] ? DAYS[r.slot_weekday].slice(0, 3) + ' ' + time12(r.slot_time) + ' IST' : '',
         slotLocal: t && tz !== IST ? time12(partsIn(t, tz).hhmm) + ' ' + tzName(tz) : null,
         plan: r.plan, classes: r.classes, amount: money(r.amount || 0, price), trialId: r.trial_id,
-        requestedAt: r.requested_at, approvedAt: r.approved_at, payBy: r.pay_by, feeRequestId: r.fee_request_id, studentId: r.student_id, offerNote: r.offer_note
+        requestedAt: r.requested_at, approvedAt: r.approved_at, payBy: r.pay_by, feeRequestId: r.fee_request_id, studentId: r.student_id, offerNote: r.offer_note,
+        source: r.source || null, hasHandpan: r.has_handpan || null, experience: r.experience || null
       };
-    }) });
+    }), followups: await followups() });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 }
 async function approveHandler(req, res) {
@@ -568,6 +570,80 @@ async function declineHandler(req, res) {
       'Hi ' + firstName(row.full_name) + ', thank you for your request. I am not able to take on this weekly class right now. Nothing has been charged.');
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+}
+
+// ── AFTER A TRIAL: "send the weekly link?" ──
+// Zoom says a booked trial ended and the person stayed 10+ min → one push to
+// Arpit and a row in Today → Needs you for 24 h. Nothing is sent to the person
+// until Arpit taps "Send weekly link". Needs trials.attended_at + trials.followup
+// (enrol2.sql); without them this quietly does nothing.
+const FOLLOWUP_MIN = 10, FOLLOWUP_WINDOW = 24 * HOUR;
+async function onTrialAttended(meetingId, minutes) {
+  try {
+    if (!meetingId || Number(minutes) < FOLLOWUP_MIN) return;
+    const { data: t, error } = await supabase.from('trials').select('id, full_name, has_handpan, followup').eq('zoom_meeting_id', String(meetingId)).maybeSingle();
+    if (error || !t || t.followup) return;
+    const { data: open } = await supabase.from('enrol_requests').select('id').eq('trial_id', t.id).in('status', OPEN).limit(1);
+    if (open && open.length) return;
+    const { error: e2 } = await supabase.from('trials').update({ followup: 'due', attended_at: new Date().toISOString() }).eq('id', t.id).is('followup', null);
+    if (e2) { console.error('trial follow-up:', e2.message); return; }
+    pushArpit(firstName(t.full_name) + "'s trial is done", 'Stayed ' + Math.round(minutes) + ' min. Send the weekly classes link?', 'trialdone-' + t.id);
+  } catch (e) { console.error('trial follow-up failed:', e.message); }
+}
+async function followups() {
+  try {
+    const since = new Date(Date.now() - FOLLOWUP_WINDOW).toISOString();
+    const { data, error } = await supabase.from('trials').select('id, full_name, has_handpan, attended_min, attended_at, start_at').eq('followup', 'due').gte('attended_at', since).order('attended_at', { ascending: true });
+    if (error) return [];
+    return (data || []).map(t => ({ trialId: t.id, name: t.full_name, minutes: t.attended_min, hasHandpan: t.has_handpan || null, at: t.attended_at, startAt: t.start_at }));
+  } catch (e) { return []; }
+}
+async function dismissFollowupHandler(req, res) {
+  try {
+    const { error } = await supabase.from('trials').update({ followup: 'dismissed' }).eq('id', req.params.trialId);
+    if (error) throw new Error(error.message);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+}
+
+// ── DIRECT FROM THE WEBSITE (no trial) ──
+// classes page → /enroll/new → "About you" → this creates the request row and
+// hands back its token; the rest is the normal pick → approve → pay flow.
+const HANDPAN_ANS = { yes: 'yes', not_yet: 'not_yet' };
+const EXPERIENCE_ANS = { never: 'never', little: 'a_little', lot: 'a_lot', a_little: 'a_little', a_lot: 'a_lot' };
+async function startHandler(req, res) {
+  try {
+    if (limited('s:' + (req.ip || ''))) return res.status(429).json({ ok: false, error: 'Too many tries. Please wait a few minutes.' });
+    const b = req.body || {};
+    if (b.website) return res.json({ ok: false, error: 'Please try again.' });            // honeypot
+    const name = clean(b.name, 80);
+    const email = clean(b.email, 120).toLowerCase();
+    let dial = String(b.dial || '').replace(/\D/g, '').slice(0, 4);
+    let phone = String(b.phone || '').replace(/\D/g, '');
+    if (!name || name.length < 2) return res.status(400).json({ ok: false, error: 'Please enter your name.' });
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ ok: false, error: 'Please enter a valid email.' });
+    if (!dial && phone.length === 10) dial = '91';
+    if (dial && !phone.startsWith(dial)) phone = dial + phone;
+    if (phone.length < 9 || phone.length > 15) return res.status(400).json({ ok: false, error: 'Please enter your WhatsApp number with the country code.' });
+    const hasHandpan = HANDPAN_ANS[b.hasHandpan] || null;
+    const experience = EXPERIENCE_ANS[b.experience] || null;
+    if (!hasHandpan || !experience) return res.status(400).json({ ok: false, error: 'Please answer both questions.' });
+    const tz = b.tz && validTz(b.tz) ? b.tz : null;
+    // Same person coming back (same phone AND email, still open) → same request.
+    const { data: open } = await supabase.from('enrol_requests').select('*').in('status', OPEN).eq('source', 'site').ilike('phone', '%' + phone.slice(-10)).limit(5);
+    const mine = (open || []).find(r => (r.email || '') === email);
+    if (mine) {
+      await update(mine.id, { full_name: name, has_handpan: hasHandpan, experience, ...(tz && mine.status === 'invited' ? { tz } : {}) });
+      return res.json({ ok: true, token: mine.token, reused: true });
+    }
+    const token = crypto.randomBytes(16).toString('hex');
+    const { error } = await supabase.from('enrol_requests').insert({
+      token, status: 'invited', source: 'site', full_name: name, phone, phone_dial: dial || null, email, tz,
+      country: clean(b.country, 60) || null, has_handpan: hasHandpan, experience, invited_at: new Date().toISOString()
+    });
+    if (error) throw new Error(error.message);
+    res.json({ ok: true, token });
+  } catch (e) { console.error('enrol start error:', e.message); res.status(500).json({ ok: false, error: 'Could not continue right now. Please try again in a minute.' }); }
 }
 
 // ── WORKER ──
@@ -629,6 +705,6 @@ function startWorker() {
 }
 
 module.exports = {
-  init, startWorker, getHandler, requestHandler, acceptHandler, planHandler, releaseHandler, inviteHandler, listHandler, approveHandler, offerHandler, declineHandler, onFeePaid, invite, weeklySlots,
+  init, startWorker, getHandler, requestHandler, startHandler, onTrialAttended, dismissFollowupHandler, acceptHandler, planHandler, releaseHandler, inviteHandler, listHandler, approveHandler, offerHandler, declineHandler, onFeePaid, invite, weeklySlots,
   _test: { priceFor, plansFor, slotFrom, nextOccurrence, partsIn, tick }
 };
