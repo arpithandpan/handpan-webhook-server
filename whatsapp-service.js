@@ -693,7 +693,7 @@ async function lastIncomingAt(phone) {
   return isNaN(t) ? 0 : t;
 }
 
-async function sendText(toPhone, text) {
+async function sendText(toPhone, text, replyTo) {
   if (!configured()) return { ok: false, error: 'WhatsApp prod env vars missing' };
   const to = normalizePhone(toPhone);
   if (!to) return { ok: false, error: 'No usable phone number' };
@@ -701,7 +701,8 @@ async function sendText(toPhone, text) {
     const res = await fetch(`${GRAPH_BASE}/${process.env.WHATSAPP_PROD_PHONE_ID}/messages`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${process.env.WHATSAPP_PROD_TOKEN}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messaging_product: 'whatsapp', recipient_type: 'individual', to, type: 'text', text: { preview_url: true, body: text } })
+      body: JSON.stringify(Object.assign({ messaging_product: 'whatsapp', recipient_type: 'individual', to, type: 'text', text: { preview_url: true, body: text } },
+        replyTo ? { context: { message_id: String(replyTo) } } : {}))
     });
     const data = await res.json();
     if (!res.ok) {
@@ -764,7 +765,10 @@ async function saveIncomingMedia(waId, mediaId, name) {
   try {
     const m = await fetchMetaMedia(mediaId);
     const info = await storeMedia(waId, m.buf, m.mime, name);
-    await supabase.from('wa_messages').update({ params: { media: info } }).eq('wa_id', waId);
+    // Keep anything already in params (e.g. reply_to) next to the media info.
+    const { data: cur } = await supabase.from('wa_messages').select('params').eq('wa_id', waId).maybeSingle();
+    const prev = cur && cur.params && !Array.isArray(cur.params) ? cur.params : {};
+    await supabase.from('wa_messages').update({ params: Object.assign({}, prev, { media: info }) }).eq('wa_id', waId);
     return info;
   } catch (e) {
     console.error('WA media save failed (' + waId + '):', e.message);
@@ -863,7 +867,7 @@ async function sendMediaHandler(req, res) {
 // Free-text reply inside the 24-hour window, logged like every other message.
 // Used by the reply box and by the agent's "Send draft".
 // → { ok, row } or { ok: false, status, error }
-async function sendReply(phoneRaw, textRaw) {
+async function sendReply(phoneRaw, textRaw, replyTo) {
   const phone = String(phoneRaw || '').replace(/\D/g, '');
   const text = String(textRaw || '').replace(/\r\n/g, '\n').trim();
   if (!phone) return { ok: false, status: 400, error: 'No phone number' };
@@ -871,10 +875,11 @@ async function sendReply(phoneRaw, textRaw) {
   if (text.length > 4000) return { ok: false, status: 400, error: 'Message is too long (max 4,000 characters)' };
   const last = await lastIncomingAt(phone);
   if (!last || Date.now() - last > WINDOW_MS) return { ok: false, status: 409, error: 'window_closed' };
-  const r = await sendText(phone, text);
+  const r = await sendText(phone, text, replyTo);
   if (!r.ok) return { ok: false, status: r.error === 'window_closed' ? 409 : 502, error: r.error };
   const row = {
     direction: 'out', phone: r.to, wa_id: r.id, type: 'text', body: text,
+    params: replyTo ? { reply_to: String(replyTo) } : null,
     status: 'sent', status_at: new Date().toISOString(), created_at: new Date().toISOString()
   };
   await logMessage(row);
@@ -885,13 +890,46 @@ async function sendReply(phoneRaw, textRaw) {
 // draftId: the agent draft Arpit edited before sending, if any.
 async function replyHandler(req, res) {
   try {
-    const r = await sendReply(req.body?.phone, req.body?.text);
+    const r = await sendReply(req.body?.phone, req.body?.text, req.body?.replyTo || null);
     if (!r.ok) return res.status(r.status).json({ error: r.error });
     if (hooks.onManualReply) hooks.onManualReply(r.row.phone, req.body?.draftId || null);
     res.json({ ok: true, row: r.row });
   } catch (e) {
     console.error('WA reply handler error:', e.message);
     res.status(500).json({ error: 'Could not send right now' });
+  }
+}
+
+// POST /api/wa/react  { phone, waId, emoji }   (admin only)
+// Puts an emoji reaction on one of their messages ('' removes it). Works only
+// inside the 24-hour window, like any free-form message.
+async function reactHandler(req, res) {
+  try {
+    if (!configured()) return res.status(503).json({ error: 'WhatsApp is not configured' });
+    const phone = String(req.body?.phone || '').replace(/\D/g, '');
+    const waId = String(req.body?.waId || '');
+    const emoji = String(req.body?.emoji || '').slice(0, 8);
+    if (!phone || !waId) return res.status(400).json({ error: 'Missing message' });
+    const last = await lastIncomingAt(phone);
+    if (!last || Date.now() - last > WINDOW_MS) return res.status(409).json({ error: 'window_closed' });
+    const to = normalizePhone(phone);
+    const r = await fetch(`${GRAPH_BASE}/${process.env.WHATSAPP_PROD_PHONE_ID}/messages`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${process.env.WHATSAPP_PROD_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messaging_product: 'whatsapp', recipient_type: 'individual', to, type: 'reaction', reaction: { message_id: waId, emoji } })
+    });
+    const j = await r.json();
+    if (!r.ok) return res.status(j?.error?.code === 131047 ? 409 : 502).json({ error: j?.error?.code === 131047 ? 'window_closed' : (j?.error?.message || 'Could not react') });
+    const row = {
+      direction: 'out', phone: to, wa_id: j?.messages?.[0]?.id || null, type: 'reaction',
+      reaction_to: waId, emoji, body: null,
+      status: 'sent', status_at: new Date().toISOString(), created_at: new Date().toISOString(), read_at: new Date().toISOString()
+    };
+    await logMessage(row);
+    res.json({ ok: true, row });
+  } catch (e) {
+    console.error('WA react error:', e.message);
+    res.status(500).json({ error: 'Could not react right now' });
   }
 }
 
@@ -982,6 +1020,7 @@ async function incomingHandler(req, res) {
               reaction_to: isReaction ? (msg.reaction?.message_id || null) : null,
               emoji: isReaction ? (msg.reaction?.emoji || '') : null,
               media_id: media?.id || null,
+              params: msg.context?.id && !isReaction ? { reply_to: msg.context.id } : null,
               created_at: msg.timestamp ? new Date(Number(msg.timestamp) * 1000).toISOString() : new Date().toISOString(),
               // A reaction needs no attention, so it never counts as unread.
               read_at: isReaction ? new Date().toISOString() : null
@@ -1029,4 +1068,4 @@ function startWorker() {
   timer = setInterval(tick, TICK_MS);
 }
 
-module.exports = { init, setHooks, sendReply, status, startWorker, processPending, sendTemplate, normalizePhone, verifyWebhook, incomingHandler, replyHandler, replyTemplateStatus, reopenHandler, mediaHandler, sendMediaHandler, _test: { planScheduleOccurrences, zonedToUtc, tzOffsetMin } };
+module.exports = { init, setHooks, sendReply, reactHandler, status, startWorker, processPending, sendTemplate, normalizePhone, verifyWebhook, incomingHandler, replyHandler, replyTemplateStatus, reopenHandler, mediaHandler, sendMediaHandler, _test: { planScheduleOccurrences, zonedToUtc, tzOffsetMin } };
