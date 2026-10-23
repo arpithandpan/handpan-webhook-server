@@ -18,6 +18,7 @@ ONLINE CLASSES (main service)
 - To learn online the student needs their own handpan.
 - Every new student starts with a FREE trial class (45 minutes, on Zoom). Book it here: https://arpitpandey.com/pages/trial . They pick a time, then get the Zoom link by email and WhatsApp. No payment is needed to book.
 - Trial times are Monday to Friday, mornings 6–9 AM IST and evenings 7 PM–1 AM IST. The booking page shows the times in the visitor's own time zone.
+- Classes run Monday to Friday only. Weekends (Saturday and Sunday) are not available for new classes or trials. If someone asks for a weekend slot, kindly say weekends aren't available and offer weekday mornings or evenings instead (for students outside India, weekday evenings IST are often their weekend morning or weekday morning). Don't mention that some existing students still have weekend classes.
 - Price: ₹1,500 per class in India. Outside India: $18 per class (Canada: C$25 per class).
 - Students pay monthly (4 classes) or quarterly (12 classes, 10% off: ₹16,200 or $194). There is no pay-per-class option.
 - Payment is always through a payment link Arpit sends (UPI, cards, net banking, international cards). An invoice comes by email after paying.

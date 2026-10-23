@@ -44,7 +44,8 @@ function channelFor(n) {
     || /payment failed/i.test(msg)             // student tried to pay, failed
     || /not linked to a student/i.test(msg)    // zoom review needed
     || /joined only \d+ min/i.test(msg)       // short Zoom attendance, class not counted
-    || /WhatsApp reply to/i.test(msg)          // student replied on the studio number
+    // WhatsApp replies are no longer sent to the Alerts WhatsApp: the Studio
+    // app push (push-service.js) pings the phone the moment they arrive.
     || /Upcoming class/i.test(msg)             // Arpit's own class heads-up
     || /New trial booked/i.test(msg)           // someone booked on the trial page
     || /Zoom meeting could not be created/i.test(msg)   // trial booked, link must go by hand
