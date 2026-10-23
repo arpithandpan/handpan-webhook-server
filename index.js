@@ -1430,6 +1430,7 @@ app.post('/api/webhooks/whatsapp', express.json(), (req, res) => whatsapp.incomi
 // Replies from the dashboard's WhatsApp section (studio number).
 app.post('/api/wa/reply', requireAdmin, express.json({ limit: '32kb' }), (req, res) => whatsapp.replyHandler(req, res));
 app.get('/api/wa/reply-template', requireAdmin, (req, res) => whatsapp.replyTemplateStatus(req, res));
+app.post('/api/wa/react', requireAdmin, express.json({ limit: '8kb' }), (req, res) => whatsapp.reactHandler(req, res));
 app.post('/api/wa/reopen', requireAdmin, express.json({ limit: '8kb' }), (req, res) => whatsapp.reopenHandler(req, res));
 // Push notifications for the Studio app (push-service.js)
 app.get('/api/push/key', requireAdmin, (req, res) => push.keyHandler(req, res));
