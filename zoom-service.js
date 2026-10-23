@@ -194,6 +194,9 @@ async function webhookHandler(req, res) {
 
     console.log('Zoom event:', body.event);
 
+    // Live state for the dashboard's Today card (who is in the room right now).
+    try { liveEvent(body); } catch (e) { console.warn('zoom live state:', e.message); }
+
     if (body.event === 'meeting.ended') {
       const o = (body.payload && body.payload.object) || {};
       if (!o.uuid) return res.status(200).json({ received: true, skipped: 'no uuid' });
@@ -221,6 +224,87 @@ async function webhookHandler(req, res) {
     console.error('Zoom webhook error:', err);
     return res.status(500).json({ error: 'Internal server error' });
   }
+}
+
+// ── 1b. LIVE STATE ──
+// Zoom tells us when a meeting starts, when people join and leave, and when
+// it ends. We keep that in memory (one small entry per meeting) so the Today
+// card can say "Ananya is waiting" or "Live · 23 min". A restart only loses
+// the picture for meetings already running; the card then falls back to the
+// clock, which is what it did before.
+const LIVE = new Map();              // meeting id → state
+const LIVE_KEEP_MS = 30 * 60 * 1000; // ended meetings stay 30 min for "Class done"
+
+function isHostish(pt, hostId) {
+  if (!pt) return false;
+  if (hostId && pt.id && pt.id === hostId) return true;
+  if (pt.email && IGNORE_EMAILS.includes(normEmail(pt.email))) return true;
+  const nn = normName(pt.user_name);
+  return !!(nn && IGNORE_NAMES.includes(nn));
+}
+function liveEntry(o) {
+  const id = String(o.id || '');
+  let m = LIVE.get(id);
+  if (!m || (o.uuid && m.uuid && m.uuid !== o.uuid && m.endedAt)) {
+    m = { meetingId: id, uuid: o.uuid || null, topic: o.topic || '', startedAt: null, endedAt: null, hostIn: false, people: new Map(), bothSince: null };
+    LIVE.set(id, m);
+  }
+  if (o.uuid) m.uuid = o.uuid;
+  if (o.topic) m.topic = o.topic;
+  return m;
+}
+function liveRecalc(m, at) {
+  const both = m.hostIn && m.people.size > 0;
+  if (both && !m.bothSince) m.bothSince = at;
+}
+function liveEvent(body) {
+  const ev = body.event || '';
+  if (!/^meeting\.(started|ended|participant_joined|participant_left)$/.test(ev)) return;
+  const o = (body.payload && body.payload.object) || {};
+  if (!o.id) return;
+  const now = new Date(body.event_ts || Date.now()).toISOString();
+  const m = liveEntry(o);
+  if (ev === 'meeting.started') { m.startedAt = o.start_time || now; m.endedAt = null; return; }
+  if (ev === 'meeting.ended') { m.endedAt = o.end_time || now; m.hostIn = false; m.people.clear(); return; }
+  const pt = o.participant || {};
+  if (!m.startedAt) m.startedAt = now;
+  m.endedAt = null;
+  const at = (ev === 'meeting.participant_joined' ? pt.join_time : pt.leave_time) || now;
+  if (isHostish(pt, o.host_id)) {
+    m.hostIn = ev === 'meeting.participant_joined';
+    if (m.hostIn) liveRecalc(m, at);
+    return;
+  }
+  // One person can join on two devices or rejoin, so key by name/email, and
+  // count the devices: they only leave when the last one does.
+  const key = normEmail(pt.email) || normName(pt.user_name) || String(pt.user_id || pt.participant_uuid || '');
+  if (!key) return;
+  const cur = m.people.get(key) || { name: String(pt.user_name || pt.email || 'Someone').trim(), since: at, n: 0 };
+  if (ev === 'meeting.participant_joined') {
+    cur.n += 1; if (cur.n === 1) cur.since = at;
+    m.people.set(key, cur);
+    liveRecalc(m, at);
+  } else {
+    cur.n -= 1;
+    if (cur.n <= 0) m.people.delete(key); else m.people.set(key, cur);
+  }
+}
+function liveList() {
+  const cut = Date.now() - LIVE_KEEP_MS;
+  const out = [];
+  for (const [id, m] of LIVE) {
+    if (m.endedAt && new Date(m.endedAt).getTime() < cut) { LIVE.delete(id); continue; }
+    if (!m.endedAt && m.startedAt && Date.now() - new Date(m.startedAt).getTime() > 6 * 3600e3) { LIVE.delete(id); continue; }
+    out.push({
+      meetingId: m.meetingId, topic: m.topic, startedAt: m.startedAt, endedAt: m.endedAt,
+      hostIn: m.hostIn, bothSince: m.bothSince,
+      people: [...m.people.values()].map(p => ({ name: p.name, since: p.since }))
+    });
+  }
+  return out;
+}
+function liveHandler(req, res) {
+  res.json({ ok: true, now: new Date().toISOString(), meetings: liveList() });
 }
 
 // ── 2. ZOOM API ──
@@ -803,6 +887,6 @@ async function resolveUnmatched(id, studentId) {
 }
 
 module.exports = {
-  init, setTrialHook, zoomApi, webhookHandler, startWorker, processPending, resolveUnmatched, status, syncMeetings,
-  _test: { processMeeting, cleanParticipants, planMeeting, buildIndex, matchPerson, studentsInTopic, isTrialTopic, encodeUuid, istDate, normName, hmac, MIN_MINUTES, TRIAL_MIN_MINUTES }
+  init, setTrialHook, zoomApi, webhookHandler, liveHandler, startWorker, processPending, resolveUnmatched, status, syncMeetings,
+  _test: { liveEvent, liveList, LIVE, processMeeting, cleanParticipants, planMeeting, buildIndex, matchPerson, studentsInTopic, isTrialTopic, encodeUuid, istDate, normName, hmac, MIN_MINUTES, TRIAL_MIN_MINUTES }
 };
