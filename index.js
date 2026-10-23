@@ -113,9 +113,12 @@ workshopMessages.init(supabase, { whatsapp });
 const studentPortal = require('./student-portal');
 studentPortal.init(supabase, { whatsapp, trialBooking });
 zoom.setTrialHook(trialBooking.markAttended);
+const push = require('./push-service');
+push.init(supabase);
 const agent = require('./agent-service');
-agent.init(supabase, { whatsapp, studentPortal, trialBooking });
-whatsapp.setHooks({ onIncoming: agent.onIncoming, onManualReply: agent.onManualReply });
+agent.init(supabase, { whatsapp, studentPortal, trialBooking, onDraft: push.onDraft });
+whatsapp.setHooks({ onIncoming: agent.onIncoming, onManualReply: agent.onManualReply, onPush: push.onWhatsApp });
+notifyMailer.setPushHook(push.onNotification);
 
 // ── GENERAL PAYMENT PAGE ID ──
 const GENERAL_PAYMENT_PAGE_ID = 'pl_SvxuRdqY2rd7ge';
@@ -1428,6 +1431,12 @@ app.post('/api/webhooks/whatsapp', express.json(), (req, res) => whatsapp.incomi
 app.post('/api/wa/reply', requireAdmin, express.json({ limit: '32kb' }), (req, res) => whatsapp.replyHandler(req, res));
 app.get('/api/wa/reply-template', requireAdmin, (req, res) => whatsapp.replyTemplateStatus(req, res));
 app.post('/api/wa/reopen', requireAdmin, express.json({ limit: '8kb' }), (req, res) => whatsapp.reopenHandler(req, res));
+// Push notifications for the Studio app (push-service.js)
+app.get('/api/push/key', requireAdmin, (req, res) => push.keyHandler(req, res));
+app.post('/api/push/subscribe', requireAdmin, express.json({ limit: '16kb' }), (req, res) => push.subscribeHandler(req, res));
+app.post('/api/push/prefs', requireAdmin, express.json({ limit: '8kb' }), (req, res) => push.prefsHandler(req, res));
+app.post('/api/push/unsubscribe', requireAdmin, express.json({ limit: '8kb' }), (req, res) => push.unsubscribeHandler(req, res));
+app.post('/api/push/test', requireAdmin, (req, res) => push.testHandler(req, res));
 // WhatsApp agent drafts (agent-service.js)
 app.get('/api/agent/drafts', requireAdmin, (req, res) => agent.listHandler(req, res));
 app.post('/api/agent/drafts/:id/send', requireAdmin, express.json({ limit: '32kb' }), (req, res) => agent.sendHandler(req, res));

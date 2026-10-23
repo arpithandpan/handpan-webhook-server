@@ -31,7 +31,7 @@ const PRICE_IN = 2, PRICE_OUT = 10, PRICE_CACHE_READ = 0.10, PRICE_CACHE_WRITE =
 
 const CATEGORIES = ['trial', 'fees', 'payment', 'schedule', 'reschedule', 'zoom_link', 'workshop', 'performance', 'teaching', 'handpan_buying', 'greeting', 'complaint', 'other'];
 
-let supabase = null, whatsapp = null, studentPortal = null, trialBooking = null;
+let supabase = null, whatsapp = null, studentPortal = null, trialBooking = null, onDraftHook = null;
 const timers = {};          // phone → debounce timer
 const running = new Set();  // phones being drafted right now
 let sweepTimer = null;
@@ -41,6 +41,7 @@ function init(client, deps) {
   whatsapp = deps.whatsapp;
   studentPortal = deps.studentPortal;
   trialBooking = deps.trialBooking;
+  onDraftHook = deps.onDraft || null;
 }
 
 function enabled() {
@@ -296,6 +297,7 @@ async function draftFor(phone, opts) {
     const { data: saved, error: insErr } = await supabase.from('wa_drafts').insert(row).select().single();
     if (insErr) throw new Error('wa_drafts: ' + insErr.message);
     console.log(`Agent draft (${row.status}, ${row.category}${row.needs_arpit ? ', needs Arpit' : ''}) → ${phone} · $${row.cost_usd}`);
+    if (onDraftHook && saved && !opts.force) { try { onDraftHook(saved, live.name); } catch (e) {} }
     return { ok: true, draft: saved };
   } catch (e) {
     console.error('Agent draft error (' + phone + '):', e.message);

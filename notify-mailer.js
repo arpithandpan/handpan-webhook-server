@@ -29,7 +29,9 @@ const EVERY_MS = 2 * 60 * 1000;
 const MAX_ATTEMPTS = 5;
 
 let supabase = null;
+let pushHook = null;   // push-service onNotification, set from index.js
 function init(client) { supabase = client; }
+function setPushHook(fn) { pushHook = fn; }
 
 // ── ROUTING ──
 // 'urgent' notifications also go to WhatsApp. Everything goes to email.
@@ -135,6 +137,10 @@ async function processPending() {
     if (error) { console.error('notify-mailer query error:', error.message); return; }
 
     for (const n of data || []) {
+      // 0) Phone push for urgent rows, once (first time we see the row).
+      if (pushHook && !n.emailed && !(Number(n.email_attempts) > 0) && channelFor(n).whatsapp) {
+        try { pushHook(n); } catch (e) {}
+      }
       // 1) Email — untouched behaviour.
       if (!n.emailed) {
         try {
@@ -187,4 +193,4 @@ function startWorker() {
   setInterval(processPending, EVERY_MS);
 }
 
-module.exports = { init, startWorker, processPending, _test: { channelFor, subjectFor, whatsappText } };
+module.exports = { init, setPushHook, startWorker, processPending, _test: { channelFor, subjectFor, whatsappText } };

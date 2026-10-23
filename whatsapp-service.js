@@ -1002,6 +1002,7 @@ async function incomingHandler(req, res) {
             await notify('info', `💬 WhatsApp reply to Handpan with Arpit — ${who}: "${preview}"${String(text).length > 160 ? '…' : ''} Reply in the dashboard (WhatsApp page)`);
           }
           console.log('WA incoming:', who, '-', preview);
+          if (isStudio && hooks.onPush) { try { hooks.onPush(String(from || '').replace(/\D/g, ''), msg.type, { who, preview }); } catch (e) {} }
         }
       }
     }
