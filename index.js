@@ -119,6 +119,8 @@ const agent = require('./agent-service');
 agent.init(supabase, { whatsapp, studentPortal, trialBooking, onDraft: push.onDraft });
 whatsapp.setHooks({ onIncoming: agent.onIncoming, onManualReply: agent.onManualReply, onPush: push.onWhatsApp });
 notifyMailer.setPushHook(push.onNotification);
+const calendarInvites = require('./calendar-invites');
+calendarInvites.init(supabase, { notify: async (type, message) => { await supabase.from('notifications').insert({ type, message, read: false }); } });
 
 // ── GENERAL PAYMENT PAGE ID ──
 const GENERAL_PAYMENT_PAGE_ID = 'pl_SvxuRdqY2rd7ge';
@@ -1433,6 +1435,10 @@ app.get('/api/wa/reply-template', requireAdmin, (req, res) => whatsapp.replyTemp
 app.post('/api/wa/react', requireAdmin, express.json({ limit: '8kb' }), (req, res) => whatsapp.reactHandler(req, res));
 app.post('/api/wa/reopen', requireAdmin, express.json({ limit: '8kb' }), (req, res) => whatsapp.reopenHandler(req, res));
 // Push notifications for the Studio app (push-service.js)
+// Calendar invites for weekly classes (CALENDAR_INVITES = off | test | on)
+app.get('/api/calendar/status', requireAdmin, (req, res) => calendarInvites.statusHandler(req, res));
+app.get('/api/calendar/preview', requireAdmin, (req, res) => calendarInvites.previewHandler(req, res));
+app.post('/api/calendar/run', requireAdmin, (req, res) => calendarInvites.runHandler(req, res));
 app.get('/api/push/key', requireAdmin, (req, res) => push.keyHandler(req, res));
 app.post('/api/push/subscribe', requireAdmin, express.json({ limit: '16kb' }), (req, res) => push.subscribeHandler(req, res));
 app.post('/api/push/prefs', requireAdmin, express.json({ limit: '8kb' }), (req, res) => push.prefsHandler(req, res));
@@ -2122,4 +2128,5 @@ app.listen(PORT, () => {
   trialBooking.startWorker();
   workshopMessages.startWorker();
   studentPortal.startWorker();
+  calendarInvites.startWorker();
 });
