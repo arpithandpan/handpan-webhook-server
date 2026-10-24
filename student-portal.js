@@ -344,7 +344,7 @@ async function dataHandler(req, res) {
     if (!person) return res.status(404).json({ ok: false, code: 'bad_link', error: 'This link is not valid any more.' });
     supabase.from('portal_people').update({ last_seen_at: new Date().toISOString() }).eq('id', person.id).then(() => {}, () => {});
 
-    const out = { ok: true, name: firstName(person.name), whatsapp: '919019576583', classes: null, workshops: null, waitlist: null };
+    const out = { ok: true, name: firstName(person.name), whatsapp: '919380140907', classes: null, workshops: null, waitlist: null };
     let student = null;
     if (person.student_id) {
       const ctx = await loadStudent(person.student_id);
