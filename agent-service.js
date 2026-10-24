@@ -122,9 +122,13 @@ async function autoWindow(now) {
   return null;
 }
 // The draft itself must be a plain, sure, info-only answer.
-function isSafe(out) {
+// firstContact: nothing sent by hand or by the agent in this chat yet. Only
+// then may a performance enquiry get its first "please share the details" reply.
+function isSafe(out, firstContact) {
+  const cat = String(out && out.category).toLowerCase();
+  const catOk = SAFE_CATS.includes(cat) || (cat === 'performance' && firstContact);
   return !!(out && out.needs_reply && String(out.reply || '').trim() && !out.needs_arpit && out.safe_to_autosend &&
-    String(out.confidence).toLowerCase() === 'high' && SAFE_CATS.includes(String(out.category).toLowerCase()));
+    String(out.confidence).toLowerCase() === 'high' && catOk);
 }
 
 // ── TIME HELPERS ──
@@ -294,7 +298,7 @@ const SCHEMA = {
     needs_arpit: { type: 'boolean', description: 'true when Arpit must decide or act himself (see ALWAYS ARPIT\'S CALL).' },
     note_for_arpit: { type: 'string', description: 'One short line for Arpit: what they want and anything he must do. Empty if nothing.' },
     confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
-    safe_to_autosend: { type: 'boolean', description: 'true ONLY when the reply just gives facts fully covered by KNOWLEDGE or LIVE DATA (fees, timings, trial link, how classes work, their own next class or Zoom link, workshop dates), makes no promise or change, and would be fine to send without Arpit reading it first. false for anything else.' }
+    safe_to_autosend: { type: 'boolean', description: 'true ONLY when the reply just gives facts fully covered by KNOWLEDGE or LIVE DATA (fees, timings, trial link, how classes work, their own next class or Zoom link, workshop dates), or is the first reply to a performance enquiry that only asks for the event details; makes no promise, price or change; and would be fine to send without Arpit reading it first. false for anything else.' }
   },
   required: ['needs_reply', 'reply', 'category', 'needs_arpit', 'note_for_arpit', 'confidence', 'safe_to_autosend'],
   additionalProperties: false
@@ -393,7 +397,8 @@ async function draftFor(phone, opts) {
     };
     // Auto-send: a safe draft at one of the picked times goes out after wait_min,
     // unless Arpit sends, edits or throws it away first.
-    if (row.status === 'pending' && SET.mode === 'auto' && isSafe(out) && !opts.force) {
+    const firstContact = !rows.some(r => r.direction === 'out' && !r.template && r.type !== 'reaction');
+    if (row.status === 'pending' && SET.mode === 'auto' && isSafe(out, firstContact) && !opts.force) {
       // Arpit is talking to them himself: drafts only for pause_min after his last reply.
       const lastMine = rows.filter(r => r.direction === 'out' && !r.template && r.type !== 'reaction' && !(r.params && r.params.auto)).pop();
       const paused = lastMine && SET.pause_min > 0 && Date.now() - new Date(lastMine.created_at).getTime() < SET.pause_min * 60000;
@@ -590,7 +595,7 @@ async function testHandler(req, res) {
     const hist = '[' + fmt(Date.now()) + '] Them: ' + text;
     const { out } = await callClaude(live, hist);
     res.json({ ok: true, reply: String(out.reply || '').trim(), needs_reply: !!out.needs_reply, needs_arpit: !!out.needs_arpit,
-      note: String(out.note_for_arpit || '').trim(), category: out.category, safe: isSafe(out) });
+      note: String(out.note_for_arpit || '').trim(), category: out.category, safe: isSafe(out, true) });
   } catch (e) { res.status(500).json({ error: 'Test failed: ' + e.message }); }
 }
 
