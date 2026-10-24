@@ -13,7 +13,8 @@
 //
 // Settings (dashboard → More → WhatsApp agent, app_settings row 'agent'):
 //   on, mode ('draft' | 'auto'), when {weekend, night, blocked, inclass, always},
-//   night [fromMin, toMin] IST, wait_min, notes (extra facts Arpit types).
+//   night [fromMin, toMin] IST, wait_min, pause_min (after Arpit replies by
+//   hand, that chat gets drafts only for this long), notes (extra facts).
 //   In 'auto' mode a SAFE draft is sent by itself after wait_min, but only at
 //   the times picked in 'when'. Anything else stays a draft, as before.
 //
@@ -56,7 +57,7 @@ function init(client, deps) {
 const SET_DEFAULTS = {
   on: true, mode: 'draft',
   when: { weekend: true, night: true, blocked: true, inclass: true, always: false },
-  night: [23 * 60, 8 * 60], wait_min: 5, notes: ''
+  night: [23 * 60, 8 * 60], wait_min: 5, pause_min: 60, notes: ''
 };
 // Kinds of question the agent may answer on its own. Money problems, changes,
 // complaints, teaching and anything 'other' always wait for Arpit.
@@ -74,6 +75,8 @@ function cleanSettings(raw) {
   }
   const w = Number(raw.wait_min);
   if (Number.isInteger(w) && w >= 1 && w <= 60) s.wait_min = w;
+  const pm = Number(raw.pause_min);
+  if (Number.isInteger(pm) && pm >= 0 && pm <= 480) s.pause_min = pm;
   if (typeof raw.notes === 'string') s.notes = raw.notes.replace(/\r\n/g, '\n').slice(0, 4000);
   return s;
 }
@@ -391,7 +394,10 @@ async function draftFor(phone, opts) {
     // Auto-send: a safe draft at one of the picked times goes out after wait_min,
     // unless Arpit sends, edits or throws it away first.
     if (row.status === 'pending' && SET.mode === 'auto' && isSafe(out) && !opts.force) {
-      const why = await autoWindow(Date.now());
+      // Arpit is talking to them himself: drafts only for pause_min after his last reply.
+      const lastMine = rows.filter(r => r.direction === 'out' && !r.template && r.type !== 'reaction' && !(r.params && r.params.auto)).pop();
+      const paused = lastMine && SET.pause_min > 0 && Date.now() - new Date(lastMine.created_at).getTime() < SET.pause_min * 60000;
+      const why = paused ? null : await autoWindow(Date.now());
       if (why) row.auto_at = new Date(Date.now() + SET.wait_min * 60000).toISOString();
     }
     const { data: saved, error: insErr } = await supabase.from('wa_drafts').insert(row).select().single();
