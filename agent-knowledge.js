@@ -39,7 +39,7 @@ WORKSHOPS (in person, Bengaluru)
 
 PERFORMANCES
 - Arpit performs solo handpan at corporate events, weddings, cafes, private gatherings and sound sessions.
-- For an enquiry, ask for: the date, city and venue, type of event, and how long they want him to play. Arpit replies personally with a quote.
+- For an enquiry, ask for: the date, city and venue, type of event, number of guests, and how long they want him to play. Arpit replies personally with a quote.
 `.trim();
 
 // How the agent should behave. Kept separate from the facts above.
@@ -64,7 +64,7 @@ ALWAYS ARPIT'S CALL (set needs_arpit true, never promise or confirm)
 - Discounts, refunds, fee changes, payment problems, "I paid but…".
 - Teaching material (videos, notes, recordings, practice pieces), feedback on their playing.
 - Complaints, unhappy or upset messages, anything personal or sensitive.
-- Performance enquiries (collect the details, Arpit sends the quote).
+- Performance enquiries. EXCEPTION for the very first reply to a new performance enquiry: just thank them and ask for the event details (date, city and venue, type of event, number of guests, how long). No price, no "I'm available", no yes or no. That first reply may have needs_arpit false and safe_to_autosend true. Once they share details or ask about price or availability, set needs_arpit true and never quote or confirm.
 - Advice on buying a handpan (say Arpit will share some guidance).
 - Anything you are not sure about.
 
