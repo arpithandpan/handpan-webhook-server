@@ -67,7 +67,7 @@ const DEFAULTS = {
   booker_day: [420, 1380],                    // slot must sit 7 AM–11 PM in the booker's own time
   price_inr: 1500,
   price_usd: 18,
-  whatsapp: '919019576583',
+  whatsapp: '919380140907',
   blocked_dates: []                           // ['2026-12-25', …] IST dates with no slots at all
 };
 
@@ -576,7 +576,7 @@ function buildIcs(t, method) {
   const start = new Date(t.start_at);
   const end = new Date(start.getTime() + (t.duration_min || 45) * MIN);
   const desc = (t.join_url ? 'Join on Zoom: ' + t.join_url + '\n\n' : '') +
-    'Free handpan trial with Arpit Pandey.\nNeed to change it? WhatsApp Arpit: https://wa.me/919019576583';
+    'Free handpan trial with Arpit Pandey.\nNeed to change it? WhatsApp Arpit: https://wa.me/919380140907';
   return [
     'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Arpit Pandey//Handpan Trials//EN', 'CALSCALE:GREGORIAN',
     'METHOD:' + (method || 'REQUEST'),
