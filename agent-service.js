@@ -11,6 +11,12 @@
 //   4. A sweep every 10 minutes catches anything missed (e.g. a restart
 //      during the wait).
 //
+// Settings (dashboard → More → WhatsApp agent, app_settings row 'agent'):
+//   on, mode ('draft' | 'auto'), when {weekend, night, blocked, inclass, always},
+//   night [fromMin, toMin] IST, wait_min, notes (extra facts Arpit types).
+//   In 'auto' mode a SAFE draft is sent by itself after wait_min, but only at
+//   the times picked in 'when'. Anything else stays a draft, as before.
+//
 // Env:
 //   ANTHROPIC_API_KEY   – Claude API key (required; without it the agent is off)
 //   AGENT_MODE          – 'draft' (default) or 'off'
@@ -31,7 +37,7 @@ const PRICE_IN = 2, PRICE_OUT = 10, PRICE_CACHE_READ = 0.10, PRICE_CACHE_WRITE =
 
 const CATEGORIES = ['trial', 'fees', 'payment', 'schedule', 'reschedule', 'zoom_link', 'workshop', 'performance', 'teaching', 'handpan_buying', 'greeting', 'complaint', 'other'];
 
-let supabase = null, whatsapp = null, studentPortal = null, trialBooking = null, onDraftHook = null;
+let supabase = null, whatsapp = null, studentPortal = null, trialBooking = null, onDraftHook = null, liveZoom = null;
 const timers = {};          // phone → debounce timer
 const running = new Set();  // phones being drafted right now
 let sweepTimer = null;
@@ -42,13 +48,81 @@ function init(client, deps) {
   studentPortal = deps.studentPortal;
   trialBooking = deps.trialBooking;
   onDraftHook = deps.onDraft || null;
+  liveZoom = deps.liveZoom || null;
+  loadSettings().catch(() => {});
 }
 
-function enabled() {
+// ── SETTINGS ──
+const SET_DEFAULTS = {
+  on: true, mode: 'draft',
+  when: { weekend: true, night: true, blocked: true, inclass: true, always: false },
+  night: [23 * 60, 8 * 60], wait_min: 5, notes: ''
+};
+// Kinds of question the agent may answer on its own. Money problems, changes,
+// complaints, teaching and anything 'other' always wait for Arpit.
+const SAFE_CATS = ['trial', 'fees', 'schedule', 'zoom_link', 'workshop', 'greeting'];
+let SET = JSON.parse(JSON.stringify(SET_DEFAULTS)), _setAt = 0;
+function cleanSettings(raw) {
+  raw = raw && typeof raw === 'object' ? raw : {};
+  const s = JSON.parse(JSON.stringify(SET_DEFAULTS));
+  if (typeof raw.on === 'boolean') s.on = raw.on;
+  if (raw.mode === 'auto' || raw.mode === 'draft') s.mode = raw.mode;
+  if (raw.when && typeof raw.when === 'object') for (const k of Object.keys(s.when)) if (typeof raw.when[k] === 'boolean') s.when[k] = raw.when[k];
+  if (Array.isArray(raw.night) && raw.night.length === 2) {
+    const a = Number(raw.night[0]), b = Number(raw.night[1]);
+    if ([a, b].every(n => Number.isInteger(n) && n >= 0 && n < 1440) && a !== b) s.night = [a, b];
+  }
+  const w = Number(raw.wait_min);
+  if (Number.isInteger(w) && w >= 1 && w <= 60) s.wait_min = w;
+  if (typeof raw.notes === 'string') s.notes = raw.notes.replace(/\r\n/g, '\n').slice(0, 4000);
+  return s;
+}
+async function loadSettings(force) {
+  if (!supabase) return SET;
+  if (!force && Date.now() - _setAt < 60 * 1000) return SET;
+  try {
+    const { data } = await supabase.from('app_settings').select('value').eq('key', 'agent').maybeSingle();
+    SET = cleanSettings(data && data.value);
+    _setAt = Date.now();
+  } catch (e) { console.error('agent settings read failed:', e.message); }
+  return SET;
+}
+
+function keyOk() {
   const mode = String(process.env.AGENT_MODE || 'draft').trim().toLowerCase();
   return mode !== 'off' && !!String(process.env.ANTHROPIC_API_KEY || '').trim();
 }
-function status() { return { enabled: enabled(), mode: enabled() ? 'draft' : 'off', model: MODEL }; }
+function enabled() { return keyOk() && SET.on; }
+function status() { return { enabled: enabled(), mode: enabled() ? SET.mode : 'off', model: MODEL }; }
+
+// Is now one of the times Arpit picked for auto-send?
+async function autoWindow(now) {
+  const w = SET.when;
+  if (w.always) return 'always';
+  const ist = new Date(now + 330 * 60000);
+  const day = ist.getUTCDay(), min = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+  if (w.weekend && (day === 0 || day === 6)) return 'weekend';
+  if (w.night) {
+    const [a, b] = SET.night;
+    if (a > b ? (min >= a || min < b) : (min >= a && min < b)) return 'night';
+  }
+  if (w.inclass && liveZoom) {
+    try { if ((liveZoom() || []).some(m => m.hostIn && !m.endedAt)) return 'inclass'; } catch (e) {}
+  }
+  if (w.blocked) {
+    try {
+      const iso = new Date(now).toISOString();
+      const { data } = await supabase.from('blocks').select('id').is('removed_at', null).lte('start_at', iso).gt('end_at', iso).limit(1);
+      if (data && data.length) return 'blocked';
+    } catch (e) {}
+  }
+  return null;
+}
+// The draft itself must be a plain, sure, info-only answer.
+function isSafe(out) {
+  return !!(out && out.needs_reply && String(out.reply || '').trim() && !out.needs_arpit && out.safe_to_autosend &&
+    String(out.confidence).toLowerCase() === 'high' && SAFE_CATS.includes(String(out.category).toLowerCase()));
+}
 
 // ── TIME HELPERS ──
 function fmt(ms, tz, withDay) {
@@ -216,9 +290,10 @@ const SCHEMA = {
     category: { type: 'string', enum: CATEGORIES },
     needs_arpit: { type: 'boolean', description: 'true when Arpit must decide or act himself (see ALWAYS ARPIT\'S CALL).' },
     note_for_arpit: { type: 'string', description: 'One short line for Arpit: what they want and anything he must do. Empty if nothing.' },
-    confidence: { type: 'string', enum: ['high', 'medium', 'low'] }
+    confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
+    safe_to_autosend: { type: 'boolean', description: 'true ONLY when the reply just gives facts fully covered by KNOWLEDGE or LIVE DATA (fees, timings, trial link, how classes work, their own next class or Zoom link, workshop dates), makes no promise or change, and would be fine to send without Arpit reading it first. false for anything else.' }
   },
-  required: ['needs_reply', 'reply', 'category', 'needs_arpit', 'note_for_arpit', 'confidence'],
+  required: ['needs_reply', 'reply', 'category', 'needs_arpit', 'note_for_arpit', 'confidence', 'safe_to_autosend'],
   additionalProperties: false
 };
 
@@ -228,7 +303,7 @@ async function callClaude(live, history) {
     max_tokens: 3000,
     output_config: { effort: 'medium', format: { type: 'json_schema', schema: SCHEMA } },
     system: [
-      { type: 'text', text: RULES + '\n\nKNOWLEDGE\n' + KNOWLEDGE, cache_control: { type: 'ephemeral' } }
+      { type: 'text', text: RULES + '\n\nKNOWLEDGE\n' + KNOWLEDGE + (SET.notes.trim() ? '\n\nLATEST NOTES FROM ARPIT (newer than the facts above; if they disagree, these win)\n' + SET.notes.trim() : ''), cache_control: { type: 'ephemeral' } }
     ],
     messages: [{
       role: 'user',
@@ -291,6 +366,7 @@ async function draftFor(phone, opts) {
     if (await countToday(phone) >= PER_PHONE_DAILY_MAX) return { ok: false, error: 'Daily limit for this chat reached' };
     if (await countToday(null) >= DAILY_MAX) return { ok: false, error: 'Daily draft limit reached' };
 
+    await loadSettings();
     const contactName = (rows.slice().reverse().find(r => r.contact_name) || {}).contact_name || '';
     const live = await liveData(phone, contactName);
     const { out, usage, cost } = await callClaude(live, historyText(rows.slice(-20), live.name));
@@ -312,9 +388,15 @@ async function draftFor(phone, opts) {
       tokens_out: usage.output_tokens || 0,
       cost_usd: Math.round(cost * 1e6) / 1e6
     };
+    // Auto-send: a safe draft at one of the picked times goes out after wait_min,
+    // unless Arpit sends, edits or throws it away first.
+    if (row.status === 'pending' && SET.mode === 'auto' && isSafe(out) && !opts.force) {
+      const why = await autoWindow(Date.now());
+      if (why) row.auto_at = new Date(Date.now() + SET.wait_min * 60000).toISOString();
+    }
     const { data: saved, error: insErr } = await supabase.from('wa_drafts').insert(row).select().single();
     if (insErr) throw new Error('wa_drafts: ' + insErr.message);
-    console.log(`Agent draft (${row.status}, ${row.category}${row.needs_arpit ? ', needs Arpit' : ''}) → ${phone} · $${row.cost_usd}`);
+    console.log(`Agent draft (${row.status}, ${row.category}${row.needs_arpit ? ', needs Arpit' : ''}${row.auto_at ? ', auto' : ''}) → ${phone} · $${row.cost_usd}`);
     if (onDraftHook && saved && !opts.force) { try { onDraftHook(saved, live.name); } catch (e) {} }
     return { ok: true, draft: saved };
   } catch (e) {
@@ -363,10 +445,47 @@ async function sweep() {
   } catch (e) { console.error('agent sweep error:', e.message); }
 }
 
+// Every minute: send safe drafts whose wait is over.
+let autoBusy = false;
+async function autoSend() {
+  if (autoBusy || !supabase) return;
+  autoBusy = true;
+  try {
+    await loadSettings();
+    const { data } = await supabase.from('wa_drafts').select('*').eq('status', 'pending').not('auto_at', 'is', null)
+      .lte('auto_at', new Date().toISOString()).limit(10);
+    for (const d of (data || [])) {
+      const stop = async (why) => { await supabase.from('wa_drafts').update({ auto_at: null }).eq('id', d.id); console.log('Agent auto-send skipped (' + why + ') → ' + d.phone); };
+      if (!enabled() || SET.mode !== 'auto') { await stop('auto is off'); continue; }
+      // They wrote again since: a fresh draft is coming, don't send the old one.
+      const { data: last } = await supabase.from('wa_messages').select('wa_id, direction, template, created_at').eq('phone', d.phone).order('created_at', { ascending: false }).limit(5);
+      const lastIn = (last || []).find(r => r.direction === 'in');
+      if (lastIn && d.in_wa_id && lastIn.wa_id !== d.in_wa_id) { await stop('newer message'); continue; }
+      if ((last || []).some(r => r.direction === 'out' && !r.template && new Date(r.created_at) > new Date(d.created_at))) { await stop('Arpit replied'); continue; }
+      // Claim it first so two runs can never send it twice.
+      const { data: claimed } = await supabase.from('wa_drafts').update({ status: 'sending' }).eq('id', d.id).eq('status', 'pending').select('id');
+      if (!claimed || !claimed.length) continue;
+      const text = String(d.body || '').trim();
+      const r = await whatsapp.sendReply(d.phone, text);
+      if (!r.ok) {
+        await supabase.from('wa_drafts').update({ status: 'pending', auto_at: null }).eq('id', d.id);
+        console.error('Agent auto-send failed → ' + d.phone + ': ' + r.error);
+        continue;
+      }
+      const now = new Date().toISOString();
+      await supabase.from('wa_drafts').update({ status: 'sent', auto_sent: true, sent_text: text, edited: false, decided_at: now, sent_wa_id: r.row?.wa_id || null }).eq('id', d.id);
+      if (r.row?.wa_id) await supabase.from('wa_messages').update({ params: { auto: true } }).eq('wa_id', r.row.wa_id);
+      console.log('Agent auto-sent → ' + d.phone);
+    }
+  } catch (e) { console.error('agent auto-send error:', e.message); }
+  finally { autoBusy = false; }
+}
+
 function startWorker() {
   if (sweepTimer) return;
-  console.log('WhatsApp agent: ' + (enabled() ? 'DRAFT mode, model ' + MODEL : 'off (no ANTHROPIC_API_KEY or AGENT_MODE=off)'));
-  if (!enabled()) return;
+  setInterval(autoSend, 60 * 1000);
+  console.log('WhatsApp agent: ' + (keyOk() ? 'on, model ' + MODEL + ' (on/off and auto-send come from dashboard settings)' : 'off (no ANTHROPIC_API_KEY or AGENT_MODE=off)'));
+  if (!keyOk()) return;
   setTimeout(sweep, 90 * 1000);
   sweepTimer = setInterval(sweep, 10 * 60 * 1000);
 }
@@ -404,12 +523,69 @@ async function sendHandler(req, res) {
   }
 }
 
+// POST /api/agent/drafts/:id/hold → don't auto-send this one, keep it as a draft
+async function holdHandler(req, res) {
+  try {
+    await supabase.from('wa_drafts').update({ auto_at: null }).eq('id', String(req.params.id || '')).eq('status', 'pending');
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Could not stop it' }); }
+}
+
 // POST /api/agent/drafts/:id/dismiss
 async function dismissHandler(req, res) {
   try {
     await supabase.from('wa_drafts').update({ status: 'dismissed', decided_at: new Date().toISOString() }).eq('id', String(req.params.id || '')).eq('status', 'pending');
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: 'Could not dismiss' }); }
+}
+
+// GET /api/agent/settings → settings, status, 7-day numbers, main knowledge
+async function settingsGetHandler(req, res) {
+  try {
+    res.set('Cache-Control', 'no-store');
+    await loadSettings(true);
+    const since = new Date(Date.now() - 7 * 86400000).toISOString();
+    const { data } = await supabase.from('wa_drafts').select('status, edited, auto_sent').gte('created_at', since).limit(2000);
+    const rows = (data || []).filter(r => r.status !== 'no_reply');
+    const stats = {
+      drafts: rows.length,
+      as_is: rows.filter(r => r.status === 'sent' && !r.edited && !r.auto_sent).length,
+      edited: rows.filter(r => r.status === 'sent' && r.edited).length,
+      auto: rows.filter(r => r.status === 'sent' && r.auto_sent).length
+    };
+    res.json({ ok: true, settings: SET, status: status(), key: keyOk(), stats, knowledge: KNOWLEDGE, now_auto: SET.mode === 'auto' ? await autoWindow(Date.now()) : null });
+  } catch (e) { res.status(500).json({ error: 'Could not load agent settings: ' + e.message }); }
+}
+
+// POST /api/agent/settings { …partial settings }
+async function settingsSaveHandler(req, res) {
+  try {
+    await loadSettings(true);
+    const b = req.body || {};
+    const merged = Object.assign({}, SET, b, { when: Object.assign({}, SET.when, b.when || {}) });
+    const clean = cleanSettings(merged);
+    const { error } = await supabase.from('app_settings').upsert({ key: 'agent', value: clean }, { onConflict: 'key' });
+    if (error) throw new Error(error.message);
+    SET = clean; _setAt = Date.now();
+    // Turning auto off stops anything still waiting.
+    if (SET.mode !== 'auto' || !SET.on) await supabase.from('wa_drafts').update({ auto_at: null }).eq('status', 'pending').not('auto_at', 'is', null);
+    res.json({ ok: true, settings: SET, status: status() });
+  } catch (e) { res.status(500).json({ error: 'Could not save: ' + e.message }); }
+}
+
+// POST /api/agent/test { text } → what the agent would reply to a new person. Nothing is saved or sent.
+async function testHandler(req, res) {
+  try {
+    if (!keyOk()) return res.status(409).json({ error: 'The agent has no Claude key' });
+    const text = String(req.body?.text || '').trim().slice(0, 1000);
+    if (!text) return res.status(400).json({ error: 'Type a question first' });
+    await loadSettings(true);
+    const live = await liveData('0000000000', '');
+    const hist = '[' + fmt(Date.now()) + '] Them: ' + text;
+    const { out } = await callClaude(live, hist);
+    res.json({ ok: true, reply: String(out.reply || '').trim(), needs_reply: !!out.needs_reply, needs_arpit: !!out.needs_arpit,
+      note: String(out.note_for_arpit || '').trim(), category: out.category, safe: isSafe(out) });
+  } catch (e) { res.status(500).json({ error: 'Test failed: ' + e.message }); }
 }
 
 // POST /api/agent/redraft { phone } → a fresh draft now
@@ -419,4 +595,5 @@ async function redraftHandler(req, res) {
   res.json({ ok: true, draft: r.draft });
 }
 
-module.exports = { init, status, startWorker, onIncoming, onManualReply, draftFor, listHandler, sendHandler, dismissHandler, redraftHandler, _test: { liveData, historyText, callClaude, SCHEMA } };
+module.exports = { init, status, startWorker, onIncoming, onManualReply, draftFor, listHandler, sendHandler, dismissHandler, redraftHandler, holdHandler,
+  settingsGetHandler, settingsSaveHandler, testHandler, _test: { liveData, historyText, callClaude, SCHEMA, cleanSettings, autoWindow, isSafe, autoSend, setSettings: (s) => { SET = cleanSettings(s); _setAt = Date.now(); } } };
