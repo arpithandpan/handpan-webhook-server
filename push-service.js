@@ -144,6 +144,8 @@ function onDraft(draft, who) {
 function onNotification(n) {
   const msg = String(n.message || '');
   if (/WhatsApp reply to/i.test(msg)) return;
+  // Weekly class requests already send their own push (with a link to Today).
+  if (/weekly class request|waiting a day for your answer on weekly/i.test(msg)) return;
   let kind = 'alert', url = '/pages/dashboard#sec=notifications';
   if (n.type === 'payment' || /payment/i.test(msg)) { kind = 'payment'; url = '/pages/dashboard#sec=payments'; }
   if (/New trial booked/i.test(msg)) { kind = 'trial'; url = '/pages/dashboard#sec=classes'; }
