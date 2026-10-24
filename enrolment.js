@@ -54,6 +54,8 @@ function init(client, deps = {}) {
   push = deps.push || null;
   portal = deps.studentPortal || null;
 }
+const CONFIRM_TEMPLATE = 'weekly_class_confirmed';
+function confirmOn() { return String(process.env.WA_CONFIRM_TEMPLATE || '').trim().toLowerCase() === 'on' && !!whatsapp; }
 function templateOn() { return String(process.env.WA_ENROL_TEMPLATE || '').trim().toLowerCase() === 'on'; }
 
 // ── TIME ──
@@ -377,7 +379,10 @@ async function createFeeRequest(row, student) {
       id, student_id: student.id, classes: row.classes, amount: row.amount, currency: row.currency,
       list_amount: row.list_amount || null, discount_pct: row.discount_pct || null, month: ym,
       note: 'Weekly classes · ' + (row.plan === 'quarterly' ? 'Quarterly' : 'Monthly') + ' · ' + DAYS[row.slot_weekday].slice(0, 3) + ' ' + time12(row.slot_time) + ' IST',
-      status: 'pending'
+      status: 'pending',
+      // With the confirm template on, this request's WhatsApp goes out from
+      // approveRow below, so the fee_link worker must not send it too.
+      ...(confirmOn() ? { wa_sent_at: new Date().toISOString() } : {})
     });
     if (!error) return id;
     if (error.code !== '23505') throw new Error('fee_requests: ' + error.message);
@@ -404,6 +409,19 @@ async function approveRow(row, { by } = {}) {
     '<p style="margin:0 0 10px;line-height:1.55;color:#6B5150;font-size:14px;">After paying you’ll get your Zoom link, an invoice and a calendar invite.</p>' +
     '<p style="margin:0;font-size:14px;"><a href="' + linkFor(row) + '" style="color:#500018;">Switch plan or pick a different time</a></p>',
     'Hi ' + firstName(row.full_name) + ', your weekly class (' + slotText(r) + ') is confirmed. Pay here to lock it in: ' + payUrl);
+  // WhatsApp: "confirmed, pay to lock it in" with a Pay button. If it can't
+  // go out, hand the request back to the usual fee_link worker.
+  if (confirmOn()) {
+    let ok = false;
+    if (row.phone) {
+      const w = await whatsapp.sendTemplate(row.phone, CONFIRM_TEMPLATE,
+        [firstName(row.full_name), slotText(r), money(row.amount, price), plan.label.toLowerCase() + ' plan (' + plan.classes + ' classes)', nice(new Date(payBy).getTime(), tz) + (tz === IST ? ' IST' : ' (' + tzName(tz) + ')')],
+        { buttonUrlParam: feeId }).catch(e => ({ ok: false, error: e.message }));
+      ok = !!(w && w.ok);
+      if (!ok) console.error('weekly_class_confirmed failed:', w && w.error);
+    }
+    if (!ok) await supabase.from('fee_requests').update({ wa_sent_at: null }).eq('id', feeId);
+  }
   await notify('info', '✅ Weekly classes approved for ' + row.full_name + ' (' + student.id + (created ? ', new' : '') + ') · ' + feeId + ' · pay by ' + nice(new Date(payBy).getTime(), IST) + ' IST.' + (by === 'student' ? ' They accepted your other time.' : ''));
   return { ok: true, studentId: student.id, feeRequestId: feeId, payUrl };
 }
