@@ -122,7 +122,8 @@ zoom.setTrialHook(async (meetingId, minutes) => {
 const push = require('./push-service');
 push.init(supabase);
 const agent = require('./agent-service');
-agent.init(supabase, { whatsapp, studentPortal, trialBooking, onDraft: push.onDraft });
+agent.init(supabase, { whatsapp, studentPortal, trialBooking, onDraft: push.onDraft,
+  liveZoom: () => { let out = []; try { zoom.liveHandler({}, { json: j => { out = (j && j.meetings) || []; } }); } catch (e) {} return out; } });
 whatsapp.setHooks({ onIncoming: agent.onIncoming, onManualReply: agent.onManualReply, onPush: push.onWhatsApp });
 notifyMailer.setPushHook(push.onNotification);
 const enrolment = require('./enrolment');
@@ -1484,6 +1485,10 @@ app.get('/api/agent/drafts', requireAdmin, (req, res) => agent.listHandler(req, 
 app.post('/api/agent/drafts/:id/send', requireAdmin, express.json({ limit: '32kb' }), (req, res) => agent.sendHandler(req, res));
 app.post('/api/agent/drafts/:id/dismiss', requireAdmin, (req, res) => agent.dismissHandler(req, res));
 app.post('/api/agent/redraft', requireAdmin, express.json({ limit: '8kb' }), (req, res) => agent.redraftHandler(req, res));
+app.post('/api/agent/drafts/:id/hold', requireAdmin, (req, res) => agent.holdHandler(req, res));
+app.get('/api/agent/settings', requireAdmin, (req, res) => agent.settingsGetHandler(req, res));
+app.post('/api/agent/settings', requireAdmin, express.json({ limit: '16kb' }), (req, res) => agent.settingsSaveHandler(req, res));
+app.post('/api/agent/test', requireAdmin, express.json({ limit: '8kb' }), (req, res) => agent.testHandler(req, res));
 app.get('/api/wa/media/:waId', requireAdmin, (req, res) => whatsapp.mediaHandler(req, res));
 app.post('/api/wa/send-media', requireAdmin, express.json({ limit: '24mb' }), (req, res) => whatsapp.sendMediaHandler(req, res));
 
