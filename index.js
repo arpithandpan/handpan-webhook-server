@@ -103,6 +103,9 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
+// Health watch first: it starts timing the background jobs before they begin.
+const health = require('./health-service');
+health.init(supabase, { zoomApi: zoom.zoomApi, push: require('./push-service') });
 zoom.init(supabase);
 notifyMailer.init(supabase);
 settlementWorker.init(supabase);
@@ -148,6 +151,15 @@ const GENERAL_PAYMENT_PAGE_ID = 'pl_SvxuRdqY2rd7ge';
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
+
+// ── SYSTEM HEALTH (dashboard → More → System health) ──
+app.get('/api/health/status', requireAdminLazy, (req, res) => health.statusHandler(req, res));
+app.post('/api/health/run', requireAdminLazy, (req, res) => health.runHandler(req, res));
+app.post('/api/health/snooze', requireAdminLazy, express.json({ limit: '4kb' }), (req, res) => health.snoozeHandler(req, res));
+app.post('/api/health/errors/:id/resolve', requireAdminLazy, (req, res) => health.resolveErrorHandler(req, res));
+// Errors from the dashboard and website pages (sent with sendBeacon, so any content type).
+app.post('/api/health/client-error', express.json({ type: '*/*', limit: '4kb' }), (req, res) => health.clientErrorHandler(req, res));
+function requireAdminLazy(req, res, next) { return requireAdmin(req, res, next); }
 
 // ── HELPERS ──
 async function generateId(table, prefix) {
@@ -2175,4 +2187,5 @@ app.listen(PORT, () => {
   calendarInvites.startWorker();
   backup.startWorker();
   enrolment.startWorker();
+  health.startWorker();
 });
