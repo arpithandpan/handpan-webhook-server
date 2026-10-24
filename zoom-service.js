@@ -144,7 +144,7 @@ async function maybeAutoRenewal(student) {
     let amount = prev.amount, list = prev.list_amount || null, currency = prev.currency || 'INR';
     const { data: st } = await supabase.from('students').select('monthly_fee, fee_basis, currency').eq('id', student.id).maybeSingle();
     const rate = st ? Number(st.monthly_fee) : 0;
-    if (st && rate > 0 && (!st.fee_basis || st.fee_basis === 'per_class')) {
+    if (st && rate > 0 && !/^(month|course)$/.test(String(st.fee_basis || ''))) {   // 'session' / 'per_class' = per class
       const n = Number(prev.classes) || 0, disc = Number(prev.discount_pct) || 0;
       list = disc ? rate * n : null;
       amount = Math.round(rate * n * (1 - disc / 100));
