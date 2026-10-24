@@ -139,14 +139,25 @@ async function maybeAutoRenewal(student) {
     const prev = prevRows && prevRows[0];
     if (!prev || !(Number(prev.amount) > 0)) return { created: false, reason: 'no_previous' };
 
+    // Price from the student's CURRENT per-class rate (rates change), keeping
+    // the package size and any discount of the last request.
+    let amount = prev.amount, list = prev.list_amount || null, currency = prev.currency || 'INR';
+    const { data: st } = await supabase.from('students').select('monthly_fee, fee_basis, currency').eq('id', student.id).maybeSingle();
+    const rate = st ? Number(st.monthly_fee) : 0;
+    if (st && rate > 0 && (!st.fee_basis || st.fee_basis === 'per_class')) {
+      const n = Number(prev.classes) || 0, disc = Number(prev.discount_pct) || 0;
+      list = disc ? rate * n : null;
+      amount = Math.round(rate * n * (1 - disc / 100));
+      if (st.currency) currency = st.currency;
+    }
     const id = await nextFeeRequestId();
     const { error } = await supabase.from('fee_requests').insert({
       id,
       student_id: student.id,
       classes: prev.classes,
-      amount: prev.amount,
-      currency: prev.currency || 'INR',
-      list_amount: prev.list_amount || null,
+      amount,
+      currency,
+      list_amount: list,
       discount_pct: prev.discount_pct || null,
       month: currentMonthYM(),
       note: 'Auto renewal (copied from ' + prev.id + ')',
@@ -157,7 +168,7 @@ async function maybeAutoRenewal(student) {
       return { created: false, reason: error.message };
     }
     console.log('Auto fee request created:', id, 'for', student.id, '(from ' + prev.id + ')');
-    return { created: true, id, classes: prev.classes, amount: prev.amount, currency: (prev.currency || 'INR').toUpperCase() };
+    return { created: true, id, classes: prev.classes, amount, currency: String(currency || 'INR').toUpperCase() };
   } catch (e) {
     console.error('maybeAutoRenewal error:', e.message);
     return { created: false, reason: e.message };
