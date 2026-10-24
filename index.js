@@ -126,7 +126,9 @@ agent.init(supabase, { whatsapp, studentPortal, trialBooking, onDraft: push.onDr
 whatsapp.setHooks({ onIncoming: agent.onIncoming, onManualReply: agent.onManualReply, onPush: push.onWhatsApp });
 notifyMailer.setPushHook(push.onNotification);
 const enrolment = require('./enrolment');
+const blocks = require('./blocks');
 enrolment.init(supabase, { whatsapp, zoomApi: zoom.zoomApi, push, studentPortal });
+blocks.init(supabase, { whatsapp, trialBooking, studentPortal, push });
 const backup = require('./backup-service');
 backup.init(supabase);
 const calendarInvites = require('./calendar-invites');
@@ -1440,6 +1442,11 @@ app.post('/api/enrol/:token/plan', express.json({ limit: '8kb' }), (req, res) =>
 app.post('/api/enrol/:token/release', express.json({ limit: '8kb' }), (req, res) => enrolment.releaseHandler(req, res));
 // Admin side (dashboard)
 app.get('/api/admin/enrol', requireAdmin, (req, res) => enrolment.listHandler(req, res));
+// Block time (Arpit's leave): preview who is affected, block, unblock.
+app.get('/api/admin/blocks', requireAdmin, (req, res) => blocks.listHandler(req, res));
+app.post('/api/admin/blocks/preview', requireAdmin, express.json({ limit: '8kb' }), (req, res) => blocks.previewHandler(req, res));
+app.post('/api/admin/blocks', requireAdmin, express.json({ limit: '8kb' }), (req, res) => blocks.createHandler(req, res));
+app.delete('/api/admin/blocks/:id', requireAdmin, (req, res) => blocks.removeHandler(req, res));
 app.post('/api/admin/enrol/followup/:trialId/dismiss', requireAdmin, (req, res) => enrolment.dismissFollowupHandler(req, res));
 app.post('/api/admin/enrol/invite', requireAdmin, express.json({ limit: '8kb' }), (req, res) => enrolment.inviteHandler(req, res));
 app.post('/api/admin/enrol/:id/approve', requireAdmin, express.json({ limit: '8kb' }), (req, res) => enrolment.approveHandler(req, res));

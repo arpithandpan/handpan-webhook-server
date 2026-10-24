@@ -331,7 +331,7 @@ function changesUsed(ctx, ym) {
 function pendingMakeups(ctx, now) {
   const today = istYmd(now);
   return ctx.exceptions
-    .filter(e => e.action === 'skip' && Number(e.student_changes) > 0 && !e.charged_at && monthEnd(String(e.original_date).slice(0, 10)) >= today)
+    .filter(e => e.action === 'skip' && (Number(e.student_changes) > 0 || e.block_id) && !e.charged_at && monthEnd(String(e.original_date).slice(0, 10)) >= today)
     .map(e => ({ key: String(e.original_date).slice(0, 10), deadline: monthEnd(String(e.original_date).slice(0, 10)) }))
     .sort((a, b) => a.key.localeCompare(b.key));
 }

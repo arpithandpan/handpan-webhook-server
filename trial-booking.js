@@ -247,6 +247,8 @@ async function busyIntervals(fromMs, toMs) {
     const b = eventBlock(String(w.date).slice(0, 10), w.workshop_time, 150);
     if (b) busy.push({ ...b, what: 'workshop ' + w.id });
   }
+  // Time Arpit blocked (leave, illness, travel): nobody can book it.
+  try { busy.push(...await require('./blocks').busyBlocks(fromMs, toMs)); } catch (e) { console.error('busy: blocks read failed:', e.message); }
   return busy.filter(b => b.e >= fromMs - 86400000 && b.s <= toMs + 86400000);
 }
 
