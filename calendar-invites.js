@@ -151,7 +151,7 @@ function buildIcs({ row, student, anchor, exceptions, seq, method }) {
     'SUMMARY:' + esc('Handpan class · ' + name + ' with Arpit'),
     'DESCRIPTION:' + esc(desc), 'LOCATION:' + esc(zoom || 'Zoom'),
     'ORGANIZER;CN=Arpit Pandey:mailto:' + FROM_EMAIL,
-    'ATTENDEE;CN=' + esc(name) + ';ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED;RSVP=FALSE:mailto:' + (student.email || ARPIT_EMAIL),
+    ...(emailsOf(student).length ? emailsOf(student) : [ARPIT_EMAIL]).map(e => 'ATTENDEE;CN=' + esc(name) + ';ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED;RSVP=FALSE:mailto:' + e),
     'SEQUENCE:' + seq, ...extra
   ];
   const lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Arpit Pandey//Handpan Classes//EN', 'CALSCALE:GREGORIAN', 'METHOD:' + method, ...vtimezone(rule.tz)];
@@ -177,11 +177,20 @@ function buildIcs({ row, student, anchor, exceptions, seq, method }) {
   return { ics, hash, summary: { exdates: exdates.length, moved: overrides.length } };
 }
 
+// Everyone who should get the invite: the student's email plus any extra
+// ones (a parent, a partner) in students.extra_emails, comma separated.
+function emailsOf(student) {
+  const all = [student.email].concat(String(student.extra_emails || '').split(/[,;\s]+/));
+  const out = [];
+  for (const e of all) { const v = String(e || '').trim().toLowerCase(); if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v) && !out.includes(v)) out.push(v); }
+  return out;
+}
+
 // ── EMAIL ──
 async function sendMail({ to, subject, html, text, ics, method }) {
   if (!RESEND_API_KEY) return { ok: false, error: 'RESEND_API_KEY not set' };
   const body = {
-    from: 'Arpit Pandey <' + FROM_EMAIL + '>', to: [to], subject, html, text, reply_to: ARPIT_EMAIL,
+    from: 'Arpit Pandey <' + FROM_EMAIL + '>', to: String(to).split(',').map(x => x.trim()).filter(Boolean), subject, html, text, reply_to: ARPIT_EMAIL,
     attachments: [{ filename: method === 'CANCEL' ? 'cancel.ics' : 'invite.ics', content: Buffer.from(ics).toString('base64'), content_type: 'text/calendar; method=' + method + '; charset=UTF-8' }]
   };
   const r = await fetch('https://api.resend.com/emails', { method: 'POST', headers: { Authorization: 'Bearer ' + RESEND_API_KEY, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -217,7 +226,7 @@ async function load() {
   const today = istYmd(Date.now());
   const [sch, st, ex, rec] = await Promise.all([
     supabase.from('class_schedule').select('*'),
-    supabase.from('students').select('id, full_name, email, archived, status'),
+    supabase.from('students').select('*'),
     supabase.from('class_exceptions').select('student_id, original_date, action, new_date, new_time_ist, makeup'),
     supabase.from('calendar_invites').select('*')
   ]);
@@ -246,7 +255,7 @@ async function run({ dry = false, only = null } = {}) {
     const rule = slotRule(row);
     // The series starts at the next class when it's new or its day/time changed.
     const anchor = rec && rec.anchor && rec.slot_sig === sig && !rec.cancelled_at ? String(rec.anchor).slice(0, 10) : firstOn(rule, partsIn(Date.now() - rule.dur * MIN, rule.tz).ymd);
-    const recipient = m === 'test' ? ARPIT_EMAIL : student.email;
+    const recipient = m === 'test' ? ARPIT_EMAIL : emailsOf(student).join(',');
     const seq = rec ? (Number(rec.seq) || 0) + 1 : 0;
     const exs = d.exceptions.filter(e => e.student_id === row.student_id && String(e.original_date).slice(0, 10) >= addDays(anchor, -1));
     const built = buildIcs({ row, student, anchor, exceptions: exs, seq, method: 'REQUEST' });
