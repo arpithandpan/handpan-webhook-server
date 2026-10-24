@@ -20,7 +20,7 @@
 //     one ⚠️ notification with the short list (push + email + WhatsApp).
 // The dashboard reads everything from GET /api/health/status (More → System health).
 
-const VERSION = 'health-2';
+const VERSION = 'health-3';
 const SERVICE_EVERY = 5 * 60 * 1000;
 const DATA_EVERY = 30 * 60 * 1000;
 const REALERT_MS = 6 * 3600 * 1000;
@@ -297,7 +297,7 @@ async function checkData() {
 
   // WhatsApp messages that failed in the last 24 h
   await run('wa-failed', async () => {
-    const rows = await q('wa_messages', x => x.select('id, phone, error, created_at').eq('direction', 'out').eq('status', 'failed').gte('created_at', since(24)).limit(30));
+    const rows = (await q('wa_messages', x => x.select('id, phone, error, created_at').eq('direction', 'out').eq('status', 'failed').gte('created_at', since(24)).limit(30))).filter(r => !/sent again automatically/i.test(String(r.error || '')));
     if (rows.length) setIssue('data:wa-failed', rows.length >= 5 ? 'bad' : 'warn', rows.length + ' WhatsApp message' + (rows.length > 1 ? 's' : '') + ' failed today', 'Latest to +' + rows[0].phone + (rows[0].error ? ': ' + String(rows[0].error).slice(0, 100) : '') + '.', { label: 'Open Inbox', sec: 'whatsapp' }, 'whatsapp');
     else delete state.issues['data:wa-failed'];
   });
@@ -346,6 +346,140 @@ async function checkData() {
   state.lastDataRun = new Date().toISOString();
 }
 
+
+// ── 5. AUTO-FIX ──
+// Only fixes that cannot hurt: never touches money records by hand, never sends a
+// student the same thing twice, never changes a setting. Every fix is logged and
+// shown under "Fixed by itself" in System health. Anything else stays an alert.
+let fixes = [];            // newest first, persisted in app_settings 'health_fixes'
+let fixDone = {};          // key → ISO, things already tried once (app_settings 'health_fixdone')
+async function logFix(title, detail) {
+  fixes.unshift({ at: new Date().toISOString(), title, detail: detail || '' });
+  fixes = fixes.slice(0, 40);
+  await saveJson('health_fixes', fixes);
+  console.log('Health auto-fix:', title, detail ? '· ' + detail : '');
+}
+async function markTried(key) { fixDone[key] = new Date().toISOString(); const keys = Object.keys(fixDone); if (keys.length > 400) for (const k of keys.slice(0, keys.length - 400)) delete fixDone[k]; await saveJson('health_fixdone', fixDone); }
+const TRANSIENT = /something went wrong|unknown error|service (is )?(temporarily )?unavailable|temporar|timed? ?out|timeout|rate limit|try again|internal|ECONN|ETIMEDOUT|socket|fetch failed|network|5\d\d\b/i;
+
+// a) Razorpay took the money but our webhook never arrived: replay it to our own
+//    webhook, signed with our secret. The normal payment code then runs exactly as
+//    if Razorpay had delivered it (it already ignores duplicates).
+async function fixMissedPayments() {
+  const secret = process.env.RAZORPAY_WEBHOOK_SECRET, k = process.env.RAZORPAY_KEY_ID, s = process.env.RAZORPAY_KEY_SECRET;
+  if (!secret || !k || !s) return;
+  for (const issue of Object.values(state.issues).filter(i => i.key.startsWith('data:rzp:'))) {
+    const id = issue.key.slice('data:rzp:'.length);
+    if (fixDone['rzp:' + id] || (snoozed[issue.key] && new Date(snoozed[issue.key]) > new Date())) continue;
+    try {
+      const r = await timed(fetch('https://api.razorpay.com/v1/payments/' + id, { headers: { Authorization: 'Basic ' + Buffer.from(k + ':' + s).toString('base64') } }));
+      if (!r.ok) continue;
+      const p = await r.json();
+      if (p.status !== 'captured' || Date.now() - p.created_at * 1000 < 45 * 60 * 1000) continue;   // give Razorpay's own retries a chance first
+      await markTried('rzp:' + id);
+      const body = JSON.stringify({ event: 'payment.captured', payload: { payment: { entity: p } }, replayed_by: 'health' });
+      const sig = require('crypto').createHmac('sha256', secret).update(body).digest('hex');
+      const w = await timed(fetch('http://127.0.0.1:' + (process.env.PORT || 3000) + '/api/webhooks/razorpay', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-razorpay-signature': sig }, body }), 30000);
+      const amt = (p.currency === 'INR' ? '₹' : p.currency + ' ') + (p.amount / 100);
+      if (w.ok) { delete state.issues[issue.key]; await logFix('Recorded a missed payment of ' + amt, 'Razorpay never told the server about ' + id + ', so it was fetched and recorded the normal way (invoice and messages included).'); }
+      else console.warn('health: replay of ' + id + ' answered ' + w.status);
+    } catch (e) { console.warn('health: payment replay ' + id + ':', e.message); }
+  }
+}
+
+// b) Invoice email failed for a passing reason: send it once more.
+async function fixInvoiceEmails() {
+  if (!deps.invoice) return;
+  const rows = await q('invoices', x => x.select('*').not('email_error', 'is', null).gte('created_at', new Date(Date.now() - 7 * 86400000).toISOString()).limit(20)).catch(() => []);
+  for (const row of rows) {
+    if (!row.email_error || fixDone['inv:' + row.id]) continue;
+    if (/invalid|not a valid|bounce|does not exist|no email|suppress|blocked|unsubscribed/i.test(row.email_error)) continue;
+    if (Date.now() - new Date(row.created_at).getTime() < 30 * 60 * 1000) continue;
+    await markTried('inv:' + row.id);
+    try {
+      const { pdf } = await deps.invoice.getPdf(supabase, row);
+      const to = await deps.invoice.emailInvoice(supabase, row, pdf);
+      await logFix('Invoice email sent again', (row.billed_name || row.id) + ' · to ' + to);
+    } catch (e) { console.warn('health: invoice resend ' + row.id + ':', e.message); }
+  }
+}
+
+// c) A WhatsApp message failed for a passing reason (Meta hiccup, timeout): send
+//    it once more. Never for templates with a button or a PDF (we can't rebuild
+//    those exactly), never when the chat window is closed, never twice.
+let tplShape = null, tplShapeAt = 0;
+async function templateShapes() {
+  if (tplShape && Date.now() - tplShapeAt < 6 * 3600 * 1000) return tplShape;
+  const waba = process.env.WHATSAPP_PROD_WABA_ID || '1652322909800354';
+  const r = await timed(fetch('https://graph.facebook.com/v21.0/' + waba + '/message_templates?fields=name,components&limit=200', { headers: { Authorization: 'Bearer ' + process.env.WHATSAPP_PROD_TOKEN } }));
+  const j = await r.json(); if (!r.ok) throw new Error((j.error && j.error.message) || 'HTTP ' + r.status);
+  tplShape = {};
+  for (const t of j.data || []) {
+    const comps = t.components || [];
+    const simple = !comps.some(c => (c.type === 'HEADER' && c.format && c.format !== 'TEXT') || (c.type === 'HEADER' && /\{\{/.test(c.text || '')) || (c.type === 'BUTTONS' && JSON.stringify(c).includes('{{')));
+    tplShape[t.name] = simple;
+  }
+  tplShapeAt = Date.now();
+  return tplShape;
+}
+async function fixWhatsApp() {
+  if (!deps.whatsapp || !process.env.WHATSAPP_PROD_TOKEN) return;
+  const since = new Date(Date.now() - 6 * 3600 * 1000).toISOString(), until = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+  const rows = await q('wa_messages', x => x.select('id, phone, type, template, params, body, error, created_at').eq('direction', 'out').eq('status', 'failed').gte('created_at', since).lte('created_at', until).limit(20)).catch(() => []);
+  for (const m of rows) {
+    if (fixDone['wa:' + m.id] || !TRANSIENT.test(String(m.error || '')) || /sent again/i.test(String(m.error || ''))) continue;
+    await markTried('wa:' + m.id);
+    try {
+      let r = null;
+      if (m.type === 'text' && m.body) r = await deps.whatsapp.sendReply(m.phone, m.body);
+      else if (m.type === 'template' && m.template && Array.isArray(m.params)) {
+        const shapes = await templateShapes();
+        if (shapes[m.template] !== true) continue;
+        r = await deps.whatsapp.sendTemplate(m.phone, m.template, m.params);
+      } else continue;
+      if (r && r.ok) {
+        await supabase.from('wa_messages').update({ error: String(m.error || 'failed') + ' · sent again automatically' }).eq('id', m.id);
+        await logFix('WhatsApp message sent again', '+' + m.phone + (m.template ? ' · ' + m.template : '') + ' · first try failed: ' + String(m.error).slice(0, 80));
+      }
+    } catch (e) { console.warn('health: WA resend ' + m.id + ':', e.message); }
+  }
+}
+
+// d) An agent reply stuck half-sent (server restarted mid-send): give it back to Arpit.
+async function fixStuckDrafts() {
+  const rows = await q('wa_drafts', x => x.select('id, phone, created_at').eq('status', 'sending').lte('created_at', new Date(Date.now() - 10 * 60 * 1000).toISOString()).limit(20)).catch(() => []);
+  for (const d of rows) {
+    const { error } = await supabase.from('wa_drafts').update({ status: 'pending', auto_at: null }).eq('id', d.id).eq('status', 'sending');
+    if (!error) await logFix('Unstuck a reply draft', 'A draft for +' + d.phone + ' got stuck while sending. It is back in the Inbox for you to send.');
+  }
+}
+
+// e) Old errors that stopped happening are closed, so the list stays honest.
+async function fixOldErrors() {
+  try { await supabase.from('system_errors').update({ resolved: true }).eq('resolved', false).lte('last_at', new Date(Date.now() - 24 * 3600 * 1000).toISOString()); } catch (e) {}
+}
+
+// f) A background job has stopped (stuck or never coming back): restart the server.
+//    Railway starts it again straight away and every job starts fresh. At most twice
+//    a day, never in the first 30 minutes after a start, so it can never loop.
+async function fixStalledJobs() {
+  if (Date.now() - new Date(state.startedAt).getTime() < 30 * 60 * 1000) return;
+  const stalled = Object.values(state.jobs).filter(j => { const late = j.lastStart ? Date.now() - new Date(j.lastStart).getTime() : Date.now() - new Date(state.startedAt).getTime(); return late > Math.max(j.every * 3 + 120000, 30 * 60 * 1000); });
+  if (!stalled.length) return;
+  const day = istYmd(); const rs = await loadJson('health_restarts', {});
+  const n = rs.day === day ? rs.n || 0 : 0;
+  if (n >= 2) return;
+  await saveJson('health_restarts', { day, n: n + 1 });
+  await logFix('Restarted the server', stalled.map(j => j.label).join(', ') + ' had stopped running. Restart ' + (n + 1) + ' of 2 allowed today.');
+  console.error('Health: restarting the server because these jobs stopped: ' + stalled.map(j => j.label).join(', '));
+  setTimeout(() => process.exit(1), 1500);
+}
+
+async function autoFix() {
+  for (const [name, fn] of [['payments', fixMissedPayments], ['invoices', fixInvoiceEmails], ['whatsapp', fixWhatsApp], ['drafts', fixStuckDrafts], ['errors', fixOldErrors], ['jobs', fixStalledJobs]]) {
+    try { await fn(); } catch (e) { console.warn('health auto-fix ' + name + ':', e.message); }
+  }
+}
 // ── ALERTS ──
 async function notifyRow(type, message) {
   try { await supabase.from('notifications').insert({ type, message, read: false }); } catch (e) {}
@@ -379,25 +513,27 @@ async function morningDigest() {
   lastDigestDay = day;
   await saveJson('health_digest', { day });
   const open = Object.values(state.issues).filter(i => !(snoozed[i.key] && new Date(snoozed[i.key]).getTime() > Date.now()));
+  const fixed = fixes.filter(f => Date.now() - new Date(f.at).getTime() < 24 * 3600 * 1000).length;
+  const fixedTxt = fixed ? ' Fixed by itself in the last day: ' + fixed + '.' : '';
   if (!open.length) {
-    if (deps.push) deps.push.send('alert', { title: 'Morning check', body: '✅ Everything is running fine.', tag: 'health-digest', url: '/pages/dashboard#sec=health' });
+    if (deps.push) deps.push.send('alert', { title: 'Morning check', body: '✅ Everything is running fine.' + fixedTxt, tag: 'health-digest', url: '/pages/dashboard#sec=health' });
     return;
   }
   const list = open.slice().sort((a, b) => (a.level === 'bad' ? 0 : 1) - (b.level === 'bad' ? 0 : 1)).slice(0, 5).map(i => (i.level === 'bad' ? '🔴 ' : '⚠️ ') + i.title).join('; ');
-  await notifyRow('warning', '⚠️ Morning check: ' + open.length + ' thing' + (open.length > 1 ? 's need' : ' needs') + ' you. ' + list + '.');
+  await notifyRow('warning', '⚠️ Morning check: ' + open.length + ' thing' + (open.length > 1 ? 's need' : ' needs') + ' you. ' + list + '.' + fixedTxt);
 }
 
 // ── LOOP ──
 let svcBusy = false, dataBusy = false;
 async function serviceTick() {
   if (svcBusy) return; svcBusy = true;
-  try { await checkServices(); await flushErrors(); await alertTransitions(); await morningDigest(); }
+  try { await checkServices(); await flushErrors(); await fixStalledJobs().catch(() => {}); await alertTransitions(); await morningDigest(); }
   catch (e) { console.warn('health service tick:', e.message); }
   finally { svcBusy = false; }
 }
 async function dataTick() {
   if (dataBusy) return; dataBusy = true;
-  try { await checkData(); await alertTransitions(); }
+  try { await checkData(); await autoFix(); await checkData(); await alertTransitions(); }
   catch (e) { console.warn('health data tick:', e.message); }
   finally { dataBusy = false; }
 }
@@ -408,7 +544,9 @@ function init(client, d = {}) {
 }
 async function startWorker() {
   alertMemo = await loadJson('health_alerts', {});
-  delete alertMemo['data:rzp-missing'];   // replaced by one issue per payment in health-2
+  delete alertMemo['data:rzp-missing'];
+  fixes = await loadJson('health_fixes', []); if (!Array.isArray(fixes)) fixes = [];
+  fixDone = await loadJson('health_fixdone', {});   // replaced by one issue per payment in health-2
   snoozed = await loadJson('health_snooze', {});
   const dg = await loadJson('health_digest', {}); lastDigestDay = dg.day || null;
   // Using the untouched timer so the watcher does not watch itself.
@@ -430,7 +568,7 @@ function statusHandler(req, res) {
     services: Object.values(state.services),
     jobs: Object.values(state.jobs).map(j => ({ key: j.key, label: j.label, every: j.every, lastStart: j.lastStart, lastOk: j.lastOk, lastErr: j.lastErr, err: j.err, runs: j.runs, fails: j.fails, streak: j.streak,
       status: state.issues['job:' + j.key] ? state.issues['job:' + j.key].level : 'ok' })),
-    issues, asked: state.asked || [], errors: (state.recentErrors || []).slice(0, 10)
+    issues, asked: state.asked || [], errors: (state.recentErrors || []).slice(0, 10), fixes: fixes.slice(0, 15)
   });
 }
 async function runHandler(req, res) {
@@ -465,4 +603,4 @@ async function resolveErrorHandler(req, res) {
 }
 
 module.exports = { init, startWorker, statusHandler, runHandler, snoozeHandler, clientErrorHandler, resolveErrorHandler, recordError,
-  _test: { state, jobKeyFor, normalizeMsg, checkServices, checkData, alertTransitions, morningDigest, setIssue, flushErrors, errBuf, setDeps: (c, d) => { supabase = c; deps = d; } } };
+  _test: { state, autoFix, fixMissedPayments, fixInvoiceEmails, fixWhatsApp, fixStuckDrafts, fixStalledJobs, getFixes: () => fixes, jobKeyFor, normalizeMsg, checkServices, checkData, alertTransitions, morningDigest, setIssue, flushErrors, errBuf, setDeps: (c, d) => { supabase = c; deps = d; } } };
