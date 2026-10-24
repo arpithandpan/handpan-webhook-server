@@ -1,0 +1,454 @@
+// health-service.js
+// Keeps an eye on the whole studio system and tells Arpit when something needs him.
+//
+// Four parts, all inside the Railway server, no AI involved:
+//   1. Job watch: every background job (reminders, agent, Zoom sync, invoices...)
+//      is timed. If a job stops running or keeps failing, that is an issue.
+//   2. Service checks every 5 minutes: database, WhatsApp, Razorpay, Zoom, email.
+//   3. Data checks every 30 minutes: payments not recorded, invoices that failed,
+//      fee links unpaid for a week, messages that failed, drafts left waiting...
+//   4. Error log: server errors (console.error) and errors from the dashboard
+//      are counted in the system_errors table. A burst of the same error is an issue.
+//
+// Telling Arpit:
+//   - When something turns bad, one notification row is written that starts
+//     with 🔴. notify-mailer already sends those to the phone (push), email and
+//     the alerts WhatsApp. Nothing else had to change for that.
+//   - When it is fine again, a ✅ push (no email, no WhatsApp).
+//   - Still bad after 6 hours: one reminder. Never a stream of the same alert.
+//   - 8:30 AM IST: a morning check. All good → a quiet push. Something open →
+//     one ⚠️ notification with the short list (push + email + WhatsApp).
+// The dashboard reads everything from GET /api/health/status (More → System health).
+
+const VERSION = 'health-1';
+const SERVICE_EVERY = 5 * 60 * 1000;
+const DATA_EVERY = 30 * 60 * 1000;
+const REALERT_MS = 6 * 3600 * 1000;
+const DIGEST_HHMM = '08:30';
+
+let supabase = null, deps = {};
+const state = {
+  startedAt: new Date().toISOString(),
+  services: {},          // key → { key, label, status: ok|warn|bad, detail, at }
+  jobs: {},              // key → { key, label, every, lastStart, lastOk, lastErr, err, runs, fails, streak, running }
+  issues: {},            // key → { key, level: warn|bad, title, detail, action, since, area }
+  lastServiceRun: null, lastDataRun: null
+};
+let alertMemo = {};      // key → { level, sentAt }  (persisted in app_settings 'health_alerts')
+let snoozed = {};        // key → until ISO          (persisted in app_settings 'health_snooze')
+let lastDigestDay = null;
+
+// ── 1. JOB WATCH ──
+// Patches setInterval once, before the workers start. Every interval created
+// from a module file is wrapped so its runs are timed. Nothing else changes:
+// same callback, same timing, errors still go where they went before.
+const JOB_LABELS = {
+  'agent-service:autoSend': 'WhatsApp agent: auto replies',
+  'agent-service:sweep': 'WhatsApp agent: drafts',
+  'backup-service:tick': 'Daily backup',
+  'calendar-invites:tick': 'Calendar invites',
+  'enrolment:run': 'Weekly class links',
+  'notify-mailer:processPending': 'Alert emails and WhatsApp',
+  'settlement-worker:processUnsettled': 'Razorpay settlements',
+  'student-portal:tick': 'Student portal reminders',
+  'trial-booking:tick': 'Trial reminders',
+  'whatsapp-service:tick': 'Class reminders on WhatsApp',
+  'workshop-messages:processPending': 'Workshop messages',
+  'zoom-service:processPending': 'Zoom attendance',
+  'zoom-service:syncMeetings': 'Zoom meeting sync',
+  'zoom-service:renewalCheck': 'Fee renewals'
+};
+function jobKeyFor(fn, stack) {
+  const m = String(stack || '').split('\n').map(l => l.match(/([a-z0-9-]+)\.js:\d+/i)).find(x => x && x[1] !== 'health-service');
+  const file = m ? m[1] : 'server';
+  let name = fn && fn.name && fn.name !== 'bound ' ? fn.name.replace(/^bound /, '') : '';
+  if (!name) { const c = String(fn).match(/([A-Za-z_$][\w$]*)\s*\(/g); if (c) { const pick = c.map(x => x.replace(/\s*\($/, '')).find(x => !/^(catch|then|console|setTimeout|if|async)$/.test(x)); if (pick) name = pick; } }
+  return file + ':' + (name || 'job');
+}
+function watchJobs() {
+  if (global.__healthPatched) return;
+  global.__healthPatched = true;
+  const orig = global.setInterval;
+  global.setInterval = function (fn, ms, ...args) {
+    if (typeof fn !== 'function' || !ms || ms < 30000) return orig(fn, ms, ...args);
+    const stack = new Error().stack;
+    // Only our own server files are watched; library timers and this file are left alone.
+    const caller = String(stack).split('\n').slice(2).find(l => /\.js:\d+/.test(l)) || '';
+    if (/node_modules|node:|health-service\.js/.test(caller)) return orig(fn, ms, ...args);
+    const key = jobKeyFor(fn, stack);
+    let k = key, n = 2; while (state.jobs[k]) k = key + '#' + (n++);
+    const j = state.jobs[k] = { key: k, label: JOB_LABELS[key] || key, every: ms, lastStart: null, lastOk: null, lastErr: null, err: null, runs: 0, fails: 0, streak: 0, running: false };
+    const wrapped = function () {
+      j.lastStart = new Date().toISOString(); j.runs++; j.running = true;
+      const done = (e) => {
+        j.running = false;
+        if (e) { j.fails++; j.streak++; j.lastErr = new Date().toISOString(); j.err = String(e && e.message || e).slice(0, 300); }
+        else { j.streak = 0; j.lastOk = new Date().toISOString(); }
+      };
+      try {
+        const r = fn.apply(this, args);
+        if (r && typeof r.then === 'function') r.then(() => done(), (e) => { done(e); console.error('Job ' + j.label + ' failed:', e && e.message || e); });
+        else done();
+      } catch (e) { done(e); console.error('Job ' + j.label + ' failed:', e && e.message || e); }
+    };
+    return orig(wrapped, ms);
+  };
+}
+
+// ── 4. ERROR LOG ──
+// console.error is counted (not replaced): the message still prints as before.
+const errBuf = new Map();   // sig → { source, where, message, count, first, last }
+function normalizeMsg(s) {
+  return String(s || '').replace(/\b[0-9a-f]{8,}\b/gi, '#').replace(/\b(pay|order|plink|inv)_[A-Za-z0-9]+/g, '$1_#')
+    .replace(/[+]?\d[\d\s-]{5,}\d/g, 'N').replace(/\d+/g, 'n').replace(/\s+/g, ' ').trim().slice(0, 240);
+}
+function recordError(source, where, message) {
+  const msg = String(message || '').slice(0, 500);
+  if (!msg) return;
+  const sig = source + '|' + where + '|' + normalizeMsg(msg);
+  const now = new Date().toISOString();
+  const e = errBuf.get(sig) || { source, where, message: msg, sig, count: 0, first: now, last: now };
+  e.count++; e.last = now; e.message = msg;
+  errBuf.set(sig, e);
+  if (errBuf.size > 300) errBuf.delete(errBuf.keys().next().value);
+}
+function watchConsole() {
+  if (global.__healthConsole) return;
+  global.__healthConsole = true;
+  const orig = console.error.bind(console);
+  console.error = function (...a) {
+    orig(...a);
+    try {
+      const st = new Error().stack.split('\n').slice(2).map(l => l.match(/([a-z0-9-]+)\.js:\d+/i)).find(Boolean);
+      const where = st ? st[1] : 'server';
+      if (where === 'health-service') return;
+      recordError('server', where, a.map(x => x instanceof Error ? x.message : (typeof x === 'object' ? JSON.stringify(x) : String(x))).join(' '));
+    } catch (e) {}
+  };
+  process.on('unhandledRejection', (r) => recordError('server', 'unhandled', r && r.message || String(r)));
+}
+async function flushErrors() {
+  if (!supabase || !errBuf.size) return;
+  const rows = [...errBuf.values()]; errBuf.clear();
+  for (const r of rows) {
+    try {
+      const sigHash = require('crypto').createHash('sha1').update(r.sig).digest('hex').slice(0, 24);
+      const { data: ex } = await supabase.from('system_errors').select('id, count').eq('sig', sigHash).maybeSingle();
+      if (ex) await supabase.from('system_errors').update({ count: (ex.count || 0) + r.count, last_at: r.last, message: r.message, resolved: false }).eq('id', ex.id);
+      else await supabase.from('system_errors').insert({ sig: sigHash, source: r.source, location: r.where, message: r.message, count: r.count, first_at: r.first, last_at: r.last });
+    } catch (e) { /* table missing: keep quiet, the status page says so */ }
+  }
+}
+
+// ── HELPERS ──
+const istNow = () => new Date(Date.now() + 5.5 * 3600 * 1000);
+const istYmd = (d = istNow()) => d.toISOString().slice(0, 10);
+const istHHMM = () => istNow().toISOString().slice(11, 16);
+const ago = (iso) => iso ? Date.now() - new Date(iso).getTime() : Infinity;
+const mins = (ms) => Math.round(ms / 60000);
+function setService(key, label, status, detail) { state.services[key] = { key, label, status, detail, at: new Date().toISOString() }; }
+function setIssue(key, level, title, detail, action, area, name) {
+  const prev = state.issues[key];
+  state.issues[key] = { key, level, title, detail: detail || '', action: action || null, area: area || 'system', name: name || null, since: prev ? prev.since : new Date().toISOString() };
+}
+async function timed(p, ms = 12000) {
+  return Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timed out after ' + ms / 1000 + 's')), ms))]);
+}
+async function loadJson(key, dflt) {
+  try { const { data } = await supabase.from('app_settings').select('value').eq('key', key).maybeSingle(); return (data && data.value) || dflt; } catch (e) { return dflt; }
+}
+async function saveJson(key, value) {
+  try { await supabase.from('app_settings').upsert({ key, value }, { onConflict: 'key' }); } catch (e) {}
+}
+
+// ── 2. SERVICE CHECKS ──
+async function checkServices() {
+  const checks = [];
+  // Database
+  checks.push((async () => {
+    const t0 = Date.now();
+    try {
+      const { error } = await timed(supabase.from('students').select('id', { head: true, count: 'exact' }).limit(1));
+      if (error) throw new Error(error.message);
+      const ms = Date.now() - t0;
+      setService('db', 'Database', ms > 4000 ? 'warn' : 'ok', ms > 4000 ? 'Slow: ' + ms + ' ms' : 'Responding in ' + ms + ' ms');
+    } catch (e) { setService('db', 'Database', 'bad', 'Not responding: ' + e.message); }
+  })());
+  // WhatsApp (studio number)
+  checks.push((async () => {
+    const tok = process.env.WHATSAPP_PROD_TOKEN, id = process.env.WHATSAPP_PROD_PHONE_ID;
+    if (!tok || !id) return setService('wa', 'WhatsApp', 'warn', 'Not set up on the server');
+    try {
+      const r = await timed(fetch('https://graph.facebook.com/v21.0/' + id + '?fields=display_phone_number,quality_rating,status', { headers: { Authorization: 'Bearer ' + tok } }));
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error((j.error && j.error.message) || 'HTTP ' + r.status);
+      const q = String(j.quality_rating || '').toUpperCase();
+      setService('wa', 'WhatsApp', q === 'RED' ? 'bad' : q === 'YELLOW' ? 'warn' : 'ok', 'Connected' + (q ? ' · quality ' + q.toLowerCase() : ''));
+    } catch (e) { setService('wa', 'WhatsApp', 'bad', 'Meta is refusing the connection: ' + e.message); }
+  })());
+  // Razorpay
+  checks.push((async () => {
+    const k = process.env.RAZORPAY_KEY_ID, s = process.env.RAZORPAY_KEY_SECRET;
+    if (!k || !s) return setService('rzp', 'Payments (Razorpay)', 'warn', 'Not set up on the server');
+    try {
+      const r = await timed(fetch('https://api.razorpay.com/v1/payments?count=1', { headers: { Authorization: 'Basic ' + Buffer.from(k + ':' + s).toString('base64') } }));
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      setService('rzp', 'Payments (Razorpay)', 'ok', 'Connected');
+    } catch (e) { setService('rzp', 'Payments (Razorpay)', 'bad', 'Razorpay is not answering: ' + e.message); }
+  })());
+  // Zoom
+  checks.push((async () => {
+    if (!deps.zoomApi || !process.env.ZOOM_CLIENT_ID) return setService('zoom', 'Zoom', 'warn', 'Not set up on the server');
+    try {
+      const r = await timed(deps.zoomApi('GET', '/users/me'));
+      if (!r || !r.ok) throw new Error((r && r.error) || 'no answer');
+      setService('zoom', 'Zoom', 'ok', 'Connected');
+    } catch (e) { setService('zoom', 'Zoom', 'bad', 'Zoom sign-in failed: ' + e.message); }
+  })());
+  // Email (Resend)
+  checks.push((async () => {
+    const key = process.env.RESEND_API_KEY;
+    if (!key) return setService('mail', 'Email', 'warn', 'Not set up on the server');
+    try {
+      const r = await timed(fetch('https://api.resend.com/domains', { headers: { Authorization: 'Bearer ' + key } }));
+      if (r.status === 401 || r.status === 403) throw new Error('key refused');
+      // Some Resend keys may only send; anything but an auth error means the key works.
+      setService('mail', 'Email', 'ok', 'Connected');
+    } catch (e) { setService('mail', 'Email', 'bad', 'Resend refused the key: ' + e.message); }
+  })());
+  await Promise.allSettled(checks);
+
+  for (const s of Object.values(state.services)) {
+    const key = 'svc:' + s.key;
+    if (s.status === 'bad') setIssue(key, 'bad', s.label + ' is down', s.detail, null, 'service', s.label);
+    else delete state.issues[key];
+  }
+
+  // Jobs: stalled or failing
+  for (const j of Object.values(state.jobs)) {
+    const key = 'job:' + j.key;
+    const late = j.lastStart ? ago(j.lastStart) : ago(state.startedAt);
+    const stalled = late > j.every * 3 + 120000;
+    if (stalled) setIssue(key, late > 3600000 ? 'bad' : 'warn', j.label + ' has stopped', 'Last ran ' + (j.lastStart ? mins(late) + ' min ago' : 'never since the server started') + ', it should run every ' + mins(j.every) + ' min. A Railway redeploy usually fixes this.', null, 'job', j.label);
+    else if (j.streak >= 3) setIssue(key, 'bad', j.label + ' keeps failing', 'Failed ' + j.streak + ' times in a row: ' + (j.err || 'unknown error'), null, 'job', j.label);
+    else delete state.issues[key];
+  }
+  state.lastServiceRun = new Date().toISOString();
+}
+
+// ── 3. DATA CHECKS ──
+async function q(table, build) { const r = await build(supabase.from(table)); if (r.error) throw new Error(table + ': ' + r.error.message); return r.data || []; }
+async function checkData() {
+  const run = async (key, fn) => { try { await fn(); } catch (e) { console.warn('health data check ' + key + ':', e.message); } };
+  const since = (h) => new Date(Date.now() - h * 3600 * 1000).toISOString();
+
+  // Razorpay has a captured payment that we never recorded (webhook missed)
+  await run('rzp-missing', async () => {
+    const k = process.env.RAZORPAY_KEY_ID, s = process.env.RAZORPAY_KEY_SECRET; if (!k || !s) return;
+    const from = Math.floor((Date.now() - 48 * 3600 * 1000) / 1000), to = Math.floor((Date.now() - 20 * 60 * 1000) / 1000);
+    const r = await timed(fetch('https://api.razorpay.com/v1/payments?count=50&from=' + from + '&to=' + to, { headers: { Authorization: 'Basic ' + Buffer.from(k + ':' + s).toString('base64') } }));
+    if (!r.ok) return;
+    const items = ((await r.json()).items || []).filter(p => p.status === 'captured');
+    if (!items.length) { delete state.issues['data:rzp-missing']; return; }
+    const ids = items.map(p => p.id), seen = new Set();
+    for (const t of ['payments', 'fee_payments', 'participants', 'unassigned_payments']) {
+      const rows = await q(t, x => x.select('razorpay_payment_id').in('razorpay_payment_id', ids)).catch(() => []);
+      rows.forEach(r => seen.add(r.razorpay_payment_id));
+    }
+    const missing = items.filter(p => !seen.has(p.id));
+    if (missing.length) {
+      const m = missing[0];
+      setIssue('data:rzp-missing', 'bad', missing.length + ' payment' + (missing.length > 1 ? 's' : '') + ' received but not recorded',
+        'Razorpay has the money but the dashboard does not know about it, so the webhook did not reach the server. Latest: ' + (m.currency === 'INR' ? '₹' : m.currency + ' ') + (m.amount / 100) + (m.email ? ' from ' + m.email : '') + ' (' + m.id + ').',
+        { label: 'Open Razorpay', url: 'https://dashboard.razorpay.com/app/payments/' + m.id }, 'payments');
+    } else delete state.issues['data:rzp-missing'];
+  });
+
+  // Invoice emails that failed
+  await run('invoice-failed', async () => {
+    const rows = await q('invoices', x => x.select('id, billed_name, email_error, created_at').not('email_error', 'is', null).gte('created_at', since(24 * 7)).limit(20));
+    const open = rows.filter(r => r.email_error);
+    if (open.length) setIssue('data:invoice-failed', 'warn', open.length + ' invoice email' + (open.length > 1 ? 's' : '') + ' failed', open.slice(0, 3).map(r => (r.billed_name || r.id) + ': ' + String(r.email_error).slice(0, 80)).join(' · '), { label: 'Open invoices', sec: 'invoices' }, 'payments');
+    else delete state.issues['data:invoice-failed'];
+  });
+
+  // Fee links unpaid for 7+ days
+  await run('fee-old', async () => {
+    const rows = await q('fee_requests', x => x.select('id, student_id, created_at').eq('status', 'pending').lte('created_at', since(24 * 7)).limit(50));
+    if (rows.length) {
+      const studs = await q('students', x => x.select('id, full_name').in('id', rows.map(r => r.student_id).filter(Boolean))).catch(() => []);
+      const nm = Object.fromEntries(studs.map(s => [s.id, s.full_name]));
+      setIssue('data:fee-old', 'warn', rows.length + ' fee link' + (rows.length > 1 ? 's' : '') + ' unpaid for 7+ days', rows.slice(0, 4).map(r => nm[r.student_id] || r.student_id).join(', ') + (rows.length > 4 ? ' and ' + (rows.length - 4) + ' more' : ''), { label: 'Open Fee Tracker', sec: 'fee-payments' }, 'payments');
+    } else delete state.issues['data:fee-old'];
+  });
+
+  // WhatsApp messages that failed in the last 24 h
+  await run('wa-failed', async () => {
+    const rows = await q('wa_messages', x => x.select('id, phone, error, created_at').eq('direction', 'out').eq('status', 'failed').gte('created_at', since(24)).limit(30));
+    if (rows.length) setIssue('data:wa-failed', rows.length >= 5 ? 'bad' : 'warn', rows.length + ' WhatsApp message' + (rows.length > 1 ? 's' : '') + ' failed today', 'Latest to +' + rows[0].phone + (rows[0].error ? ': ' + String(rows[0].error).slice(0, 100) : '') + '.', { label: 'Open Inbox', sec: 'whatsapp' }, 'whatsapp');
+    else delete state.issues['data:wa-failed'];
+  });
+
+  // Agent drafts waiting for Arpit for 3+ hours
+  await run('drafts-old', async () => {
+    let rows = await q('wa_drafts', x => x.select('id, phone, created_at').eq('status', 'pending').lte('created_at', since(3)).gte('created_at', since(72)).limit(30));
+    // Only count people whose last message is still theirs (Arpit may have answered from his phone).
+    const phones = [...new Set(rows.map(r => r.phone))];
+    if (phones.length) {
+      const msgs = await q('wa_messages', x => x.select('phone, direction, created_at, type').in('phone', phones).gte('created_at', since(96)).order('created_at', { ascending: false }).limit(500)).catch(() => []);
+      const last = {}; msgs.forEach(m => { if (!last[m.phone] && m.type !== 'reaction') last[m.phone] = m; });
+      rows = rows.filter(r => last[r.phone] && last[r.phone].direction === 'in');
+    }
+    if (rows.length) setIssue('data:drafts-old', 'warn', rows.length + ' reply draft' + (rows.length > 1 ? 's' : '') + ' waiting 3+ hours', 'People are waiting for an answer.', { label: 'Open Inbox', sec: 'whatsapp' }, 'whatsapp');
+    else delete state.issues['data:drafts-old'];
+  });
+
+  // Questions the agent could not answer this week (input for the AI review later)
+  await run('needs-arpit', async () => {
+    const rows = await q('wa_drafts', x => x.select('id, category').eq('needs_arpit', true).gte('created_at', since(24 * 7)).limit(200)).catch(() => []);
+    const by = {}; rows.forEach(r => { const c = r.category || 'other'; by[c] = (by[c] || 0) + 1; });
+    state.asked = Object.entries(by).sort((a, b) => b[1] - a[1]).map(([category, count]) => ({ category, count }));
+  });
+
+  // Today's and tomorrow's class meetings without a Zoom link
+  await run('zoom-links', async () => {
+    const today = istYmd(), tomorrow = istYmd(new Date(istNow().getTime() + 86400000));
+    const rows = await q('class_meetings', x => x.select('id, student_id, class_date, time_ist, join_url, status').in('class_date', [today, tomorrow]).eq('status', 'scheduled')).catch(() => []);
+    const noLink = rows.filter(r => !r.join_url);
+    const trials = await q('trials', x => x.select('id, full_name, start_at, join_url, status').eq('status', 'booked').gte('start_at', new Date().toISOString()).lte('start_at', new Date(Date.now() + 36 * 3600 * 1000).toISOString())).catch(() => []);
+    const tNo = trials.filter(t => !t.join_url);
+    const n = noLink.length + tNo.length;
+    if (n) setIssue('data:zoom-links', 'warn', n + ' upcoming class' + (n > 1 ? 'es have' : ' has') + ' no Zoom link', [...noLink.map(r => r.student_id + ' ' + r.class_date + ' ' + (r.time_ist || '')), ...tNo.map(t => 'Trial: ' + (t.full_name || t.id))].slice(0, 4).join(' · '), { label: 'Open Schedule', sec: 'schedule' }, 'classes');
+    else delete state.issues['data:zoom-links'];
+  });
+
+  // Error bursts (same error 3+ times in the last hour)
+  await run('errors', async () => {
+    const rows = await q('system_errors', x => x.select('id, source, location, message, count, last_at').eq('resolved', false).gte('last_at', since(1)).order('last_at', { ascending: false }).limit(20)).catch(() => []);
+    state.recentErrors = rows;
+    const burst = rows.filter(r => (r.count || 0) >= 3);
+    if (burst.length) setIssue('data:errors', 'warn', burst.length + ' error' + (burst.length > 1 ? 's' : '') + ' repeating', burst.slice(0, 2).map(r => (r.location || r.source) + ': ' + String(r.message).slice(0, 90)).join(' · '), null, 'errors');
+    else delete state.issues['data:errors'];
+  });
+  state.lastDataRun = new Date().toISOString();
+}
+
+// ── ALERTS ──
+async function notifyRow(type, message) {
+  try { await supabase.from('notifications').insert({ type, message, read: false }); } catch (e) {}
+}
+async function alertTransitions() {
+  const now = Date.now();
+  let changed = false;
+  for (const i of Object.values(state.issues)) {
+    if (i.level !== 'bad') continue;
+    if (snoozed[i.key] && new Date(snoozed[i.key]).getTime() > now) continue;
+    const memo = alertMemo[i.key];
+    if (!memo || now - memo.sentAt > REALERT_MS) {
+      await notifyRow('warning', '🔴 ' + i.title + '. ' + i.detail);
+      alertMemo[i.key] = { level: i.level, sentAt: now, title: i.title, name: i.name };
+      changed = true;
+    }
+  }
+  for (const key of Object.keys(alertMemo)) {
+    if (!state.issues[key] || state.issues[key].level !== 'bad') {
+      const m = alertMemo[key];
+      delete alertMemo[key]; changed = true;
+      const body = m.name ? '✅ ' + m.name + ' is working again.' : '✅ Sorted: ' + (m.title || 'an earlier problem') + '.';
+      if (deps.push) deps.push.send('alert', { title: 'Studio', body, tag: 'health-' + key, url: '/pages/dashboard#sec=health' });
+    }
+  }
+  if (changed) await saveJson('health_alerts', alertMemo);
+}
+async function morningDigest() {
+  const day = istYmd();
+  if (lastDigestDay === day || istHHMM() < DIGEST_HHMM) return;
+  lastDigestDay = day;
+  await saveJson('health_digest', { day });
+  const open = Object.values(state.issues).filter(i => !(snoozed[i.key] && new Date(snoozed[i.key]).getTime() > Date.now()));
+  if (!open.length) {
+    if (deps.push) deps.push.send('alert', { title: 'Morning check', body: '✅ Everything is running fine.', tag: 'health-digest', url: '/pages/dashboard#sec=health' });
+    return;
+  }
+  const list = open.sort((a, b) => (a.level === 'bad' ? 0 : 1) - (b.level === 'bad' ? 0 : 1)).slice(0, 5).map(i => (i.level === 'bad' ? '🔴 ' : '⚠️ ') + i.title).join('; ');
+  await notifyRow('warning', '⚠️ Morning check: ' + open.length + ' thing' + (open.length > 1 ? 's need' : ' needs') + ' you. ' + list + '.');
+}
+
+// ── LOOP ──
+let svcBusy = false, dataBusy = false;
+async function serviceTick() {
+  if (svcBusy) return; svcBusy = true;
+  try { await checkServices(); await flushErrors(); await alertTransitions(); await morningDigest(); }
+  catch (e) { console.warn('health service tick:', e.message); }
+  finally { svcBusy = false; }
+}
+async function dataTick() {
+  if (dataBusy) return; dataBusy = true;
+  try { await checkData(); await alertTransitions(); }
+  catch (e) { console.warn('health data tick:', e.message); }
+  finally { dataBusy = false; }
+}
+
+function init(client, d = {}) {
+  supabase = client; deps = d;
+  watchJobs(); watchConsole();
+}
+async function startWorker() {
+  alertMemo = await loadJson('health_alerts', {});
+  snoozed = await loadJson('health_snooze', {});
+  const dg = await loadJson('health_digest', {}); lastDigestDay = dg.day || null;
+  // Using the untouched timer so the watcher does not watch itself.
+  setTimeout(() => { serviceTick(); dataTick(); }, 45 * 1000);
+  setInterval(serviceTick, SERVICE_EVERY);
+  setInterval(dataTick, DATA_EVERY);
+  console.log('Health watch on (' + VERSION + '): ' + Object.keys(state.jobs).length + ' jobs watched');
+}
+
+// ── ENDPOINTS ──
+function publicIssue(i) { return { ...i, snoozedUntil: snoozed[i.key] || null }; }
+function statusHandler(req, res) {
+  const issues = Object.values(state.issues).map(publicIssue).sort((a, b) => (a.level === 'bad' ? 0 : 1) - (b.level === 'bad' ? 0 : 1));
+  const active = issues.filter(i => !(i.snoozedUntil && new Date(i.snoozedUntil) > new Date()));
+  res.json({
+    ok: true, version: VERSION, startedAt: state.startedAt,
+    checkedAt: state.lastServiceRun, dataCheckedAt: state.lastDataRun,
+    overall: active.some(i => i.level === 'bad') ? 'bad' : active.length ? 'warn' : 'ok',
+    services: Object.values(state.services),
+    jobs: Object.values(state.jobs).map(j => ({ key: j.key, label: j.label, every: j.every, lastStart: j.lastStart, lastOk: j.lastOk, lastErr: j.lastErr, err: j.err, runs: j.runs, fails: j.fails, streak: j.streak,
+      status: state.issues['job:' + j.key] ? state.issues['job:' + j.key].level : 'ok' })),
+    issues, asked: state.asked || [], errors: (state.recentErrors || []).slice(0, 10)
+  });
+}
+async function runHandler(req, res) {
+  await Promise.allSettled([serviceTick(), dataTick()]);
+  statusHandler(req, res);
+}
+async function snoozeHandler(req, res) {
+  const key = String(req.body?.key || ''); const hours = Math.min(168, Math.max(1, Number(req.body?.hours) || 24));
+  if (!key) return res.status(400).json({ error: 'key required' });
+  snoozed[key] = new Date(Date.now() + hours * 3600 * 1000).toISOString();
+  await saveJson('health_snooze', snoozed);
+  res.json({ ok: true, until: snoozed[key] });
+}
+// Errors from the dashboard / website. Public, so it is small and rate limited.
+const hits = new Map();
+function clientErrorHandler(req, res) {
+  const ip = String(req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim();
+  const now = Date.now(), h = hits.get(ip) || [];
+  const recent = h.filter(t => now - t < 60000); recent.push(now); hits.set(ip, recent);
+  if (hits.size > 2000) hits.clear();
+  if (recent.length > 10) return res.status(429).json({ ok: false });
+  const b = req.body || {};
+  const page = String(b.page || 'site').replace(/[^a-z0-9._/-]/gi, '').slice(0, 60) || 'site';
+  const msg = String(b.message || '').slice(0, 400);
+  const at = String(b.at || '').slice(0, 160);
+  if (msg) recordError(/dashboard/.test(page) ? 'dashboard' : 'site', page, msg + (at ? ' @ ' + at : ''));
+  res.json({ ok: true });
+}
+async function resolveErrorHandler(req, res) {
+  try { await supabase.from('system_errors').update({ resolved: true }).eq('id', req.params.id); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+}
+
+module.exports = { init, startWorker, statusHandler, runHandler, snoozeHandler, clientErrorHandler, resolveErrorHandler, recordError,
+  _test: { state, jobKeyFor, normalizeMsg, checkServices, checkData, alertTransitions, morningDigest, setIssue, flushErrors, errBuf, setDeps: (c, d) => { supabase = c; deps = d; } } };
