@@ -263,6 +263,17 @@ async function requestHandler(req, res) {
     const msg = (changed ? '🔁 Weekly class request changed: ' : '🔴 New weekly class request' + (row.source === 'site' ? ' (from the website, no trial)' : '') + ': ') + row.full_name + ' · ' + DAYS[r2.slot_weekday].slice(0, 3) + ' ' + time12(r2.slot_time) + ' IST' +
       (tz !== IST ? ' (' + time12(partsIn(start, tz).hhmm) + ' ' + tzName(tz) + ')' : '') + ' · ' + p.label + ' ' + money(p.amount, price) + '. Approve it in Today.';
     await notify('trial', msg);
+    // The person gets their own link by email, so they can come back without signing in.
+    {
+      const first = nextOccurrence(r2, ((settings.min_notice_hours || 12) * HOUR));
+      await mail(row.email, (changed ? 'Updated: ' : '') + 'Your weekly handpan class request',
+        '<p style="margin:0 0 14px;font-size:16px;">Hi ' + esc(firstName(row.full_name)) + ',</p>' +
+        '<p style="margin:0 0 12px;line-height:1.55;">Thanks! I’ve got your request for <b>' + esc(slotText(r2)) + '</b>, ' + esc(p.label.toLowerCase()) + ' plan (' + p.classes + ' classes, ' + esc(money(p.amount, price)) + ').' + (first ? ' Your first class would be ' + esc(nice(first, tz)) + '.' : '') + '</p>' +
+        '<p style="margin:0;line-height:1.55;">This time is held for you while I confirm, usually within a day. Nothing to pay yet: you get the payment link once I confirm.</p>' +
+        btn(linkFor(row), 'See or change your request') +
+        '<p style="margin:0;line-height:1.55;color:#6B5150;font-size:14px;">Keep this email. The button always opens your request, no sign-in needed.</p>',
+        'Hi ' + firstName(row.full_name) + ', I got your request for ' + slotText(r2) + ' (' + p.label + ', ' + money(p.amount, price) + '). I will confirm within a day. See or change it: ' + linkFor(row));
+    }
     pushArpit('🗓️ ' + firstName(row.full_name) + ' wants weekly classes', DAYS[r2.slot_weekday].slice(0, 3) + ' ' + time12(r2.slot_time) + ' IST · ' + p.label, 'enrol-' + row.id);
     res.json(await view(r2));
   } catch (e) { console.error('enrol request error:', e.message); res.status(500).json({ ok: false, error: 'Could not send right now. Please try again.' }); }
@@ -390,7 +401,8 @@ async function approveRow(row, { by } = {}) {
     '<p style="margin:0 0 14px;font-size:16px;">Hi ' + esc(firstName(row.full_name)) + ',</p>' +
     '<p style="margin:0 0 12px;line-height:1.55;">' + (by === 'student' ? 'You’re confirmed for ' : 'I’ve confirmed your weekly class: ') + '<b>' + esc(slotText(r)) + '</b>, ' + esc(plan.label.toLowerCase()) + ' plan (' + plan.classes + ' classes, ' + esc(money(row.amount, price)) + ').</p>' +
     '<p style="margin:0;line-height:1.55;">Pay to lock the time in. It’s held for you until <b>' + esc(nice(new Date(payBy).getTime(), tz)) + '</b>.</p>' + btn(payUrl, 'Pay ' + money(row.amount, price)) +
-    '<p style="margin:0;line-height:1.55;color:#6B5150;font-size:14px;">After paying you’ll get your Zoom link, an invoice and a calendar invite.</p>',
+    '<p style="margin:0 0 10px;line-height:1.55;color:#6B5150;font-size:14px;">After paying you’ll get your Zoom link, an invoice and a calendar invite.</p>' +
+    '<p style="margin:0;font-size:14px;"><a href="' + linkFor(row) + '" style="color:#500018;">Switch plan or pick a different time</a></p>',
     'Hi ' + firstName(row.full_name) + ', your weekly class (' + slotText(r) + ') is confirmed. Pay here to lock it in: ' + payUrl);
   await notify('info', '✅ Weekly classes approved for ' + row.full_name + ' (' + student.id + (created ? ', new' : '') + ') · ' + feeId + ' · pay by ' + nice(new Date(payBy).getTime(), IST) + ' IST.' + (by === 'student' ? ' They accepted your other time.' : ''));
   return { ok: true, studentId: student.id, feeRequestId: feeId, payUrl };
