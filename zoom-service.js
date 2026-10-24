@@ -118,6 +118,19 @@ async function maybeAutoRenewal(student) {
       .select('id').eq('student_id', student.id).eq('status', 'pending').limit(1);
     if (pending && pending.length) return { created: false, reason: 'pending_exists' };
 
+    // Arpit cancelled the last renewal after the student's latest class? Then
+    // he is handling it himself (break, package change): don't recreate it.
+    const { data: lastReq } = await supabase.from('fee_requests')
+      .select('id, status, created_at').eq('student_id', student.id)
+      .order('created_at', { ascending: false }).limit(1);
+    const { data: lastLog } = await supabase.from('class_log')
+      .select('created_at').eq('student_id', student.id)
+      .order('created_at', { ascending: false }).limit(1);
+    const lr = lastReq && lastReq[0], ll = lastLog && lastLog[0];
+    if (lr && lr.status === 'cancelled' && (!ll || String(lr.created_at) > String(ll.created_at))) {
+      return { created: false, reason: 'cancelled_by_arpit' };
+    }
+
     // Copy the most recent non-cancelled request as the package template.
     const { data: prevRows } = await supabase.from('fee_requests')
       .select('id, classes, amount, currency, list_amount, discount_pct, status')
@@ -493,6 +506,43 @@ async function paidClasses(studentId) {
   return (data || []).filter(f => f.paid !== false).reduce((a, f) => a + (Number(f.classes) || 0), 0);
 }
 
+// ── DAILY RENEWAL CHECK ──
+// Catches what the per-class trigger misses: classes logged by hand in the
+// dashboard, and students who were already at 0 before auto renewal existed.
+// Active students with an active weekly slot and 0 (or fewer) paid classes
+// left get the renewal. Runs every hour but is idempotent (one pending
+// request per student, and a renewal Arpit cancelled is never recreated).
+async function takenClasses(studentId) {
+  const { data } = await supabase.from('class_log').select('is_free').eq('student_id', studentId);
+  return (data || []).filter(l => !l.is_free).length;
+}
+async function renewalCheck() {
+  if (!supabase || !autoFeeRequestsOn()) return { skipped: 'off' };
+  const out = [];
+  try {
+    const [{ data: studs }, { data: slots }] = await Promise.all([
+      supabase.from('students').select('id, full_name, status, archived'),
+      supabase.from('class_schedule').select('student_id, active')
+    ]);
+    const withSlot = new Set((slots || []).filter(r => r.active !== false).map(r => r.student_id));
+    for (const st of studs || []) {
+      if (st.archived || !/^active$/i.test(String(st.status || '').trim()) || !withSlot.has(st.id)) continue;
+      const left = (await paidClasses(st.id)) - (await takenClasses(st.id));
+      if (left > 0) continue;
+      const auto = await maybeAutoRenewal(st);
+      if (auto.created) {
+        const sym = auto.currency === 'INR' ? '₹' : auto.currency + ' ';
+        await notify('payment', `💳 ${st.full_name || st.id} has ${left === 0 ? 'no paid classes left' : -left + ' unpaid class' + (left === -1 ? '' : 'es')}. Renewal ${auto.id} sent (${auto.classes} classes, ${sym}${auto.amount}). Cancel it in the dashboard if the package should change.`);
+        out.push(st.id + ' ' + auto.id);
+      } else if (auto.reason === 'no_previous') {
+        out.push(st.id + ' no package to copy');
+      }
+    }
+    if (out.length) console.log('Renewal check:', out.join(', '));
+  } catch (e) { console.error('renewal check failed:', e.message); }
+  return { done: out };
+}
+
 // Log one class. Skips if the student already has any class on that date.
 // First class of a brand new student (nothing paid, nothing logged) is a free trial.
 async function logClass({ student, classDate, minutes, meetingUuid, how }) {
@@ -712,6 +762,9 @@ function startWorker() {
   console.log('Zoom meeting sync: ' + (autoMeetingsOn() ? 'ON (every 6h)' : 'off (ZOOM_AUTO_MEETINGS not set)'));
   setTimeout(() => syncMeetings().catch(e => console.error('zoom sync error:', e.message)), 90 * 1000);
   setInterval(() => syncMeetings().catch(e => console.error('zoom sync error:', e.message)), SYNC_EVERY_MS);
+  console.log('Renewal check: ' + (autoFeeRequestsOn() ? 'ON (every hour)' : 'off (AUTO_FEE_REQUESTS not on)'));
+  setTimeout(() => renewalCheck(), 3 * 60 * 1000);
+  setInterval(() => renewalCheck(), 60 * 60 * 1000);
 }
 
 function status() {
@@ -899,6 +952,6 @@ async function resolveUnmatched(id, studentId) {
 }
 
 module.exports = {
-  init, setTrialHook, zoomApi, webhookHandler, liveHandler, startWorker, processPending, resolveUnmatched, status, syncMeetings,
+  init, setTrialHook, zoomApi, webhookHandler, liveHandler, startWorker, renewalCheck, processPending, resolveUnmatched, status, syncMeetings,
   _test: { liveEvent, liveList, LIVE, processMeeting, cleanParticipants, planMeeting, buildIndex, matchPerson, studentsInTopic, isTrialTopic, encodeUuid, istDate, normName, hmac, MIN_MINUTES, TRIAL_MIN_MINUTES }
 };
