@@ -1844,7 +1844,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
               const amt = symbol + Number(amountMajor).toLocaleString(isINR ? 'en-IN' : 'en-US', { maximumFractionDigits: 2 });
               const what = classes ? (classes === 1 ? '1 class' : `${classes} classes`) : 'your classes';
               const first = String(studentName || '').trim().split(/\s+/)[0] || 'there';
-              const r = await whatsapp.sendTemplate(toPhone, 'fee_receipt', [first, amt, what], { document: doc });
+              const r = await whatsapp.sendTemplate(toPhone, 'fee_receipt', [first, amt, what], { document: doc, invoiceId: invoice.invoiceId });
               if (!r.ok) {
                 await supabase.from('notifications').insert({ type: 'warning', message: `⚠️ WhatsApp receipt to ${studentName} (${feeId}) failed: ${r.error}. The invoice email still went.`, read: false });
               }
