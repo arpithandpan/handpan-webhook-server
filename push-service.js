@@ -131,7 +131,7 @@ function onWhatsApp(phone, type, info) {
 function onDraft(draft, who) {
   if (!draft || draft.status !== 'pending') return;
   send('draft', {
-    title: '✦ Draft ready · ' + (who || ('+' + draft.phone)),
+    title: (draft.auto_at ? '✦ Auto reply in ' + Math.max(1, Math.round((new Date(draft.auto_at) - Date.now()) / 60000)) + ' min · ' : '✦ Draft ready · ') + (who || ('+' + draft.phone)),
     body: (draft.needs_arpit && draft.note ? 'Needs you: ' + draft.note + '\n' : '') + String(draft.body || '').slice(0, 160),
     tag: 'wa-' + draft.phone,      // replaces the message push for this chat
     renotify: false,
