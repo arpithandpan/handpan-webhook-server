@@ -105,7 +105,7 @@ const supabase = createClient(
 );
 // Health watch first: it starts timing the background jobs before they begin.
 const health = require('./health-service');
-health.init(supabase, { zoomApi: zoom.zoomApi, push: require('./push-service') });
+health.init(supabase, { zoomApi: zoom.zoomApi, push: require('./push-service'), whatsapp, invoice: require('./invoice-service') });
 zoom.init(supabase);
 notifyMailer.init(supabase);
 settlementWorker.init(supabase);
