@@ -120,8 +120,9 @@ function monthLong(ym) {
 function packageLabel(classes, month) {
   const n = parseInt(classes, 10) || 0;
   const base = n === 1 ? '1 class' : `${n} classes`;
-  const ml = monthLong(month);
-  return ml ? `${base} (${ml})` : base;
+  // No month (24 Oct 2026): students skip and move classes, and pay only for
+  // the classes they attend, so "(October 2026)" read like an expiry date.
+  return base;
 }
 
 // ── SEND ONE TEMPLATE ──
