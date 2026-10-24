@@ -8,8 +8,8 @@
 // too (via Meta's Cloud API, template `dashboard_alert`). One place,
 // catches everything — nothing else in the codebase needed changing.
 //
-// Channels are decided by category (see channelFor). Email gets everything;
-// WhatsApp gets only what channelFor marks urgent.
+// Channels are decided by channelFor: since 24 Oct only failures go to
+// email and WhatsApp; the Studio app push gets everything.
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const NOTIFY_EMAIL_TO = (process.env.NOTIFY_EMAIL_TO || 'arpithandpan@gmail.com').trim();
@@ -38,19 +38,25 @@ function setPushHook(fn) { pushHook = fn; }
 // Routing looks at what the message is about, since the notifications
 // table only stores type + message text.
 function channelFor(n) {
+  // 24 Oct 2026: the Studio app push now carries everything. Email and the
+  // Alerts WhatsApp only get things that broke and need Arpit's hands
+  // (a failed send, something that could not be created or saved).
+  // Everything stays in the dashboard's Notifications list as before.
+  // NOTIFY_EMAIL_ALL=on brings back "email everything".
   const msg = String(n.message || '');
-  const urgent =
-    n.type === 'payment'                       // money in, fee reminders
-    || /payment failed/i.test(msg)             // student tried to pay, failed
-    || /not linked to a student/i.test(msg)    // zoom review needed
-    || /joined only \d+ min/i.test(msg)       // short Zoom attendance, class not counted
-    // WhatsApp replies are no longer sent to the Alerts WhatsApp: the Studio
-    // app push (push-service.js) pings the phone the moment they arrive.
-    || /Upcoming class/i.test(msg)             // Arpit's own class heads-up
-    || /New trial booked/i.test(msg)           // someone booked on the trial page
-    || /Zoom meeting could not be created/i.test(msg)   // trial booked, link must go by hand
-    || /via My (classes|bookings):/i.test(msg);                     // a student moved / skipped / booked a make-up
-  return { email: true, whatsapp: urgent };
+  const critical = n.type === 'warning' && (/^\s*(🔴|⚠️)/u.test(msg) || /\bfail(ed|ure)?\b|could not|couldn.t/i.test(msg));
+  const all = String(process.env.NOTIFY_EMAIL_ALL || '').toLowerCase() === 'on';
+  // Phone push: the things Arpit wants to know about straight away.
+  const push = critical
+    || n.type === 'payment'                       // money in, enrolled, fee due
+    || /payment failed/i.test(msg)
+    || /not linked to a student/i.test(msg)
+    || /joined only \d+ min/i.test(msg)
+    || /Upcoming class/i.test(msg)
+    || /New trial booked/i.test(msg)
+    || /via My (classes|bookings):/i.test(msg)
+    || /expired|didn.t pay|didn.t answer/i.test(msg);   // a held weekly time was released
+  return { email: critical || all, whatsapp: critical, push };
 }
 
 // Subject: the message itself, trimmed. Emojis in the messages already
@@ -138,12 +144,14 @@ async function processPending() {
     if (error) { console.error('notify-mailer query error:', error.message); return; }
 
     for (const n of data || []) {
-      // 0) Phone push for urgent rows, once (first time we see the row).
-      if (pushHook && !n.emailed && !(Number(n.email_attempts) > 0) && channelFor(n).whatsapp) {
+      // 0) Phone push, once (first time we see the row).
+      if (pushHook && !n.emailed && !(Number(n.email_attempts) > 0) && channelFor(n).push) {
         try { pushHook(n); } catch (e) {}
       }
-      // 1) Email — untouched behaviour.
-      if (!n.emailed) {
+      // 1) Email: only rows channelFor marks for email; the rest are marked done.
+      if (!n.emailed && !channelFor(n).email) {
+        await supabase.from('notifications').update({ emailed: true }).eq('id', n.id);
+      } else if (!n.emailed) {
         try {
           await sendEmail(n);
           await supabase.from('notifications').update({ emailed: true }).eq('id', n.id);
