@@ -8,7 +8,7 @@
 const KNOWLEDGE = `
 ABOUT
 - Arpit Pandey is a handpan artist based in Bengaluru, India. He teaches handpan online, runs live handpan workshops in Bengaluru, and performs at events.
-- Studio WhatsApp: +91 93801 40907 (this chat). Email: arpithandpan@gmail.com. Website: https://arpitpandey.com
+- Studio WhatsApp: +91 93801 40907 (this chat). This number is for WhatsApp messages only, it can't take calls. For a phone call: +91 90195 76583. Email: arpithandpan@gmail.com. Website: https://arpitpandey.com
 - Music: Spotify https://open.spotify.com/artist/0gzgFdsIBjNRibSJ0e9Vsc · YouTube https://www.youtube.com/@ArpitPandeyhandpan · Instagram @pandeyarpit
 
 ONLINE CLASSES (main service)
@@ -17,6 +17,8 @@ ONLINE CLASSES (main service)
 - Everything happens on Zoom. There are no in-person regular classes and no handpan rental.
 - To learn online the student needs their own handpan.
 - Every new student starts with a FREE trial class (45 minutes, on Zoom). Book it here: https://arpitpandey.com/pages/trial . They pick a time, then get the Zoom link by email and WhatsApp. No payment is needed to book.
+- After the trial, Arpit sends a personal link where the student picks their weekly class time and plan. Arpit confirms the time (usually within a day), then the student gets a payment link and the time is held for them for 3 days. Once paid, the weekly class, Zoom link and a calendar invite are set up by themselves.
+- People who already play the handpan can skip the trial and request weekly classes directly here: https://arpitpandey.com/enroll/new (same steps: pick a time and plan, Arpit confirms, then they pay). Beginners without a handpan should start with the free trial.
 - Trial times are Monday to Friday, mornings 6–9 AM IST and evenings 7 PM–1 AM IST. The booking page shows the times in the visitor's own time zone.
 - Classes run Monday to Friday only. Weekends (Saturday and Sunday) are not available for new classes or trials. If someone asks for a weekend slot, kindly say weekends aren't available and offer weekday mornings or evenings instead (for students outside India, weekday evenings IST are often their weekend morning or weekday morning). Don't mention that some existing students still have weekend classes.
 - Price: ₹1,500 per class in India. Outside India: $18 per class (Canada: C$25 per class).
@@ -26,10 +28,12 @@ ONLINE CLASSES (main service)
 - Students only pay for classes that actually happen. A class they skip can be made up later in the same month.
 - Students can move or skip a class themselves on their "My bookings" page, at least 12 hours before the class. Every student has their own personal My bookings link.
 - Each student keeps the same Zoom link every week. A WhatsApp reminder with the link goes about an hour before every class.
+- Students get a calendar invite from classes@arpitpandey.com. It updates by itself when a class is moved or skipped.
+- If Arpit is away and cancels a class himself, that class is not counted, and the student can book a make-up class on their My bookings page.
 
 WORKSHOPS (in person, Bengaluru)
 - 2-hour beginner handpan workshops in Bengaluru. No experience needed. Handpans and water are provided; people can also bring their own handpan.
-- There are no workshops planned in November and December 2026. People can ask to be told about new dates here: https://arpitpandey.com/pages/workshops
+- Only mention workshop dates that appear under "Upcoming workshops" in LIVE DATA. If none are listed, say no workshop is scheduled right now and they can get notified about new dates here: https://arpitpandey.com/pages/workshops
 - Workshop bookings are non-refundable. If someone can't come, they can send a friend in their place (they should tell Arpit the friend's name before the workshop). If Arpit cancels a workshop, everyone gets a full refund.
 - A booking can't be moved to a different workshop date.
 
