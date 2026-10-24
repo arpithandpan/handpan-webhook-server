@@ -171,16 +171,16 @@ async function sendTemplate(toPhone, templateName, bodyParams, opts) {
     if (!res.ok) {
       const msg = data?.error?.message || `HTTP ${res.status}`;
       console.error(`WA send failed (${templateName} → ${to}):`, msg);
-      await logOutgoingTemplate(to, templateName, bodyParams, null, msg);
+      await logOutgoingTemplate(to, templateName, bodyParams, null, msg, opts);
       return { ok: false, error: msg };
     }
     const id = data?.messages?.[0]?.id || null;
     console.log(`WA sent: ${templateName} → ${to} (${id})`);
-    await logOutgoingTemplate(to, templateName, bodyParams, id, null);
+    await logOutgoingTemplate(to, templateName, bodyParams, id, null, opts);
     return { ok: true, id };
   } catch (e) {
     console.error(`WA send error (${templateName}):`, e.message);
-    await logOutgoingTemplate(to, templateName, bodyParams, null, e.message);
+    await logOutgoingTemplate(to, templateName, bodyParams, null, e.message, opts);
     return { ok: false, error: e.message };
   }
 }
@@ -237,7 +237,7 @@ function renderTemplate(text, params) {
   });
 }
 
-async function logOutgoingTemplate(to, templateName, bodyParams, waId, error) {
+async function logOutgoingTemplate(to, templateName, bodyParams, waId, error, opts) {
   let bodies = await templateBodies();
   if (!bodies[templateName]) bodies = await templateBodies(true);
   const text = bodies[templateName];
@@ -247,7 +247,9 @@ async function logOutgoingTemplate(to, templateName, bodyParams, waId, error) {
     wa_id: waId || null,
     type: 'template',
     template: templateName,
-    params: (bodyParams || []).map(String),
+    // A template with a PDF on top (fee_receipt) keeps which invoice it was,
+    // so the Inbox can show the file and open it.
+    params: opts && opts.document ? { values: (bodyParams || []).map(String), doc: { name: opts.document.filename || 'Invoice.pdf', invoiceId: opts.invoiceId || null } } : (bodyParams || []).map(String),
     body: text ? renderTemplate(text, bodyParams) : null,
     status: waId ? 'sent' : 'failed',
     status_at: new Date().toISOString(),
