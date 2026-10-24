@@ -141,6 +141,24 @@ async function liveData(phone, contactName) {
     lines.push('They attended a past workshop.');
   }
 
+  // Weekly classes request in progress (self-enrolment).
+  try {
+    const k = last10(phone);
+    const { data: er } = await supabase.from('enrol_requests').select('status, plan, slot_weekday, slot_time, pay_by').ilike('phone', '%' + k).in('status', ['invited', 'requested', 'offered', 'approved']).order('created_at', { ascending: false }).limit(1);
+    const r = (er || [])[0];
+    if (r) {
+      const D = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+      const t = r.slot_weekday != null ? D[r.slot_weekday] + ' ' + (h => ((h[0] % 12) || 12) + ':' + String(h[1]).padStart(2, '0') + (h[0] < 12 ? ' AM' : ' PM'))(String(r.slot_time || '00:00').split(':').map(Number)) + ' IST' : '';
+      lines.push('Weekly classes request: ' + ({ invited: 'they have the link but have not picked a time yet', requested: 'they asked for ' + t + ' (' + r.plan + '), waiting for Arpit to confirm', offered: 'Arpit offered ' + t + ', waiting for them to accept', approved: 'confirmed for ' + t + ', waiting for their payment' + (r.pay_by ? ' (held until ' + fmt(new Date(r.pay_by).getTime()) + ' IST)' : '') })[r.status] + '. Their personal link is in their email.');
+      if (kind === 'unknown') kind = 'enrolling';
+    }
+  } catch (e) {}
+  // Time Arpit blocked (leave, travel): never offer or promise these.
+  try {
+    const { data: bl } = await supabase.from('blocks').select('start_at, end_at, all_day').is('removed_at', null).gte('end_at', new Date(now).toISOString()).lte('start_at', new Date(now + 30 * 86400000).toISOString());
+    if (bl && bl.length) lines.push('Arpit is AWAY (no classes, trials or calls): ' + bl.map(b => b.all_day ? fmt(new Date(b.start_at).getTime(), 'Asia/Kolkata', true).split(',')[0] + (new Date(b.end_at) - new Date(b.start_at) > 86400000 ? ' to ' + fmt(new Date(b.end_at).getTime() - 1, 'Asia/Kolkata', true).split(',')[0] : '') : fmt(new Date(b.start_at).getTime()) + ' to ' + fmt(new Date(b.end_at).getTime(), 'Asia/Kolkata', false) + ' IST').join('; ') + '.');
+  } catch (e) {}
+
   if (kind === 'unknown') lines.push(`This person is NEW (not a student, no trial booked)${name ? '. WhatsApp name: ' + name : ''}.`);
 
   // Upcoming workshops for everyone.
