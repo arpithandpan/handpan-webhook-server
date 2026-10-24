@@ -20,7 +20,7 @@
 //     one ⚠️ notification with the short list (push + email + WhatsApp).
 // The dashboard reads everything from GET /api/health/status (More → System health).
 
-const VERSION = 'health-1';
+const VERSION = 'health-2';
 const SERVICE_EVERY = 5 * 60 * 1000;
 const DATA_EVERY = 30 * 60 * 1000;
 const REALERT_MS = 6 * 3600 * 1000;
@@ -201,7 +201,9 @@ async function checkServices() {
     if (!deps.zoomApi || !process.env.ZOOM_CLIENT_ID) return setService('zoom', 'Zoom', 'warn', 'Not set up on the server');
     try {
       const r = await timed(deps.zoomApi('GET', '/users/me'));
-      if (!r || !r.ok) throw new Error((r && r.error) || 'no answer');
+      // The app is not allowed to read user details, and does not need to. Zoom answering
+      // with a scope error still proves the sign-in works, which is all this checks.
+      if (!r || (!r.ok && !/scope/i.test(String(r.error || '')))) throw new Error((r && r.error) || 'no answer');
       setService('zoom', 'Zoom', 'ok', 'Connected');
     } catch (e) { setService('zoom', 'Zoom', 'bad', 'Zoom sign-in failed: ' + e.message); }
   })());
@@ -211,7 +213,9 @@ async function checkServices() {
     if (!key) return setService('mail', 'Email', 'warn', 'Not set up on the server');
     try {
       const r = await timed(fetch('https://api.resend.com/domains', { headers: { Authorization: 'Bearer ' + key } }));
-      if (r.status === 401 || r.status === 403) throw new Error('key refused');
+      const j = await r.json().catch(() => ({}));
+      // A send-only key (the studio uses one) may not list domains. That answer still proves the key is real.
+      if ((r.status === 401 || r.status === 403) && !/restricted|only send/i.test(JSON.stringify(j))) throw new Error('key refused');
       // Some Resend keys may only send; anything but an auth error means the key works.
       setService('mail', 'Email', 'ok', 'Connected');
     } catch (e) { setService('mail', 'Email', 'bad', 'Resend refused the key: ' + e.message); }
@@ -255,13 +259,22 @@ async function checkData() {
       const rows = await q(t, x => x.select('razorpay_payment_id').in('razorpay_payment_id', ids)).catch(() => []);
       rows.forEach(r => seen.add(r.razorpay_payment_id));
     }
+    const fr = await q('fee_requests', x => x.select('razorpay_payment_id').in('razorpay_payment_id', ids)).catch(() => []);
+    fr.forEach(r => seen.add(r.razorpay_payment_id));
+    const gg = await q('gigs', x => x.select('advance_payment_id, balance_payment_id')).catch(() => []);
+    gg.forEach(r => { if (r.advance_payment_id) seen.add(r.advance_payment_id); if (r.balance_payment_id) seen.add(r.balance_payment_id); });
     const missing = items.filter(p => !seen.has(p.id));
-    if (missing.length) {
-      const m = missing[0];
-      setIssue('data:rzp-missing', 'bad', missing.length + ' payment' + (missing.length > 1 ? 's' : '') + ' received but not recorded',
-        'Razorpay has the money but the dashboard does not know about it, so the webhook did not reach the server. Latest: ' + (m.currency === 'INR' ? '₹' : m.currency + ' ') + (m.amount / 100) + (m.email ? ' from ' + m.email : '') + ' (' + m.id + ').',
-        { label: 'Open Razorpay', url: 'https://dashboard.razorpay.com/app/payments/' + m.id }, 'payments');
-    } else delete state.issues['data:rzp-missing'];
+    for (const k of Object.keys(state.issues)) if (k.startsWith('data:rzp:') && !missing.some(m => 'data:rzp:' + m.id === k)) delete state.issues[k];
+    for (const m of missing.slice(0, 5)) {
+      const amt = (m.currency === 'INR' ? '₹' : m.currency + ' ') + (m.amount / 100);
+      const who = [m.notes && (m.notes.name || m.notes.full_name), m.email, m.contact].filter(Boolean).join(', ');
+      const what = m.description || (m.notes && (m.notes.purpose || m.notes.type)) || '';
+      const at = new Date(m.created_at * 1000).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+      setIssue('data:rzp:' + m.id, 'bad', 'Payment of ' + amt + ' not recorded',
+        'Razorpay has it but the dashboard does not. ' + at + (who ? ' · ' + who : '') + (what ? ' · ' + what : '') + ' · ' + m.id + '. If this was not a studio payment, tap "Not a studio payment".',
+        { label: 'Open in Razorpay', url: 'https://dashboard.razorpay.com/app/payments/' + m.id, ignore: 'Not a studio payment' }, 'payments');
+    }
+    delete state.issues['data:rzp-missing'];
   });
 
   // Invoice emails that failed
@@ -361,8 +374,8 @@ async function alertTransitions() {
   if (changed) await saveJson('health_alerts', alertMemo);
 }
 async function morningDigest() {
-  const day = istYmd();
-  if (lastDigestDay === day || istHHMM() < DIGEST_HHMM) return;
+  const day = istYmd(), hm = istHHMM();
+  if (lastDigestDay === day || hm < DIGEST_HHMM || hm > '10:30') return;
   lastDigestDay = day;
   await saveJson('health_digest', { day });
   const open = Object.values(state.issues).filter(i => !(snoozed[i.key] && new Date(snoozed[i.key]).getTime() > Date.now()));
@@ -370,7 +383,7 @@ async function morningDigest() {
     if (deps.push) deps.push.send('alert', { title: 'Morning check', body: '✅ Everything is running fine.', tag: 'health-digest', url: '/pages/dashboard#sec=health' });
     return;
   }
-  const list = open.sort((a, b) => (a.level === 'bad' ? 0 : 1) - (b.level === 'bad' ? 0 : 1)).slice(0, 5).map(i => (i.level === 'bad' ? '🔴 ' : '⚠️ ') + i.title).join('; ');
+  const list = open.slice().sort((a, b) => (a.level === 'bad' ? 0 : 1) - (b.level === 'bad' ? 0 : 1)).slice(0, 5).map(i => (i.level === 'bad' ? '🔴 ' : '⚠️ ') + i.title).join('; ');
   await notifyRow('warning', '⚠️ Morning check: ' + open.length + ' thing' + (open.length > 1 ? 's need' : ' needs') + ' you. ' + list + '.');
 }
 
@@ -395,10 +408,11 @@ function init(client, d = {}) {
 }
 async function startWorker() {
   alertMemo = await loadJson('health_alerts', {});
+  delete alertMemo['data:rzp-missing'];   // replaced by one issue per payment in health-2
   snoozed = await loadJson('health_snooze', {});
   const dg = await loadJson('health_digest', {}); lastDigestDay = dg.day || null;
   // Using the untouched timer so the watcher does not watch itself.
-  setTimeout(() => { serviceTick(); dataTick(); }, 45 * 1000);
+  setTimeout(() => { serviceTick(); dataTick(); }, 90 * 1000);
   setInterval(serviceTick, SERVICE_EVERY);
   setInterval(dataTick, DATA_EVERY);
   console.log('Health watch on (' + VERSION + '): ' + Object.keys(state.jobs).length + ' jobs watched');
@@ -424,7 +438,7 @@ async function runHandler(req, res) {
   statusHandler(req, res);
 }
 async function snoozeHandler(req, res) {
-  const key = String(req.body?.key || ''); const hours = Math.min(168, Math.max(1, Number(req.body?.hours) || 24));
+  const key = String(req.body?.key || ''); const hours = Math.min(key.startsWith('data:rzp:') ? 24 * 3650 : 168, Math.max(1, Number(req.body?.hours) || 24));
   if (!key) return res.status(400).json({ error: 'key required' });
   snoozed[key] = new Date(Date.now() + hours * 3600 * 1000).toISOString();
   await saveJson('health_snooze', snoozed);
