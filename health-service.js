@@ -20,7 +20,7 @@
 //     one ⚠️ notification with the short list (push + email + WhatsApp).
 // The dashboard reads everything from GET /api/health/status (More → System health).
 
-const VERSION = 'health-3';
+const VERSION = 'health-4';
 const SERVICE_EVERY = 5 * 60 * 1000;
 const DATA_EVERY = 30 * 60 * 1000;
 const REALERT_MS = 6 * 3600 * 1000;
@@ -296,7 +296,7 @@ async function checkData() {
 
   // Fee links unpaid for 7+ days
   await run('fee-old', async () => {
-    const rows = await q('fee_requests', x => x.select('id, student_id, created_at').eq('status', 'pending').lte('created_at', since(24 * 7)).limit(50));
+    const rows = (await q('fee_requests', x => x.select('id, student_id, created_at').eq('status', 'pending').lte('created_at', since(24 * 7)).limit(50))).filter(r => !/^S-DEMO/i.test(String(r.student_id || '')));
     if (rows.length) {
       const studs = await q('students', x => x.select('id, full_name').in('id', rows.map(r => r.student_id).filter(Boolean))).catch(() => []);
       const nm = Object.fromEntries(studs.map(s => [s.id, s.full_name]));
@@ -307,7 +307,7 @@ async function checkData() {
   // WhatsApp messages that failed in the last 24 h
   await run('wa-failed', async () => {
     const tp = await testPhones();
-    const rows = (await q('wa_messages', x => x.select('id, phone, error, created_at').eq('direction', 'out').eq('status', 'failed').gte('created_at', since(24)).limit(30))).filter(r => !/sent again automatically/i.test(String(r.error || '')) && !tp.has(String(r.phone || '')));
+    const rows = (await q('wa_messages', x => x.select('id, phone, error, created_at').eq('direction', 'out').eq('status', 'failed').gte('created_at', since(24)).limit(30))).filter(r => !/sent again automatically/i.test(String(r.error || '')) && !tp.has(String(r.phone || '').replace(/\D/g, '')));
     if (rows.length) setIssue('data:wa-failed', rows.length >= 5 ? 'bad' : 'warn', rows.length + ' WhatsApp message' + (rows.length > 1 ? 's' : '') + ' failed today', 'Latest to +' + rows[0].phone + (rows[0].error ? ': ' + String(rows[0].error).slice(0, 100) : '') + '.', { label: 'Open Inbox', sec: 'whatsapp' }, 'whatsapp');
     else delete state.issues['data:wa-failed'];
   });
@@ -315,7 +315,7 @@ async function checkData() {
   // Agent drafts waiting for Arpit for 3+ hours
   await run('drafts-old', async () => {
     const tp2 = await testPhones();
-    let rows = (await q('wa_drafts', x => x.select('id, phone, created_at').eq('status', 'pending').lte('created_at', since(3)).gte('created_at', since(72)).limit(30))).filter(r => !tp2.has(String(r.phone || '')));
+    let rows = (await q('wa_drafts', x => x.select('id, phone, created_at').eq('status', 'pending').lte('created_at', since(3)).gte('created_at', since(72)).limit(30))).filter(r => !tp2.has(String(r.phone || '').replace(/\D/g, '')));
     // Only count people whose last message is still theirs (Arpit may have answered from his phone).
     const phones = [...new Set(rows.map(r => r.phone))];
     if (phones.length) {
@@ -329,7 +329,8 @@ async function checkData() {
 
   // Questions the agent could not answer this week (input for the AI review later)
   await run('needs-arpit', async () => {
-    const rows = await q('wa_drafts', x => x.select('id, category').eq('needs_arpit', true).gte('created_at', since(24 * 7)).limit(200)).catch(() => []);
+    const tp3 = await testPhones();
+    const rows = (await q('wa_drafts', x => x.select('id, category, phone').eq('needs_arpit', true).gte('created_at', since(24 * 7)).limit(200)).catch(() => [])).filter(r => !tp3.has(String(r.phone || '').replace(/\D/g, '')));
     const by = {}; rows.forEach(r => { const c = r.category || 'other'; by[c] = (by[c] || 0) + 1; });
     state.asked = Object.entries(by).sort((a, b) => b[1] - a[1]).map(([category, count]) => ({ category, count }));
   });
