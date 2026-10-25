@@ -322,12 +322,27 @@ async function zoomCheck() {
   if (error) throw new Error(error.message);
   const { data: st } = await supabase.from('students').select('id, full_name');
   const nm = Object.fromEntries((st || []).map(s => [s.id, s.full_name || s.id]));
+  // A meeting in Zoom's "Recently Deleted" can still answer GET /meetings/{id},
+  // so a meeting only counts as alive when it is also in the account's list.
+  const live = new Set(); let next = '', listed = false;
+  for (let i = 0; i < 10; i++) {
+    const l = await deps.zoomApi('GET', '/users/me/meetings?type=scheduled&page_size=300' + (next ? '&next_page_token=' + next : ''));
+    if (!l.ok) break;
+    listed = true;
+    for (const m of (l.data.meetings || [])) live.add(String(m.id));
+    next = l.data.next_page_token || ''; if (!next) break;
+  }
+  // Only trust the list if it shows at least one of our meetings (so a list that
+  // leaves out "no fixed time" meetings can never raise a false alarm).
+  const ours = (data || []).map(r => (String(r.zoom_link || '').match(/\/j\/(\d+)/) || [])[1]).filter(Boolean);
+  if (!ours.some(id => live.has(String(id)))) listed = false;
   const out = [];
   for (const r of (data || [])) {
     const id = (String(r.zoom_link || '').match(/\/j\/(\d+)/) || [])[1];
     if (!id) { out.push({ student: nm[r.student_id] || r.student_id, problem: 'no Zoom link' }); continue; }
     const m = await deps.zoomApi('GET', '/meetings/' + id);
     if (!m.ok) { out.push({ student: nm[r.student_id] || r.student_id, problem: m.status === 404 ? 'Zoom meeting was deleted' : 'Zoom check failed: ' + m.error }); continue; }
+    if (listed && !live.has(String(id))) { out.push({ student: nm[r.student_id] || r.student_id, problem: 'Zoom meeting is in Recently Deleted (recover it in Zoom within 7 days)' }); continue; }
     if (Number(m.data.type) !== 3) out.push({ student: nm[r.student_id] || r.student_id, problem: 'Zoom meeting has fixed times again (type ' + m.data.type + ')' });
   }
   return out;
