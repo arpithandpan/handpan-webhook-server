@@ -137,6 +137,9 @@ const backup = require('./backup-service');
 backup.init(supabase);
 const calendarInvites = require('./calendar-invites');
 calendarInvites.init(supabase, { notify: async (type, message) => { await supabase.from('notifications').insert({ type, message, read: false }); } });
+// Arpit's own Studio calendar in Google + calendar/Zoom guards (studio-calendar.js)
+const studioCal = require('./studio-calendar');
+studioCal.init(supabase, { zoomApi: zoom.zoomApi });
 
 // ── GENERAL PAYMENT PAGE ID ──
 const GENERAL_PAYMENT_PAGE_ID = 'pl_SvxuRdqY2rd7ge';
@@ -1491,6 +1494,37 @@ app.post('/api/wa/reopen', requireAdmin, express.json({ limit: '8kb' }), (req, r
 app.get('/api/calendar/status', requireAdmin, (req, res) => calendarInvites.statusHandler(req, res));
 app.get('/api/calendar/preview', requireAdmin, (req, res) => calendarInvites.previewHandler(req, res));
 app.post('/api/calendar/run', requireAdmin, (req, res) => calendarInvites.runHandler(req, res));
+// Calendar overview for System health: students' invites + Studio calendar + guards
+app.get('/api/calendar/overview', requireAdmin, async (req, res) => {
+  try {
+    const [inv, st, sch] = await Promise.all([
+      supabase.from('calendar_invites').select('*'),
+      supabase.from('students').select('id, full_name, email'),
+      supabase.from('class_schedule').select('id, student_id, active')
+    ]);
+    const nm = Object.fromEntries((st.data || []).map(s => [s.id, s]));
+    const slotOk = Object.fromEntries((sch.data || []).map(r => [String(r.id), r.active !== false]));
+    const invites = (inv.data || []).map(r => ({ slot: r.slot_id, student: (nm[r.student_id] && nm[r.student_id].full_name) || r.student_id, to: r.recipient, sent: r.last_sent_at, updates: Number(r.seq) || 0, active: !r.cancelled_at && slotOk[String(r.slot_id)] !== false }))
+      .sort((a, b) => (b.active - a.active) || String(a.student).localeCompare(String(b.student)));
+    const mode = String(process.env.CALENDAR_INVITES || 'off').trim().toLowerCase();
+    res.json({ invitesMode: mode, invites, studio: studioCal.status() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Send one student's calendar invite again (next run treats it as changed)
+app.post('/api/calendar/resend', requireAdmin, express.json({ limit: '2kb' }), async (req, res) => {
+  try {
+    const slot = String((req.body || {}).slot || '');
+    if (!slot) return res.status(400).json({ error: 'slot needed' });
+    const { error } = await supabase.from('calendar_invites').update({ hash: null }).eq('slot_id', slot);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(await calendarInvites.run());
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Sync the Studio calendar and re-run the guards now
+app.post('/api/studio-calendar/run', requireAdmin, async (req, res) => {
+  try { const sync = await studioCal.sync(); await studioCal.guards(); res.json({ sync, status: studioCal.status() }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
 // Weekly data backup (Sundays 9 AM IST); this sends one now
 app.post('/api/backup/run', requireAdmin, (req, res) => backup.runHandler(req, res));
 app.get('/api/push/key', requireAdmin, (req, res) => push.keyHandler(req, res));
@@ -2191,6 +2225,7 @@ app.listen(PORT, () => {
   workshopMessages.startWorker();
   studentPortal.startWorker();
   calendarInvites.startWorker();
+  studioCal.startWorker();
   backup.startWorker();
   enrolment.startWorker();
   health.startWorker();
