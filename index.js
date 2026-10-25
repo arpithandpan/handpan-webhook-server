@@ -160,6 +160,12 @@ app.post('/api/health/errors/:id/resolve', requireAdminLazy, (req, res) => healt
 // Errors from the dashboard and website pages (sent with sendBeacon, so any content type).
 app.post('/api/health/client-error', express.json({ type: '*/*', limit: '4kb' }), (req, res) => health.clientErrorHandler(req, res));
 function requireAdminLazy(req, res, next) { return requireAdmin(req, res, next); }
+// ── WEEKLY AI REVIEW (System health → Weekly review) ──
+const review = require('./review-service');
+review.init(supabase, { push: require('./push-service') });
+app.get('/api/review', requireAdminLazy, (req, res) => review.getHandler(req, res));
+app.post('/api/review/run', requireAdminLazy, express.json({ limit: '4kb' }), (req, res) => review.runHandler(req, res));
+app.post('/api/review/fact', requireAdminLazy, express.json({ limit: '8kb' }), (req, res) => review.factHandler(req, res));
 
 // ── HELPERS ──
 async function generateId(table, prefix) {
@@ -2188,4 +2194,5 @@ app.listen(PORT, () => {
   backup.startWorker();
   enrolment.startWorker();
   health.startWorker();
+  review.startWorker();
 });
