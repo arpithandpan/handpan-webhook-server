@@ -241,6 +241,14 @@ async function checkServices() {
   state.lastServiceRun = new Date().toISOString();
 }
 
+// Test accounts (student ids starting S-DEMO, plus TEST_PHONES in Railway) never raise issues.
+let _tp = null, _tpAt = 0;
+async function testPhones() {
+  if (_tp && Date.now() - _tpAt < 30 * 60 * 1000) return _tp;
+  const set = new Set(String(process.env.TEST_PHONES || '').split(',').map(x => x.replace(/\D/g, '')).filter(Boolean));
+  try { const { data } = await supabase.from('students').select('id, phone').like('id', 'S-DEMO%'); (data || []).forEach(s => { const d = String(s.phone || '').replace(/\D/g, ''); if (d) set.add(d); }); } catch (e) {}
+  _tp = set; _tpAt = Date.now(); return set;
+}
 // ── 3. DATA CHECKS ──
 async function q(table, build) { const r = await build(supabase.from(table)); if (r.error) throw new Error(table + ': ' + r.error.message); return r.data || []; }
 async function checkData() {
@@ -298,14 +306,16 @@ async function checkData() {
 
   // WhatsApp messages that failed in the last 24 h
   await run('wa-failed', async () => {
-    const rows = (await q('wa_messages', x => x.select('id, phone, error, created_at').eq('direction', 'out').eq('status', 'failed').gte('created_at', since(24)).limit(30))).filter(r => !/sent again automatically/i.test(String(r.error || '')));
+    const tp = await testPhones();
+    const rows = (await q('wa_messages', x => x.select('id, phone, error, created_at').eq('direction', 'out').eq('status', 'failed').gte('created_at', since(24)).limit(30))).filter(r => !/sent again automatically/i.test(String(r.error || '')) && !tp.has(String(r.phone || '')));
     if (rows.length) setIssue('data:wa-failed', rows.length >= 5 ? 'bad' : 'warn', rows.length + ' WhatsApp message' + (rows.length > 1 ? 's' : '') + ' failed today', 'Latest to +' + rows[0].phone + (rows[0].error ? ': ' + String(rows[0].error).slice(0, 100) : '') + '.', { label: 'Open Inbox', sec: 'whatsapp' }, 'whatsapp');
     else delete state.issues['data:wa-failed'];
   });
 
   // Agent drafts waiting for Arpit for 3+ hours
   await run('drafts-old', async () => {
-    let rows = await q('wa_drafts', x => x.select('id, phone, created_at').eq('status', 'pending').lte('created_at', since(3)).gte('created_at', since(72)).limit(30));
+    const tp2 = await testPhones();
+    let rows = (await q('wa_drafts', x => x.select('id, phone, created_at').eq('status', 'pending').lte('created_at', since(3)).gte('created_at', since(72)).limit(30))).filter(r => !tp2.has(String(r.phone || '')));
     // Only count people whose last message is still theirs (Arpit may have answered from his phone).
     const phones = [...new Set(rows.map(r => r.phone))];
     if (phones.length) {
