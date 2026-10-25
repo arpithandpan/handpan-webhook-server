@@ -16,6 +16,7 @@
 // Table blocks (blocks.sql). Admin routes in index.js.
 
 const IST = 'Asia/Kolkata';
+const studio = require('./studio-time');   // the days and hours Arpit enters are on his own clock
 const MIN = 60000, DAY = 86400000;
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const FROM_EMAIL = process.env.TRIAL_FROM_EMAIL || 'classes@arpitpandey.com';
@@ -44,7 +45,8 @@ function tzName(tz) { return tz === IST || tz === 'Asia/Calcutta' ? 'IST' : Stri
 function firstName(n) { return String(n || '').trim().split(/\s+/)[0] || 'there'; }
 function esc(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
 
-// Body { mode: 'day'|'hours', from: 'YYYY-MM-DD', to?: 'YYYY-MM-DD', start?: 'HH:MM', end?: 'HH:MM', note? } → { s, e } in ms (IST).
+// Body { mode: 'day'|'hours', from: 'YYYY-MM-DD', to?: 'YYYY-MM-DD', start?: 'HH:MM', end?: 'HH:MM', note?, tz? } → { s, e } in ms.
+// The dates and hours are Arpit's own wall clock (b.tz from the dashboard, else the studio zone).
 function rangeOf(b) {
   const from = String(b.from || ''), to = String(b.to || b.from || '');
   if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to) || to < from) return { error: 'Pick valid dates' };
@@ -52,11 +54,13 @@ function rangeOf(b) {
   if (b.mode === 'hours') {
     if (from !== to) return { error: 'Hours can only be blocked on one day' };
     if (!/^\d{2}:\d{2}$/.test(String(b.start || '')) || !/^\d{2}:\d{2}$/.test(String(b.end || ''))) return { error: 'Pick a start and end time' };
-    let s = istMs(from, b.start), e = istMs(from, b.end);
-    if (e <= s) e += DAY;            // e.g. 10 PM to 1 AM
+    const z = validTz(b.tz) ? b.tz : studio.tz();
+    let s = studio.toUtc(from, b.start, z), e = studio.toUtc(from, b.end, z);
+    if (e <= s) e = studio.toUtc(addDays(from, 1), b.end, z);   // e.g. 10 PM to 1 AM
     return { s, e };
   }
-  return { s: istMs(from, '00:00'), e: istMs(addDays(to, 1), '00:00') };
+  const z = validTz(b.tz) ? b.tz : studio.tz();
+  return { s: studio.toUtc(from, '00:00', z), e: studio.toUtc(addDays(to, 1), '00:00', z) };
 }
 
 // Every class and booked trial that overlaps [s, e).
@@ -117,8 +121,8 @@ async function affected(s, e) {
 
 function summary(a) {
   return {
-    classes: a.classes.map(c => ({ studentId: c.studentId, name: c.name, when: dayText(c.start, IST) + ', ' + timeText(c.start, IST) + ' IST', key: c.key, moved: !!c.ex })),
-    trials: a.trials.map(t => ({ id: t.id, name: t.name, when: dayText(t.start, IST) + ', ' + timeText(t.start, IST) + ' IST' }))
+    classes: a.classes.map(c => ({ studentId: c.studentId, name: c.name, when: dayText(c.start, studio.tz()) + ', ' + timeText(c.start, studio.tz()) + ' ' + studio.label(), key: c.key, moved: !!c.ex })),
+    trials: a.trials.map(t => ({ id: t.id, name: t.name, when: dayText(t.start, studio.tz()) + ', ' + timeText(t.start, studio.tz()) + ' ' + studio.label() }))
   };
 }
 
@@ -226,7 +230,7 @@ async function createHandler(req, res) {
     const told = await tellStudents(byStudent, a.students, 'cancel');
     await supabase.from('blocks').update({ affected: { classes: summary(a).classes, trials: summary(a).trials, told } }).eq('id', blk.id);
     const failed = told.filter(t => t.email !== 'sent');
-    await notify(failed.length ? 'warning' : 'info', (failed.length ? '⚠️ ' : '⛔ ') + 'Blocked ' + (b.mode === 'hours' ? dayText(r.s, IST) + ' ' + timeText(r.s, IST) + '–' + timeText(r.e, IST) : dayText(r.s, IST) + (istYmd(r.e - 1) !== istYmd(r.s) ? ' to ' + dayText(r.e - 1, IST) : '')) +
+    await notify(failed.length ? 'warning' : 'info', (failed.length ? '⚠️ ' : '⛔ ') + 'Blocked ' + (b.mode === 'hours' ? dayText(r.s, studio.tz()) + ' ' + timeText(r.s, studio.tz()) + '–' + timeText(r.e, studio.tz()) : dayText(r.s, studio.tz()) + (studio.ymd(r.e - 1) !== studio.ymd(r.s) ? ' to ' + dayText(r.e - 1, studio.tz()) : '')) +
       ': ' + Object.keys(byStudent).length + ' student' + (Object.keys(byStudent).length === 1 ? '' : 's') + ' told, ' + a.trials.length + ' trial' + (a.trials.length === 1 ? '' : 's') + ' cancelled.' +
       (failed.length ? ' Email failed for ' + failed.map(f => (a.students[f.studentId] || {}).full_name || f.studentId).join(', ') + ', message them yourself.' : ''));
     res.json({ ok: true, id: blk.id, classes: a.classes.length, trials: a.trials.length, told });
@@ -272,7 +276,7 @@ async function removeHandler(req, res) {
     }
     await supabase.from('blocks').update({ removed_at: new Date().toISOString() }).eq('id', id);
     const told = await tellStudents(byStudent, students, 'restore');
-    await notify('info', '✅ Unblocked ' + dayText(new Date(blk.start_at).getTime(), IST) + ': ' + told.length + ' student' + (told.length === 1 ? '' : 's') + ' told their class is back on. Cancelled trials stay cancelled.');
+    await notify('info', '✅ Unblocked ' + dayText(new Date(blk.start_at).getTime(), studio.tz()) + ': ' + told.length + ' student' + (told.length === 1 ? '' : 's') + ' told their class is back on. Cancelled trials stay cancelled.');
     res.json({ ok: true, restored: told.length });
   } catch (e) { console.error('block remove error:', e.message); res.status(500).json({ ok: false, error: e.message }); }
 }

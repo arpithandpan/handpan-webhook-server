@@ -20,7 +20,7 @@
 //     one ⚠️ notification with the short list (push + email + WhatsApp).
 // The dashboard reads everything from GET /api/health/status (More → System health).
 
-const VERSION = 'health-6';
+const VERSION = 'health-7';
 const SERVICE_EVERY = 5 * 60 * 1000;
 const DATA_EVERY = 30 * 60 * 1000;
 const REALERT_MS = 6 * 3600 * 1000;
@@ -538,7 +538,8 @@ async function alertTransitions() {
   if (changed) await saveJson('health_alerts', alertMemo);
 }
 async function morningDigest() {
-  const day = istYmd(), hm = istHHMM();
+  const _c = require('./studio-time').parts();   // Arpit's own morning, wherever he is
+  const day = _c.ymd, hm = _c.hhmm;
   if (lastDigestDay === day || hm < DIGEST_HHMM || hm > '10:30') return;
   lastDigestDay = day;
   await saveJson('health_digest', { day });

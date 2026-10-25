@@ -97,10 +97,11 @@ async function run(reason) {
 
 // Sunday (IST) from 9 AM, once per week.
 async function due() {
-  const ist = new Date(Date.now() + 330 * 60000);
+  const st = require('./studio-time'), off = st.offsetMin() * 60000;
+  const ist = new Date(Date.now() + off);   // Arpit's own clock
   if (ist.getUTCDay() !== 0 || ist.getUTCHours() < 9) return false;
   // Only a backup sent today (Sunday, IST) counts; one sent by hand earlier in the week doesn't skip Sunday's.
-  const since = new Date(Date.UTC(ist.getUTCFullYear(), ist.getUTCMonth(), ist.getUTCDate()) - 330 * 60000).toISOString();
+  const since = new Date(Date.UTC(ist.getUTCFullYear(), ist.getUTCMonth(), ist.getUTCDate()) - off).toISOString();
   const { data } = await supabase.from('notifications').select('id').like('message', '💾 Weekly backup sent%').not('message', 'like', '%sent by hand%').gte('created_at', since).limit(1);
   return !(data && data.length);
 }

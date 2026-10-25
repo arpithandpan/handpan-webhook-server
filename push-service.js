@@ -62,7 +62,8 @@ function cleanPrefs(p) {
   if (p && typeof p === 'object') for (const k of Object.keys(DEFAULT_PREFS)) if (typeof p[k] === 'boolean') out[k] = p[k];
   return out;
 }
-function istMinutes(d) { const t = new Date(d.getTime() + 330 * 60000); return t.getUTCHours() * 60 + t.getUTCMinutes(); }
+// Quiet hours follow Arpit's own clock (studio-time.js), so they stay 11 PM – 7 AM wherever he is.
+function istMinutes(d) { return require('./studio-time').parts(d.getTime()).minutes; }
 function inQuiet(now) { const m = istMinutes(now); return m >= QUIET_FROM || m < QUIET_TO; }
 
 // ── SEND ──

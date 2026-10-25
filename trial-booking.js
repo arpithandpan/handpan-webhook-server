@@ -45,13 +45,15 @@ const FROM_EMAIL = process.env.TRIAL_FROM_EMAIL || 'classes@arpitpandey.com';
 const ARPIT_EMAIL = process.env.TRIAL_ARPIT_EMAIL || 'arpithandpan@gmail.com';
 const HOST_EMAIL = process.env.ZOOM_HOST_EMAIL || 'arpithandpan@gmail.com';
 const IST = 'Asia/Kolkata';
+const studio = require('./studio-time');   // Arpit's own clock (India unless he moved)
 
 function waTemplatesOn() {
   return String(process.env.WA_TRIAL_TEMPLATES || '').trim().toLowerCase() === 'on';
 }
 
 // ── 1. SETTINGS ──
-// Times are minutes after midnight IST of the window's own day. An evening
+// Times are minutes after midnight in Arpit's own time zone (studio-time.js,
+// India by default) on the window's own day. An evening
 // window may run past midnight (1500 = 1:00 AM next day); it still belongs to
 // the weekday it started on, so Friday 7 PM to Saturday 1 AM is a Friday window.
 const DEFAULTS = {
@@ -68,12 +70,12 @@ const DEFAULTS = {
   price_inr: 1500,
   price_usd: 18,
   whatsapp: '919380140907',
-  blocked_dates: []                           // ['2026-12-25', …] IST dates with no slots at all
+  blocked_dates: []                           // ['2026-12-25', …] dates (Arpit's own zone) with no slots at all
 };
 
 let _settingsCache = null, _settingsAt = 0;
 async function getSettings(force) {
-  if (!force && _settingsCache && Date.now() - _settingsAt < 60 * 1000) return _settingsCache;
+  if (!force && _settingsCache && Date.now() - _settingsAt < 60 * 1000) return { ..._settingsCache, tz: studio.tz() };
   let stored = {};
   try {
     const { data } = await supabase.from('app_settings').select('value').eq('key', 'trial_booking').maybeSingle();
@@ -81,7 +83,7 @@ async function getSettings(force) {
   } catch (e) { console.error('trial settings read failed:', e.message); }
   _settingsCache = sanitizeSettings(stored);
   _settingsAt = Date.now();
-  return _settingsCache;
+  return { ..._settingsCache, tz: studio.tz() };
 }
 
 // Anything odd in the stored row falls back to the default for that field,
@@ -291,43 +293,54 @@ function eventBlock(ymd, timeTxt, defaultLen) {
 // class grid (class length + buffer from each window start), so a trial
 // always takes a spot a weekly class could later use.
 function computeSlots(settings, busy, nowMs, lengthMin) {
-  const s = settings;
+  const s = settings, zone = s.tz || IST;
   const len = (lengthMin || s.trial_min) * MIN;
-  const step = (s.class_min + s.buffer_min) * MIN;
   const buf = s.buffer_min * MIN;
   const rest = s.rest_hours * 60 * MIN;
-  const earliest = nowMs + s.min_notice_hours * 60 * MIN;
-  const today = istYmd(new Date(nowMs));
-  const lastMs = istMidnight(addDays(today, s.days_ahead + 1));
-  const blocked = new Set(s.blocked_dates || []);
   const out = [];
-
+  for (const t of gridStarts(s, nowMs)) {
+    const end = t + len;
+    let ok = true;
+    for (const b of busy) {
+      // Overlap with buffer on both sides.
+      if (t < b.e + buf && end + buf > b.s) { ok = false; break; }
+      // Night rest: a gap that spans 3 AM (Arpit's own clock) must be at least rest_hours.
+      if (rest > 0) {
+        const gapStart = b.e <= t ? b.e : end;
+        const gapEnd = b.e <= t ? t : b.s;
+        if (gapEnd > gapStart && gapEnd - gapStart < rest && spans3am(gapStart, gapEnd, zone)) { ok = false; break; }
+      }
+    }
+    if (ok) out.push(t);
+  }
+  return [...new Set(out)].sort((a, b) => a - b);
+}
+// Every candidate start on the class grid, inside Arpit's windows, in his own
+// zone. Window times are wall-clock minutes (1500 = 1 AM next day), turned into
+// real moments one by one, so a daylight-saving change mid-window stays right.
+function gridStarts(s, nowMs) {
+  const zone = s.tz || IST;
+  const step = s.class_min + s.buffer_min;
+  const earliest = nowMs + s.min_notice_hours * 60 * MIN;
+  const today = studio.ymd(nowMs, zone);
+  const lastMs = studio.midnight(addDays(today, s.days_ahead + 1), zone);
+  const blocked = new Set(s.blocked_dates || []);
+  const at = (day, m) => studio.toUtc(addDays(day, Math.floor(m / 1440)), String(Math.floor((m % 1440) / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0'), zone);
+  const out = [];
   for (let i = 0; i <= s.days_ahead; i++) {
     const day = addDays(today, i);
     if (!s.weekdays.includes(weekdayOf(day))) continue;
     if (blocked.has(day)) continue;
-    const base = istMidnight(day);
     for (const [ws, we] of s.windows) {
-      for (let t = base + ws * MIN; t + s.class_min * MIN <= base + we * MIN; t += step) {
+      for (let m = ws; m + s.class_min <= we; m += step) {
+        const t = at(day, m);
         if (t < earliest || t >= lastMs) continue;
-        const end = t + len;
-        if (blocked.has(istYmd(new Date(t)))) continue;
-        let ok = true;
-        for (const b of busy) {
-          // Overlap with buffer on both sides.
-          if (t < b.e + buf && end + buf > b.s) { ok = false; break; }
-          // Night rest: a gap that spans 3 AM IST must be at least rest_hours.
-          if (rest > 0) {
-            const gapStart = b.e <= t ? b.e : end;
-            const gapEnd = b.e <= t ? t : b.s;
-            if (gapEnd > gapStart && gapEnd - gapStart < rest && spans3am(gapStart, gapEnd)) { ok = false; break; }
-          }
-        }
-        if (ok) out.push(t);
+        if (blocked.has(studio.ymd(t, zone))) continue;
+        out.push(t);
       }
     }
   }
-  return [...new Set(out)].sort((a, b) => a - b);
+  return out;
 }
 // Grid candidates that are gone ONLY because a real class or trial sits on
 // them (direct overlap). Buffer and night-rest casualties stay hidden, and
@@ -335,33 +348,19 @@ function computeSlots(settings, busy, nowMs, lengthMin) {
 function computeBooked(settings, busy, nowMs, lengthMin) {
   const s = settings;
   const len = (lengthMin || s.trial_min) * MIN;
-  const step = (s.class_min + s.buffer_min) * MIN;
-  const earliest = nowMs + s.min_notice_hours * 60 * MIN;
-  const today = istYmd(new Date(nowMs));
-  const lastMs = istMidnight(addDays(today, s.days_ahead + 1));
-  const blocked = new Set(s.blocked_dates || []);
   const out = [];
-  for (let i = 0; i <= s.days_ahead; i++) {
-    const day = addDays(today, i);
-    if (!s.weekdays.includes(weekdayOf(day))) continue;
-    if (blocked.has(day)) continue;
-    const base = istMidnight(day);
-    for (const [ws, we] of s.windows) {
-      for (let t = base + ws * MIN; t + s.class_min * MIN <= base + we * MIN; t += step) {
-        if (t < earliest || t >= lastMs) continue;
-        if (blocked.has(istYmd(new Date(t)))) continue;
-        const end = t + len;
-        if (busy.some(b => t < b.e && end > b.s)) out.push(t);
-      }
-    }
+  for (const t of gridStarts(s, nowMs)) {
+    const end = t + len;
+    if (busy.some(b => t < b.e && end > b.s)) out.push(t);
   }
   return [...new Set(out)].sort((a, b) => a - b);
 }
-function spans3am(a, b) {
-  // Is there an IST 03:00 inside (a, b)?
-  const day = istYmd(new Date(a));
-  for (let k = 0; k <= 1; k++) {
-    const three = istMidnight(addDays(day, k)) + 180 * MIN;
+function spans3am(a, b, zone) {
+  // Is there a 03:00 (Arpit's own clock) inside (a, b)?
+  zone = zone || IST;
+  const day = studio.ymd(a, zone);
+  for (let k = -1; k <= 1; k++) {
+    const three = studio.toUtc(addDays(day, k), '03:00', zone);
     if (three > a && three < b) return true;
   }
   return false;
@@ -540,7 +539,7 @@ async function bookHandler(req, res) {
     const mismatch = indianPhone !== indianTz ? ` Check currency: ${indianPhone ? '+91 number' : 'non-Indian number'} but booking from ${tz}.` : '';
 
     await notify(joinUrl ? 'info' : 'warning',
-      `🎉 New trial booked: ${name} · ${prettyIn(start, IST)} IST (${prettyIn(start, tz)} their time) · +${phone} · ${HANDPAN[handpan]}.` +
+      `🎉 New trial booked: ${name} · ${prettyIn(start, studio.tz())} ${studio.label()} (${prettyIn(start, tz)} their time) · +${phone} · ${HANDPAN[handpan]}.` +
       (joinUrl ? '' : ' ⚠️ Zoom meeting could not be created, please send them a link.') +
       (failed.length ? ` ⚠️ Could not send: ${failed.join(', ')}.` : '') + mismatch);
 
@@ -657,12 +656,12 @@ async function sendArpitInvite(t) {
   const start = new Date(t.start_at);
   const html = mailShell(`
   <h1 style="margin:0 0 14px;font-size:20px;color:#500018;font-weight:600;">New trial: ${esc(t.full_name)}</h1>
-  <p style="margin:0 0 6px;"><strong>When:</strong> ${esc(prettyIn(start, IST))} IST (${esc(prettyIn(start, t.tz))} ${esc(tzLabel(t.tz))})</p>
+  <p style="margin:0 0 6px;"><strong>When:</strong> ${esc(prettyIn(start, studio.tz()))} ${esc(studio.label())} (${esc(prettyIn(start, t.tz))} ${esc(tzLabel(t.tz))})</p>
   <p style="margin:0 0 6px;"><strong>WhatsApp:</strong> +${esc(t.phone)}</p>
   <p style="margin:0 0 6px;"><strong>Email:</strong> ${esc(t.email)}</p>
   <p style="margin:0 0 6px;"><strong>Handpan:</strong> ${esc(HANDPAN[t.has_handpan] || '—')}</p>
   ${t.join_url ? `<p style="margin:12px 0 0;"><a href="${esc(t.join_url)}" style="color:#500018;">Zoom link</a></p>` : '<p style="margin:12px 0 0;color:#a00;">Zoom meeting was not created. Send a link by hand.</p>'}`);
-  return sendMail({ to: ARPIT_EMAIL, subject: 'Trial booked · ' + t.full_name + ' · ' + prettyIn(start, IST) + ' IST', html, text: 'New trial: ' + t.full_name, ics: buildIcs(t), replyTo: t.email });
+  return sendMail({ to: ARPIT_EMAIL, subject: 'Trial booked · ' + t.full_name + ' · ' + prettyIn(start, studio.tz()) + ' ' + studio.label(), html, text: 'New trial: ' + t.full_name, ics: buildIcs(t), replyTo: t.email });
 }
 
 // ── 9. CANCEL (dashboard ✕ button) ──
@@ -699,8 +698,8 @@ async function cancelTrial(id) {
     }).catch(e => ({ ok: false, error: e.message }));
     done.email = r.ok ? 'sent' : ('failed: ' + r.error);
     const a = await sendMail({
-      to: ARPIT_EMAIL, subject: 'Trial cancelled · ' + t.full_name + ' · ' + prettyIn(start, IST) + ' IST',
-      html: mailShell(`<p style="margin:0;">You cancelled ${esc(t.full_name)}'s trial on ${esc(prettyIn(start, IST))} IST. The calendar event is removed and they were emailed.</p>`),
+      to: ARPIT_EMAIL, subject: 'Trial cancelled · ' + t.full_name + ' · ' + prettyIn(start, studio.tz()) + ' ' + studio.label(),
+      html: mailShell(`<p style="margin:0;">You cancelled ${esc(t.full_name)}'s trial on ${esc(prettyIn(start, studio.tz()))} ${esc(studio.label())}. The calendar event is removed and they were emailed.</p>`),
       text: 'Trial cancelled: ' + t.full_name, ics: buildIcs(t, 'CANCEL')
     }).catch(e => ({ ok: false, error: e.message }));
     done.calendar = a.ok ? 'removed' : ('failed: ' + a.error);
@@ -749,7 +748,7 @@ async function tick() {
       .eq('status', 'booked').lte('start_at', new Date(now - 4 * 3600 * 1000).toISOString());
     for (const t of (past || [])) {
       await supabase.from('trials').update({ status: 'no_show' }).eq('id', t.id);
-      await notify('info', `🙈 ${t.full_name} didn't join the trial on ${prettyIn(new Date(t.start_at), IST)} IST. Marked no-show on the Students page.`);
+      await notify('info', `🙈 ${t.full_name} didn't join the trial on ${prettyIn(new Date(t.start_at), studio.tz())} ${studio.label()}. Marked no-show on the Students page.`);
     }
   } catch (e) { console.error('trial worker error:', e.message); }
   finally { _busy = false; }
@@ -778,5 +777,5 @@ async function markAttended(meetingId, minutes) {
 
 module.exports = {
   init, slotsHandler, bookHandler, cancelHandler, cancelTrial, startWorker, markAttended, getSettings, freeSlots, busyIntervals,
-  _test: { eventBlock, durationMin, computeSlots, computeBooked, sanitizeSettings, DEFAULTS, buildIcs, spans3am, istYmd, zonedToUtc }
+  _test: { eventBlock, durationMin, computeSlots, computeBooked, gridStarts, sanitizeSettings, DEFAULTS, buildIcs, spans3am, istYmd, zonedToUtc }
 };

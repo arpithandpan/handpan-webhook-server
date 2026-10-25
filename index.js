@@ -104,6 +104,9 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 // Health watch first: it starts timing the background jobs before they begin.
+// Arpit's own clock (India unless he moved). Loaded first so every worker can use it.
+const studioTime = require('./studio-time');
+studioTime.init(supabase);
 const health = require('./health-service');
 health.init(supabase, { zoomApi: zoom.zoomApi, push: require('./push-service'), whatsapp, invoice: require('./invoice-service') });
 zoom.init(supabase);
@@ -1494,6 +1497,9 @@ app.post('/api/wa/reopen', requireAdmin, express.json({ limit: '8kb' }), (req, r
 app.get('/api/calendar/status', requireAdmin, (req, res) => calendarInvites.statusHandler(req, res));
 app.get('/api/calendar/preview', requireAdmin, (req, res) => calendarInvites.previewHandler(req, res));
 app.post('/api/calendar/run', requireAdmin, (req, res) => calendarInvites.runHandler(req, res));
+// Where Arpit is working from (Settings → Where you are). Changes only his own clock.
+app.get('/api/studio-time', requireAdmin, (req, res) => studioTime.getHandler(req, res));
+app.post('/api/studio-time', requireAdmin, express.json({ limit: '2kb' }), (req, res) => studioTime.setHandler(req, res));
 // Calendar overview for System health: students' invites + Studio calendar + guards
 app.get('/api/calendar/overview', requireAdmin, async (req, res) => {
   try {

@@ -72,7 +72,7 @@ function esc(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&
 function emailHtml(n) {
   return '<div style="font-family:Helvetica,Arial,sans-serif;font-size:15px;line-height:1.6;color:#1a1a1a;max-width:520px;">'
     + '<p style="margin:0 0 14px;">' + esc(n.message) + '</p>'
-    + '<p style="margin:0 0 18px;font-size:13px;color:#8a7a6a;">' + new Date(n.created_at || Date.now()).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit', hour12: true }) + ' IST</p>'
+    + '<p style="margin:0 0 18px;font-size:13px;color:#8a7a6a;">' + new Date(n.created_at || Date.now()).toLocaleString('en-IN', { timeZone: require('./studio-time').tz(), day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit', hour12: true }) + ' ' + require('./studio-time').label() + '</p>'
     + '<a href="' + DASHBOARD_URL + '" style="display:inline-block;background:#500018;color:#fff;text-decoration:none;padding:9px 18px;border-radius:8px;font-size:14px;">Open dashboard</a>'
     + '</div>';
 }

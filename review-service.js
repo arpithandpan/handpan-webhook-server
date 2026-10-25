@@ -161,7 +161,7 @@ async function run(opts = {}) {
 // Sunday 9 AM IST, once there is a week of data.
 async function tick() {
   try {
-    const now = istNow(), day = now.toISOString().slice(0, 10);
+    const now = require('./studio-time').shifted(), day = now.toISOString().slice(0, 10);   // Arpit's own Sunday
     if (now.getUTCDay() !== RUN_DAY || now.toISOString().slice(11, 16) < RUN_HHMM) return;
     const st = await getJson('ai_review_state', {});
     if (st.lastAuto === day) return;

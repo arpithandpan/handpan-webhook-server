@@ -102,7 +102,7 @@ function status() { return { enabled: enabled(), mode: enabled() ? SET.mode : 'o
 async function autoWindow(now) {
   const w = SET.when;
   if (w.always) return 'always';
-  const ist = new Date(now + 330 * 60000);
+  const ist = require('./studio-time').shifted(now);   // Arpit's own clock (India unless he moved)
   const day = ist.getUTCDay(), min = ist.getUTCHours() * 60 + ist.getUTCMinutes();
   if (w.weekend && (day === 0 || day === 6)) return 'weekend';
   if (w.night) {

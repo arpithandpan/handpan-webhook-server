@@ -37,6 +37,7 @@ const MIN = 60000, DAY = 86400000;
 const SYNC_MS = 10 * MIN, GUARD_MS = 6 * 60 * MIN;
 const PAST_DAYS = 2, AHEAD_DAYS = 70;
 const DASH = 'https://arpitpandey.com/pages/dashboard';
+const studio = require('./studio-time');
 
 const state = { lastSync: null, lastError: null, counts: null, stray: [], strayAt: null, zoom: [], zoomAt: null, guardError: null };
 
@@ -219,7 +220,7 @@ async function desired() {
   for (const b of blocks) {
     const s = new Date(b.start_at).getTime(), e = new Date(b.end_at).getTime(); if (isNaN(s) || isNaN(e)) continue;
     const title = 'Away' + (b.note ? ' · ' + b.note : '');
-    if (b.all_day) out.push({ key: 'away|' + b.id, title, allDay: istYmd(s), endDay: istYmd(e - 1) === istYmd(s) ? null : addDays(istYmd(e - 1), 1), desc: 'Blocked in Studio. No classes or trials.', color: '8', kind: 'away' });
+    if (b.all_day) out.push({ key: 'away|' + b.id, title, allDay: studio.ymd(s), endDay: studio.ymd(e - 1) === studio.ymd(s) ? null : addDays(studio.ymd(e - 1), 1), desc: 'Blocked in Studio. No classes or trials.', color: '8', kind: 'away' });
     else out.push({ key: 'away|' + b.id, title, s, e, desc: 'Blocked in Studio. No classes or trials.', color: '8', kind: 'away' });
   }
   return out;
