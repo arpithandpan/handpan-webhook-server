@@ -31,12 +31,20 @@ const short = p => { const d = String(p || '').replace(/\D/g, ''); return d ? '�
 const scrub = t => String(t || '').replace(/[\w.+-]+@[\w-]+\.[\w.]+/g, '[email]').replace(/\+?\d[\d\s().-]{7,}\d/g, m => short(m));
 async function getJson(key, dflt) { try { const { data } = await supabase.from('app_settings').select('value').eq('key', key).maybeSingle(); return (data && data.value) || dflt; } catch (e) { return dflt; } }
 async function putJson(key, value) { const { error } = await supabase.from('app_settings').upsert({ key, value }, { onConflict: 'key' }); if (error) throw new Error(error.message); }
+// Test accounts (students whose id starts with S-DEMO, plus TEST_PHONES in Railway) are left
+// out of the review, so testing the agent never shows up as real work.
+async function testPhones() {
+  const set = new Set(String(process.env.TEST_PHONES || '').split(',').map(x => x.replace(/\D/g, '')).filter(Boolean));
+  try { const { data } = await supabase.from('students').select('id, phone').like('id', 'S-DEMO%'); (data || []).forEach(s => { const d = String(s.phone || '').replace(/\D/g, ''); if (d) set.add(d); }); } catch (e) {}
+  return set;
+}
 async function rows(table, build) { try { const r = await build(supabase.from(table)); return r.data || []; } catch (e) { return []; } }
 
 // ── 1. GATHER ──
 async function gather(days) {
   const from = since(days);
-  const drafts = await rows('wa_drafts', x => x.select('id, phone, in_wa_id, status, body, sent_text, edited, category, needs_arpit, note, person_kind, created_at').gte('created_at', from).order('created_at', { ascending: true }).limit(400));
+  const tests = await testPhones();
+  const drafts = (await rows('wa_drafts', x => x.select('id, phone, in_wa_id, status, body, sent_text, edited, category, needs_arpit, note, person_kind, created_at').gte('created_at', from).order('created_at', { ascending: true }).limit(400))).filter(d => !tests.has(String(d.phone || '').replace(/\D/g, '')));
   const interesting = drafts.filter(d => d.needs_arpit || d.edited || d.category === 'other' || d.status === 'no_reply' && d.note);
   const ids = [...new Set(interesting.map(d => d.in_wa_id).filter(Boolean))];
   const msgs = ids.length ? await rows('wa_messages', x => x.select('wa_id, body, type').in('wa_id', ids)) : [];
