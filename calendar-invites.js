@@ -38,6 +38,9 @@ let notifyFn = null;
 let zoomApi = null;
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+// Reading delivery status needs a full-access key. RESEND_READ_KEY (optional) is used
+// only for that, so the sending key stays as it is.
+const RESEND_READ_KEY = process.env.RESEND_READ_KEY || RESEND_API_KEY;
 const FROM_EMAIL = process.env.TRIAL_FROM_EMAIL || 'classes@arpitpandey.com';
 const ARPIT_EMAIL = process.env.TRIAL_ARPIT_EMAIL || 'arpithandpan@gmail.com';
 const IST = 'Asia/Kolkata';
@@ -303,13 +306,13 @@ async function trackDelivery(id, student, to, kind) {
   await saveChecks();
 }
 async function checkDeliveries() {
-  if (!RESEND_API_KEY || _checkOff) return;
+  if (!RESEND_READ_KEY || _checkOff) return;
   await loadChecks();
   if (!_checks.length) return;
   const now = Date.now(); let changed = false; const said = new Set();
   for (const c of _checks.slice()) {
     if (now - c.at < CHECK_AT[c.n]) continue;
-    const r = await fetch('https://api.resend.com/emails/' + c.id, { headers: { Authorization: 'Bearer ' + RESEND_API_KEY } }).catch(() => null);
+    const r = await fetch('https://api.resend.com/emails/' + c.id, { headers: { Authorization: 'Bearer ' + RESEND_READ_KEY } }).catch(() => null);
     if (r && (r.status === 401 || r.status === 403)) {
       _checkOff = true; _checks = []; await saveChecks();
       console.log('Calendar invites: delivery check off (this Resend key can only send). Use a full-access key to turn it on.');
@@ -459,8 +462,8 @@ function startWorker() {
   _timer = setInterval(tick, TICK_MS);
   setInterval(() => { checkDeliveries().catch(e => console.error('Invite delivery check failed:', e.message)); }, 5 * MIN);
   // Can this Resend key read delivery status? (a send-only key answers 401)
-  if (RESEND_API_KEY) fetch('https://api.resend.com/emails/00000000-0000-0000-0000-000000000000', { headers: { Authorization: 'Bearer ' + RESEND_API_KEY } })
-    .then(r => { if (r.status === 401 || r.status === 403) { _checkOff = true; console.log('Invite delivery check: off (this Resend key can only send)'); } else console.log('Invite delivery check: on (15 min, 2 h, 24 h after each invite)'); })
+  if (RESEND_READ_KEY) fetch('https://api.resend.com/emails/00000000-0000-0000-0000-000000000000', { headers: { Authorization: 'Bearer ' + RESEND_READ_KEY } })
+    .then(r => { if (r.status === 401 || r.status === 403) { _checkOff = true; console.log('Invite delivery check: off (this Resend key can only send; add a full-access key as RESEND_READ_KEY)'); } else console.log('Invite delivery check: on (15 min, 2 h, 24 h after each invite)'); })
     .catch(() => {});
 }
 
