@@ -64,13 +64,13 @@ async function gather(days) {
     rows('class_log', x => x.select('id, is_free').gte('class_date', from.slice(0, 10))),
     rows('trials', x => x.select('id, status, created_at').gte('created_at', from)),
     rows('students', x => x.select('id, join_date').gte('join_date', from.slice(0, 10))),
-    rows('fee_requests', x => x.select('id, status, created_at')),
+    rows('fee_requests', x => x.select('id, status, created_at, student_id')),
     rows('payments', x => x.select('amount, type, date').gte('date', from.slice(0, 10)))
   ]);
   const income = pays.filter(p => p.type === 'income').reduce((a, p) => a + Number(p.amount || 0), 0);
   const week = {
     classes: cls.length, trials_booked: trials.length, new_students: studs.length,
-    fee_links_unpaid: fees.filter(f => f.status === 'pending').length,
+    fee_links_unpaid: fees.filter(f => f.status === 'pending' && !/^S-DEMO/i.test(String(f.student_id || ''))).length,
     income_inr: Math.round(income),
     agent_drafts: drafts.length, agent_auto_sent: drafts.filter(d => d.status === 'sent' && !d.edited && d.sent_text == null).length,
     agent_passed_to_you: drafts.filter(d => d.needs_arpit).length, agent_rewritten_by_you: drafts.filter(d => d.edited).length,
