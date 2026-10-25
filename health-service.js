@@ -20,7 +20,7 @@
 //     one ⚠️ notification with the short list (push + email + WhatsApp).
 // The dashboard reads everything from GET /api/health/status (More → System health).
 
-const VERSION = 'health-5';
+const VERSION = 'health-6';
 const SERVICE_EVERY = 5 * 60 * 1000;
 const DATA_EVERY = 30 * 60 * 1000;
 const REALERT_MS = 6 * 3600 * 1000;
@@ -57,7 +57,8 @@ const JOB_LABELS = {
   'zoom-service:processPending': 'Zoom attendance',
   'zoom-service:syncMeetings': 'Zoom meeting sync',
   'zoom-service:renewalCheck': 'Fee renewals',
-  'review-service:tick': 'Weekly AI review'
+  'review-service:tick': 'Weekly AI review',
+  'studio-calendar:sync': 'Studio calendar', 'studio-calendar:guards': 'Calendar and Zoom check'
 };
 function jobKeyFor(fn, stack) {
   const m = String(stack || '').split('\n').map(l => l.match(/([a-z0-9-]+)\.js:\d+/i)).find(x => x && x[1] !== 'health-service');
