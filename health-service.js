@@ -56,7 +56,8 @@ const JOB_LABELS = {
   'workshop-messages:processPending': 'Workshop messages',
   'zoom-service:processPending': 'Zoom attendance',
   'zoom-service:syncMeetings': 'Zoom meeting sync',
-  'zoom-service:renewalCheck': 'Fee renewals'
+  'zoom-service:renewalCheck': 'Fee renewals',
+  'review-service:tick': 'Weekly AI review'
 };
 function jobKeyFor(fn, stack) {
   const m = String(stack || '').split('\n').map(l => l.match(/([a-z0-9-]+)\.js:\d+/i)).find(x => x && x[1] !== 'health-service');
