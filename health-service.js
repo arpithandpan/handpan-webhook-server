@@ -20,7 +20,7 @@
 //     one ⚠️ notification with the short list (push + email + WhatsApp).
 // The dashboard reads everything from GET /api/health/status (More → System health).
 
-const VERSION = 'health-4';
+const VERSION = 'health-5';
 const SERVICE_EVERY = 5 * 60 * 1000;
 const DATA_EVERY = 30 * 60 * 1000;
 const REALERT_MS = 6 * 3600 * 1000;
@@ -325,6 +325,23 @@ async function checkData() {
     }
     if (rows.length) setIssue('data:drafts-old', 'warn', rows.length + ' reply draft' + (rows.length > 1 ? 's' : '') + ' waiting 3+ hours', 'People are waiting for an answer.', { label: 'Open Inbox', sec: 'whatsapp' }, 'whatsapp');
     else delete state.issues['data:drafts-old'];
+  });
+
+  // Calendars and Zoom links (studio-calendar.js guards; read only)
+  await run('calendar', async () => {
+    let sc; try { sc = require('./studio-calendar').status(); } catch (e) { return; }
+    const go = { label: 'Open System health', sec: 'health' };
+    if (sc.enabled && sc.lastError) setIssue('cal:sync', 'warn', 'Studio calendar is not updating', String(sc.lastError).slice(0, 160), go, 'calendar');
+    else delete state.issues['cal:sync'];
+    const stray = (sc.stray || []).filter(x => !x.error);
+    if (stray.length) {
+      const withStudents = stray.filter(x => x.studentGuests > 0).length;
+      setIssue('cal:stray', 'warn', stray.length + ' old class entr' + (stray.length > 1 ? 'ies' : 'y') + ' in your Google Calendar',
+        stray.slice(0, 4).map(x => x.title).join(', ') + (withStudents ? '. ' + withStudents + ' of them also show in a student\'s calendar.' : '') + ' Delete them in Google Calendar (This and following events).', go, 'calendar');
+    } else delete state.issues['cal:stray'];
+    const zp = sc.zoom || [];
+    if (zp.length) setIssue('cal:zoom', 'bad', 'Zoom link problem: ' + zp[0].student + (zp.length > 1 ? ' and ' + (zp.length - 1) + ' more' : ''), zp.map(x => x.student + ': ' + x.problem).join('. '), go, 'zoom');
+    else delete state.issues['cal:zoom'];
   });
 
   // Questions the agent could not answer this week (input for the AI review later)
