@@ -20,6 +20,8 @@ const RUN_DAY = 0, RUN_HHMM = '09:00';            // Sunday, IST
 const MIN_DATA_DAYS = 6;
 
 let supabase = null, deps = {};
+let KNOWLEDGE = '';
+try { KNOWLEDGE = require('./agent-knowledge').KNOWLEDGE || ''; } catch (e) {}
 let running = false;
 
 const istNow = () => new Date(Date.now() + 5.5 * 3600 * 1000);
@@ -96,7 +98,7 @@ const SCHEMA = {
 const RULES = `You review one week of Arpit's handpan studio (online 1:1 classes, workshops in Bengaluru, performances).
 Write for Arpit: short, plain, warm, no jargon, no em dashes.
 - new_questions: only real gaps, things people asked that the agent could not answer or Arpit had to handle. Group similar ones. Skip normal booking/fee/schedule chat that went fine. Empty list is fine.
-- teach_agent: at most 5 lines, only facts that would have let the agent answer a real question from this week. Never invent prices, dates or policies: put a [blank] and set needs_arpit_input. Do not repeat what the existing notes already say. Where Arpit rewrote a draft, learn from what he sent instead.
+- teach_agent: at most 5 lines, only facts that would have let the agent answer a real question from this week. Read MAIN KNOWLEDGE first: if the answer is already there and the agent still got it wrong or passed it on, do NOT suggest a line for it, list it under errors instead (title like "Agent ignored its knowledge", serious=false, fix_note says which rule). Never invent prices, dates or policies: put a [blank] and set needs_arpit_input. Do not repeat what the existing notes already say. Where Arpit rewrote a draft, learn from what he sent instead.
 - errors: group by likely cause, skip one-offs that look harmless. serious = could lose money, a student, or a message.
 - Never include phone numbers, emails or full names.`;
 
@@ -109,6 +111,7 @@ async function askClaude(data) {
     system: RULES,
     messages: [{ role: 'user', content:
       'THE WEEK IN NUMBERS\n' + JSON.stringify(data.week) +
+      '\n\nMAIN KNOWLEDGE THE AGENT ALREADY HAS\n' + KNOWLEDGE.slice(0, 12000) +
       '\n\nAGENT NOTES ARPIT ALREADY HAS\n' + (data.notes.trim() || '(none)') +
       '\n\nCHATS THE AGENT PASSED TO ARPIT, OR WHERE ARPIT REWROTE THE REPLY\n' + JSON.stringify(data.asks) +
       '\n\nERRORS (server and dashboard)\n' + JSON.stringify(data.errors) +
