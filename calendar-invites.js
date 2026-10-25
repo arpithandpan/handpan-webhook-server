@@ -20,11 +20,22 @@
 // Switching test → on sends each student their first invite.
 //
 // Table calendar_invites (RLS on, server only): one row per weekly slot.
+//
+// v179 additions
+//   • Delivery check: every invite's Resend id is checked after 15 min, 2 h and
+//     24 h. Bounced / marked as spam / blocked → an alert to Arpit (dashboard +
+//     phone). The list waits in app_settings 'invite_checks' so a restart keeps it.
+//   • Zoom check before a first invite (new student, or back from a break): a
+//     deleted meeting holds the invite and alerts Arpit; a meeting with fixed
+//     times is switched to "no fixed time" first (same ID, same link).
+//   • resend(): the student (My bookings) or Arpit (System health) can get the
+//     same invite again. Same UID, so the calendar entry updates, never doubles.
 
 const crypto = require('crypto');
 
 let supabase = null;
 let notifyFn = null;
+let zoomApi = null;
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const FROM_EMAIL = process.env.TRIAL_FROM_EMAIL || 'classes@arpitpandey.com';
@@ -35,7 +46,8 @@ const TICK_MS = 10 * MIN;
 const MAX_PER_RUN = 25;
 const DAYS = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
 
-function init(client, opts = {}) { supabase = client; notifyFn = opts.notify || null; }
+function init(client, opts = {}) { supabase = client; notifyFn = opts.notify || null; zoomApi = opts.zoomApi || null; }
+async function alert(type, message) { if (notifyFn) { try { await notifyFn(type, message); } catch (e) {} } }
 function mode() {
   const v = String(process.env.CALENDAR_INVITES || '').trim().toLowerCase();
   return v === 'on' || v === 'test' ? v : 'off';
@@ -194,8 +206,9 @@ async function sendMail({ to, subject, html, text, ics, method }) {
     attachments: [{ filename: method === 'CANCEL' ? 'cancel.ics' : 'invite.ics', content: Buffer.from(ics).toString('base64'), content_type: 'text/calendar; method=' + method + '; charset=UTF-8' }]
   };
   const r = await fetch('https://api.resend.com/emails', { method: 'POST', headers: { Authorization: 'Bearer ' + RESEND_API_KEY, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  if (!r.ok) { const j = await r.json().catch(() => ({})); return { ok: false, error: j.message || ('HTTP ' + r.status) }; }
-  return { ok: true };
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) return { ok: false, error: j.message || ('HTTP ' + r.status) };
+  return { ok: true, id: j.id || null };
 }
 function shell(inner) {
   return '<div style="background:#F5EEE5;padding:28px 16px;font-family:Helvetica,Arial,sans-serif;color:#5A4645;"><div style="max-width:520px;margin:0 auto;background:#FFFDFA;border-radius:16px;padding:28px 24px;">' + inner +
@@ -209,6 +222,11 @@ function mailFor(kind, student, test) {
     text: 'Hi ' + first + ', your weekly handpan class is attached as a calendar invite. Add it once and it stays up to date: when a class is moved or skipped, your calendar changes by itself. To move or skip a class: https://arpitpandey.com/my',
     html: shell('<p style="margin:0 0 14px;font-size:16px;">Hi ' + first + ',</p><p style="margin:0 0 14px;line-height:1.55;">Your weekly handpan class is attached as a calendar invite. Add it once and it stays up to date: when a class is moved or skipped, your calendar changes by itself.</p><p style="margin:0;line-height:1.55;">To move or skip a class: <a href="https://arpitpandey.com/my" style="color:#500018;">arpitpandey.com/my</a></p>')
   };
+  if (kind === 'again') return {
+    subject: tag + 'Your weekly handpan class · calendar invite',
+    text: 'Hi ' + first + ', here is your weekly handpan class calendar invite again. Open it and add it (or tap Yes). If the class is already in your calendar, it just updates the same entry, so nothing shows twice. To move or skip a class: https://arpitpandey.com/my',
+    html: shell('<p style="margin:0 0 14px;font-size:16px;">Hi ' + first + ',</p><p style="margin:0 0 14px;line-height:1.55;">Here is your weekly handpan class calendar invite again. Open it and add it (or tap Yes). If the class is already in your calendar, it just updates the same entry, so nothing shows twice.</p><p style="margin:0;line-height:1.55;">To move or skip a class: <a href="https://arpitpandey.com/my" style="color:#500018;">arpitpandey.com/my</a></p>')
+  };
   if (kind === 'cancel') return {
     subject: tag + 'Weekly handpan class removed from your calendar',
     text: 'Hi ' + first + ', this removes your weekly handpan class from your calendar. If this is a mistake, just reply or WhatsApp me.',
@@ -219,6 +237,97 @@ function mailFor(kind, student, test) {
     text: 'Hi ' + first + ', your class times changed, so here is the updated calendar invite. Your calendar should update by itself.',
     html: shell('<p style="margin:0 0 14px;font-size:16px;">Hi ' + first + ',</p><p style="margin:0;line-height:1.55;">Your class times changed, so here is the updated calendar invite. Your calendar should update by itself. You can always see your classes at <a href="https://arpitpandey.com/my" style="color:#500018;">arpitpandey.com/my</a>.</p>')
   };
+}
+
+// ── ZOOM CHECK before a first invite ──
+// Returns { ok:true } to send, or { ok:false, why } to hold the invite.
+// A meeting in Zoom's "Recently Deleted" still answers GET /meetings/{id}, so
+// it only counts as alive when it is also in the account's meeting list (and
+// that list is trusted only when it shows at least one of our meetings).
+let _zoomList = { at: 0, ids: null };
+async function zoomListed(ourIds) {
+  if (Date.now() - _zoomList.at > 10 * MIN) {
+    const ids = new Set(); let next = '', ok = false;
+    for (let i = 0; i < 10; i++) {
+      const l = await zoomApi('GET', '/users/me/meetings?type=scheduled&page_size=300' + (next ? '&next_page_token=' + next : ''));
+      if (!l.ok) { ok = false; break; }
+      ok = true;
+      for (const m of (l.data.meetings || [])) ids.add(String(m.id));
+      next = l.data.next_page_token || ''; if (!next) break;
+    }
+    _zoomList = { at: Date.now(), ids: ok ? ids : null };
+  }
+  const ids = _zoomList.ids;
+  return ids && ourIds.some(id => ids.has(id)) ? ids : null;
+}
+function meetingId(link) { return (String(link || '').match(/\/j\/(\d+)/) || [])[1] || null; }
+async function zoomGate(row, allSlots) {
+  if (!zoomApi) return { ok: true };
+  const id = meetingId(row.zoom_link);
+  if (!id) return { ok: true };            // no link yet: the invite goes, and updates once a link is added
+  const m = await zoomApi('GET', '/meetings/' + id);
+  if (!m.ok && m.status === 404) return { ok: false, why: 'their Zoom meeting (' + id + ') was deleted. Make a new "no fixed time" meeting and put the link on their slot' };
+  if (!m.ok) return { ok: true };          // Zoom hiccup: don't block the invite on it
+  const ours = allSlots.map(r => meetingId(r.zoom_link)).filter(Boolean);
+  const listed = await zoomListed(ours).catch(() => null);
+  if (listed && !listed.has(String(id))) return { ok: false, why: 'their Zoom meeting (' + id + ') is in Zoom → Meetings → Recently Deleted. Recover it there (same link)' };
+  if (Number(m.data.type) !== 3) {
+    const p = await zoomApi('PATCH', '/meetings/' + id, { type: 3 });
+    const after = p.ok ? await zoomApi('GET', '/meetings/' + id) : null;
+    if (after && after.ok && Number(after.data.type) === 3 && after.data.join_url === m.data.join_url) {
+      console.log('Calendar invites: Zoom ' + id + ' switched to no fixed time (same link)');
+    } else {
+      await alert('warning', '⚠️ Zoom meeting ' + id + ' still has fixed times (type ' + m.data.type + '). The calendar invite went out, but switch the meeting to "no fixed time" in Zoom so the link never expires.');
+    }
+  }
+  return { ok: true };
+}
+const _heldSaid = {};   // slot → day already alerted
+
+// ── DELIVERY CHECK ──
+// Resend accepts a mail first and finds out later if the address bounced.
+const CHECK_AT = [15 * MIN, 2 * 60 * MIN, 24 * 60 * MIN];
+const BAD = { bounced: 'bounced (the address does not take mail)', complained: 'was marked as spam', failed: 'could not be sent', suppressed: 'was blocked (this address bounced before)' };
+let _checks = null, _checkOff = false;
+async function loadChecks() {
+  if (_checks) return _checks;
+  try { const { data } = await supabase.from('app_settings').select('value').eq('key', 'invite_checks').maybeSingle(); _checks = (data && Array.isArray(data.value)) ? data.value : []; }
+  catch (e) { _checks = []; }
+  return _checks;
+}
+async function saveChecks() { try { await supabase.from('app_settings').upsert({ key: 'invite_checks', value: _checks.slice(-200) }, { onConflict: 'key' }); } catch (e) {} }
+async function trackDelivery(id, student, to, kind) {
+  if (!id || _checkOff) return;
+  await loadChecks();
+  _checks.push({ id, student: student.full_name || student.id, sid: student.id, to, kind, at: Date.now(), n: 0 });
+  await saveChecks();
+}
+async function checkDeliveries() {
+  if (!RESEND_API_KEY || _checkOff) return;
+  await loadChecks();
+  if (!_checks.length) return;
+  const now = Date.now(); let changed = false; const said = new Set();
+  for (const c of _checks.slice()) {
+    if (now - c.at < CHECK_AT[c.n]) continue;
+    const r = await fetch('https://api.resend.com/emails/' + c.id, { headers: { Authorization: 'Bearer ' + RESEND_API_KEY } }).catch(() => null);
+    if (r && (r.status === 401 || r.status === 403)) {
+      _checkOff = true; _checks = []; await saveChecks();
+      console.log('Calendar invites: delivery check off (this Resend key can only send). Use a full-access key to turn it on.');
+      return;
+    }
+    if (!r || !r.ok) continue;             // try again next round
+    const j = await r.json().catch(() => ({}));
+    const ev = String(j.last_event || '');
+    const done = () => { _checks.splice(_checks.indexOf(c), 1); changed = true; };
+    if (BAD[ev]) {
+      if (!said.has(c.to + ev)) await alert('warning', '📭 Calendar invite to ' + c.student + ' ' + BAD[ev] + ': ' + c.to + '. Fix their email in Students; the invite goes again by itself.');
+      said.add(c.to + ev);
+      console.log('Calendar invite ' + ev + ': ' + c.student + ' <' + c.to + '>');
+      done();
+    } else if (['delivered', 'opened', 'clicked'].includes(ev)) done();
+    else { c.n++; changed = true; if (c.n >= CHECK_AT.length) done(); }
+  }
+  if (changed) await saveChecks();
 }
 
 // ── WORKER ──
@@ -235,7 +344,7 @@ async function load() {
 }
 
 // Returns the list of actions; sends them unless dry.
-async function run({ dry = false, only = null } = {}) {
+async function run({ dry = false, only = null, again = null } = {}) {
   const m = mode();
   if (m === 'off' && !dry) return { mode: m, actions: [] };
   const d = await load();
@@ -244,6 +353,7 @@ async function run({ dry = false, only = null } = {}) {
   const actions = [];
   for (const row of d.slots) {
     if (only && row.student_id !== only) continue;
+    if (again && !again.has(String(row.id))) continue;
     const student = studentById[row.student_id];
     const rec = recBySlot[String(row.id)];
     const live = row.active !== false && student && !student.archived && !!student.email;
@@ -260,8 +370,8 @@ async function run({ dry = false, only = null } = {}) {
     const exs = d.exceptions.filter(e => e.student_id === row.student_id && String(e.original_date).slice(0, 10) >= addDays(anchor, -1));
     const built = buildIcs({ row, student, anchor, exceptions: exs, seq, method: 'REQUEST' });
     const isNew = !rec || rec.cancelled_at || rec.recipient !== recipient || rec.slot_sig !== sig;
-    if (!isNew && rec.hash === built.hash) continue;
-    actions.push({ kind: isNew ? 'new' : 'update', row, student, rec, anchor, sig, recipient, seq, built });
+    if (!isNew && rec.hash === built.hash && !again) continue;
+    actions.push({ kind: isNew ? 'new' : again ? 'again' : 'update', row, student, rec, anchor, sig, recipient, seq, built });
   }
   if (dry) return { mode: m, actions: actions.map(a => ({ kind: a.kind, student: a.student.full_name || a.student.id, slot: a.row.id, to: a.recipient || (a.rec && a.rec.recipient), changes: a.built ? a.built.summary : null })) };
   const done = [];
@@ -275,9 +385,19 @@ async function run({ dry = false, only = null } = {}) {
         if (!r.ok) throw new Error(r.error);
         await supabase.from('calendar_invites').update({ seq, cancelled_at: new Date().toISOString(), last_sent_at: new Date().toISOString() }).eq('id', a.rec.id);
       } else {
+        if (a.kind === 'new') {
+          const g = await zoomGate(a.row, d.slots.filter(r => r.active !== false));
+          if (!g.ok) {
+            const today = istYmd(Date.now());
+            if (_heldSaid[a.row.id] !== today) { _heldSaid[a.row.id] = today; await alert('warning', '🔴 Calendar invite for ' + (a.student.full_name || a.row.student_id) + ' is on hold: ' + g.why + '. It goes out by itself once that is fixed.'); }
+            console.log('Calendar invite held (' + (a.student.full_name || a.row.student_id) + '): ' + g.why);
+            continue;
+          }
+        }
         const mail = mailFor(a.kind, a.student, m === 'test');
         const r = await sendMail({ to: a.recipient, ...mail, ics: a.built.ics, method: 'REQUEST' });
         if (!r.ok) throw new Error(r.error);
+        await trackDelivery(r.id, a.student, a.recipient, a.kind);
         const row = { slot_id: String(a.row.id), student_id: a.row.student_id, recipient: a.recipient, seq: a.seq, hash: a.built.hash, slot_sig: a.sig, anchor: a.anchor, last_sent_at: new Date().toISOString(), cancelled_at: null };
         if (a.rec) await supabase.from('calendar_invites').update(row).eq('id', a.rec.id);
         else await supabase.from('calendar_invites').insert(row);
@@ -285,11 +405,29 @@ async function run({ dry = false, only = null } = {}) {
       done.push(a.kind + ' ' + (a.student.full_name || a.student.id));
     } catch (e) {
       console.error('Calendar invite failed (' + (a.student.full_name || a.row.student_id) + '):', e.message);
-      if (notifyFn) { try { await notifyFn('warning', '🔴 Calendar invite not sent to ' + (a.student.full_name || a.row.student_id) + ': ' + e.message); } catch (er) {} }
+      await alert('warning', '🔴 Calendar invite not sent to ' + (a.student.full_name || a.row.student_id) + ': ' + e.message);
     }
   }
   if (done.length) console.log('Calendar invites (' + m + '):', done.join(', '));
   return { mode: m, sent: done };
+}
+
+// Send the same invite again: { student } = all their live slots, { slot } = one.
+// Same UID and a higher SEQUENCE, so the calendar updates the entry it has.
+async function resend({ student = null, slot = null } = {}) {
+  if (mode() === 'off') return { ok: false, code: 'off', error: 'Calendar invites are off' };
+  let q = supabase.from('class_schedule').select('id, student_id, active');
+  q = slot ? q.eq('id', slot) : q.eq('student_id', student);
+  const { data, error } = await q;
+  if (error) return { ok: false, error: error.message };
+  const live = (data || []).filter(r => r.active !== false);
+  if (!live.length) return { ok: false, code: 'no_slot', error: 'No active weekly class' };
+  if (_busy) return { ok: false, code: 'busy', error: 'busy' };
+  _busy = true;
+  try {
+    const r = await run({ only: live[0].student_id, again: new Set(live.map(x => String(x.id))) });
+    return { ok: (r.sent || []).length > 0, sent: r.sent || [], mode: r.mode, error: (r.sent || []).length ? null : 'Not sent' };
+  } finally { _busy = false; }
 }
 
 // Preview the .ics a student would get right now (dashboard / testing).
@@ -319,6 +457,11 @@ function startWorker() {
   };
   setTimeout(tick, 60 * 1000);
   _timer = setInterval(tick, TICK_MS);
+  setInterval(() => { checkDeliveries().catch(e => console.error('Invite delivery check failed:', e.message)); }, 5 * MIN);
+  // Can this Resend key read delivery status? (a send-only key answers 401)
+  if (RESEND_API_KEY) fetch('https://api.resend.com/emails/00000000-0000-0000-0000-000000000000', { headers: { Authorization: 'Bearer ' + RESEND_API_KEY } })
+    .then(r => { if (r.status === 401 || r.status === 403) { _checkOff = true; console.log('Invite delivery check: off (this Resend key can only send)'); } else console.log('Invite delivery check: on (15 min, 2 h, 24 h after each invite)'); })
+    .catch(() => {});
 }
 
 // Admin endpoints
@@ -335,4 +478,4 @@ async function runHandler(req, res) {
   finally { _busy = false; }
 }
 
-module.exports = { init, startWorker, run, preview, statusHandler, previewHandler, runHandler, _test: { buildIcs, slotRule, firstOn, zonedToUtc, fold } };
+module.exports = { init, startWorker, run, resend, preview, statusHandler, previewHandler, runHandler, checkDeliveries, _test: { buildIcs, slotRule, firstOn, zonedToUtc, fold, zoomGate, _set: o => { if ('zoomApi' in o) zoomApi = o.zoomApi; if ('checks' in o) _checks = o.checks; if ('off' in o) _checkOff = o.off; } } };

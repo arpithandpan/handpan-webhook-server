@@ -821,6 +821,29 @@ function maskEmail(e) {
   return u.slice(0, Math.min(2, Math.max(1, u.length - 1))) + '•••@' + d;
 }
 
+// POST /api/my/:token/calendar → the student's calendar invite again, by email.
+// Same invite (same UID), so their calendar updates the entry it has; nothing doubles.
+async function calendarHandler(req, res) {
+  try {
+    const ctx = await ctxForToken(req.params.token);
+    if (!ctx) return res.status(404).json({ ok: false, error: 'This link is not valid any more.' });
+    const to = [ctx.student.email].concat(String(ctx.student.extra_emails || '').split(/[,;\s]+/)).filter(e => /@/.test(String(e || ''))).map(maskEmail);
+    if (!to.length) return res.status(400).json({ ok: false, error: 'There is no email on your profile yet. Please WhatsApp Arpit to add it.' });
+    const wait = waitMinutes('cal:' + ctx.student.id, 1, 60 * MIN);
+    if (wait) return res.status(429).json({ ok: false, error: 'Sent already. Please check your inbox (and spam). You can ask again in ' + wait + ' min.' });
+    tooMany('cal:' + ctx.student.id, 1, 60 * MIN);
+    const r = await require('./calendar-invites').resend({ student: ctx.student.id });
+    if (r.code === 'no_slot') return res.status(400).json({ ok: false, error: 'Your weekly class is paused right now, so there is no invite to send.' });
+    if (r.code === 'busy') { _reqHits.delete('cal:' + ctx.student.id); return res.status(503).json({ ok: false, error: 'One moment, please try again in a minute.' }); }
+    if (!r.ok) { _reqHits.delete('cal:' + ctx.student.id); return res.status(500).json({ ok: false, error: 'Could not send it right now. Please WhatsApp Arpit.' }); }
+    notify('info', '🗓️ ' + (ctx.student.full_name || ctx.student.id) + ' asked for their calendar invite again (My bookings).');
+    res.json({ ok: true, to });
+  } catch (e) {
+    console.error('portal calendar error:', e.message);
+    res.status(500).json({ ok: false, error: 'Could not send it right now. Please WhatsApp Arpit.' });
+  }
+}
+
 async function verifyCodeHandler(req, res) {
   try {
     const c = contactKey((req.body || {}).contact);
@@ -931,6 +954,6 @@ function startWorker() {
 }
 
 module.exports = {
-  init, startWorker, dataHandler, timesHandler, changeHandler, requestLinkHandler, requestCodeHandler, verifyCodeHandler, invoiceHandler, adminLinkHandler, linkForStudent,
+  init, startWorker, dataHandler, timesHandler, changeHandler, calendarHandler, requestLinkHandler, requestCodeHandler, verifyCodeHandler, invoiceHandler, adminLinkHandler, linkForStudent,
   _test: { _codes, _miss, buildClasses, changesUsed, pendingMakeups, monthEnd, freeTimes, loadStudent, tick, tooMany, _reqHits }
 };

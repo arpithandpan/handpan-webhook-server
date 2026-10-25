@@ -139,7 +139,7 @@ blocks.init(supabase, { whatsapp, trialBooking, studentPortal, push });
 const backup = require('./backup-service');
 backup.init(supabase);
 const calendarInvites = require('./calendar-invites');
-calendarInvites.init(supabase, { notify: async (type, message) => { await supabase.from('notifications').insert({ type, message, read: false }); } });
+calendarInvites.init(supabase, { zoomApi: zoom.zoomApi, notify: async (type, message) => { await supabase.from('notifications').insert({ type, message, read: false }); } });
 // Arpit's own Studio calendar in Google + calendar/Zoom guards (studio-calendar.js)
 const studioCal = require('./studio-calendar');
 studioCal.init(supabase, { zoomApi: zoom.zoomApi });
@@ -1521,9 +1521,10 @@ app.post('/api/calendar/resend', requireAdmin, express.json({ limit: '2kb' }), a
   try {
     const slot = String((req.body || {}).slot || '');
     if (!slot) return res.status(400).json({ error: 'slot needed' });
-    const { error } = await supabase.from('calendar_invites').update({ hash: null }).eq('slot_id', slot);
-    if (error) return res.status(500).json({ error: error.message });
-    res.json(await calendarInvites.run());
+    const r = await calendarInvites.resend({ slot });
+    // Worker busy right now: mark it changed so the next run (within 10 min) sends it.
+    if (r.code === 'busy') { await supabase.from('calendar_invites').update({ hash: null }).eq('slot_id', slot); return res.json({ ok: true, queued: true, sent: [] }); }
+    res.json(r);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // Sync the Studio calendar and re-run the guards now
@@ -1557,6 +1558,7 @@ app.post('/api/my/verify-code', express.json({ limit: '4kb' }), (req, res) => st
 app.get('/api/my/:token', (req, res) => studentPortal.dataHandler(req, res));
 app.get('/api/my/:token/times', (req, res) => studentPortal.timesHandler(req, res));
 app.post('/api/my/:token/change', express.json({ limit: '4kb' }), (req, res) => studentPortal.changeHandler(req, res));
+app.post('/api/my/:token/calendar', (req, res) => studentPortal.calendarHandler(req, res));
 app.get('/api/my/:token/invoice/:id', (req, res) => studentPortal.invoiceHandler(req, res, { getPdf, pdfFilename }));
 app.post('/api/portal/link', requireAdmin, express.json({ limit: '4kb' }), (req, res) => studentPortal.adminLinkHandler(req, res));
 
