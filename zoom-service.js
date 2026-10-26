@@ -582,7 +582,8 @@ async function logClass({ student, classDate, minutes, meetingUuid, how }) {
   } else {
     const taken = allLogs.filter(l => !l.is_free).length + 1;
     const remaining = paid - taken;
-    await notify('info', `🎥 Class logged from Zoom: ${name} · ${prettyDate(classDate)} · ${minutes} min (${how})`);
+    const leftTxt = remaining > 0 ? `${remaining} class${remaining === 1 ? '' : 'es'} left` : remaining === 0 ? '0 classes left' : `${-remaining} unpaid`;
+    await notify('info', `🎥 Class logged from Zoom: ${name} · ${prettyDate(classDate)} · ${minutes} min · ${leftTxt} (${how})`);
     if (remaining <= 0) {
       const deficit = remaining === 0
         ? `0 classes left after the ${prettyDate(classDate)} class`
