@@ -1,7 +1,9 @@
 // ── WHATSAPP AGENT (draft mode) ──
 // When someone messages the studio number, this drafts a reply with Claude
 // and saves it in wa_drafts. Arpit sees the draft in the dashboard chat and
-// sends it as is, edits it, or throws it away. Nothing is sent on its own.
+// sends it as is, edits it, or throws it away. In 'auto' mode safe replies
+// go out by themselves, and when Arpit must decide, a short holding reply
+// ("let me check and get back to you") goes out while the real draft waits.
 //
 // Flow:
 //   1. whatsapp-service.js logs the incoming message and calls onIncoming().
@@ -36,7 +38,7 @@ const SITE = 'https://arpitpandey.com';
 // $ per million tokens (Sonnet 5.5). Only used for the cost column.
 const PRICE_IN = 2, PRICE_OUT = 10, PRICE_CACHE_READ = 0.10, PRICE_CACHE_WRITE = 2.5;
 
-const CATEGORIES = ['trial', 'fees', 'payment', 'schedule', 'reschedule', 'zoom_link', 'workshop', 'performance', 'teaching', 'handpan_buying', 'greeting', 'complaint', 'other'];
+const CATEGORIES = ['trial', 'fees', 'payment', 'schedule', 'reschedule', 'zoom_link', 'workshop', 'performance', 'teaching', 'handpan_buying', 'greeting', 'general', 'complaint', 'other'];
 
 let supabase = null, whatsapp = null, studentPortal = null, trialBooking = null, onDraftHook = null, liveZoom = null;
 const timers = {};          // phone → debounce timer
@@ -61,7 +63,18 @@ const SET_DEFAULTS = {
 };
 // Kinds of question the agent may answer on its own. Money problems, changes,
 // complaints, teaching and anything 'other' always wait for Arpit.
-const SAFE_CATS = ['trial', 'fees', 'schedule', 'zoom_link', 'workshop', 'greeting'];
+const SAFE_CATS = ['trial', 'fees', 'schedule', 'zoom_link', 'workshop', 'greeting', 'general'];
+// Holding replies ("let me check and get back to you") may go out by themselves
+// only if they say nothing that could be a promise.
+const HOLD_BLOCK = /[0-9₹$€£%]|https?:|www\.|@|\b(yes|yeah|yep|sure|confirm(ed)?|done|booked|scheduled|available|free|discount|refund|price|cost|fee|fees|paid|payment|cancel(led)?|moved?|reschedul\w*|tomorrow|today|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday|haan|ho jayega|pakka|no problem|of course|definitely|will do|i'll send|i will send|sending)\b/i;
+const HOLD_NO_CATS = ['complaint'];
+function holdingOk(out) {
+  const t = String(out && out.holding_reply || '').trim();
+  if (!t || t.length > 200 || t.split(/\n/).length > 2) return '';
+  if (HOLD_NO_CATS.includes(String(out.category).toLowerCase())) return '';
+  if (HOLD_BLOCK.test(t)) return '';
+  return t;
+}
 let SET = JSON.parse(JSON.stringify(SET_DEFAULTS)), _setAt = 0;
 function cleanSettings(raw) {
   raw = raw && typeof raw === 'object' ? raw : {};
@@ -127,8 +140,9 @@ async function autoWindow(now) {
 function isSafe(out, firstContact) {
   const cat = String(out && out.category).toLowerCase();
   const catOk = SAFE_CATS.includes(cat) || (cat === 'performance' && firstContact);
+  const conf = String(out && out.confidence).toLowerCase();
   return !!(out && out.needs_reply && String(out.reply || '').trim() && !out.needs_arpit && out.safe_to_autosend &&
-    String(out.confidence).toLowerCase() === 'high' && catOk);
+    (conf === 'high' || conf === 'medium') && catOk);
 }
 
 // ── TIME HELPERS ──
@@ -294,13 +308,14 @@ const SCHEMA = {
   properties: {
     needs_reply: { type: 'boolean', description: 'false when nothing needs saying (thanks, ok, emoji, a "See you there" tap).' },
     reply: { type: 'string', description: 'The WhatsApp message to send, written as Arpit. Empty when needs_reply is false.' },
-    category: { type: 'string', enum: CATEGORIES },
+    category: { type: 'string', enum: CATEGORIES, description: 'teaching = only teaching material or feedback on playing. general = what a handpan is, about Arpit, his music, other harmless facts. Questions about classes are schedule, fees or trial.' },
     needs_arpit: { type: 'boolean', description: 'true when Arpit must decide or act himself (see ALWAYS ARPIT\'S CALL).' },
     note_for_arpit: { type: 'string', description: 'One short line for Arpit: what they want and anything he must do. Empty if nothing.' },
     confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
-    safe_to_autosend: { type: 'boolean', description: 'true ONLY when the reply just gives facts fully covered by KNOWLEDGE or LIVE DATA (fees, timings, trial link, how classes work, their own next class or Zoom link, workshop dates), or is the first reply to a performance enquiry that only asks for the event details; makes no promise, price or change; and would be fine to send without Arpit reading it first. false for anything else.' }
+    holding_reply: { type: 'string', description: 'Only when needs_arpit is true: a very short acknowledgement that can go out right away while Arpit decides ("Thanks! Let me check this and get back to you shortly."). No answer, promise, price, number, date, link. Empty for complaints, upset or personal messages, and when needs_arpit is false.' },
+    safe_to_autosend: { type: 'boolean', description: 'true ONLY when the reply just gives facts fully covered by KNOWLEDGE or LIVE DATA (fees, timings, trial link, how classes work, their own next class or Zoom link, workshop dates, what a handpan is, about Arpit), or is the first reply to a performance enquiry that only asks for the event details; makes no promise, price or change; and would be fine to send without Arpit reading it first. false for anything else.' }
   },
-  required: ['needs_reply', 'reply', 'category', 'needs_arpit', 'note_for_arpit', 'confidence', 'safe_to_autosend'],
+  required: ['needs_reply', 'reply', 'category', 'needs_arpit', 'note_for_arpit', 'confidence', 'holding_reply', 'safe_to_autosend'],
   additionalProperties: false
 };
 
@@ -398,16 +413,25 @@ async function draftFor(phone, opts) {
     // Auto-send: a safe draft at one of the picked times goes out after wait_min,
     // unless Arpit sends, edits or throws it away first.
     const firstContact = !rows.some(r => r.direction === 'out' && !r.template && r.type !== 'reaction');
-    if (row.status === 'pending' && SET.mode === 'auto' && isSafe(out, firstContact) && !opts.force) {
-      // Arpit is talking to them himself: drafts only for pause_min after his last reply.
-      const lastMine = rows.filter(r => r.direction === 'out' && !r.template && r.type !== 'reaction' && !(r.params && r.params.auto)).pop();
-      const paused = lastMine && SET.pause_min > 0 && Date.now() - new Date(lastMine.created_at).getTime() < SET.pause_min * 60000;
-      const why = paused ? null : await autoWindow(Date.now());
-      if (why) row.auto_at = new Date(Date.now() + SET.wait_min * 60000).toISOString();
+    // Arpit is talking to them himself: drafts only for pause_min after his last reply.
+    const lastMine = rows.filter(r => r.direction === 'out' && !r.template && r.type !== 'reaction' && !(r.params && r.params.auto)).pop();
+    const paused = lastMine && SET.pause_min > 0 && Date.now() - new Date(lastMine.created_at).getTime() < SET.pause_min * 60000;
+    const canAuto = row.status === 'pending' && SET.mode === 'auto' && !opts.force && !paused && await autoWindow(Date.now());
+    if (canAuto && isSafe(out, firstContact)) row.auto_at = new Date(Date.now() + SET.wait_min * 60000).toISOString();
+    // Arpit must decide: a short holding reply goes out by itself, the real draft waits for him.
+    // Saved first, so the dashboard (newest pending per chat) keeps showing the real draft.
+    const hold = canAuto && !row.auto_at && row.needs_arpit ? holdingOk(out) : '';
+    if (hold) {
+      const { error: hErr } = await supabase.from('wa_drafts').insert(Object.assign({}, row, {
+        body: hold, needs_arpit: false, note: 'Holding reply, sent while you decide', confidence: 'high',
+        tokens_in: 0, tokens_out: 0, cost_usd: 0, auto_at: new Date(Date.now() + SET.wait_min * 60000).toISOString()
+      }));
+      if (hErr) console.error('Agent holding reply not saved:', hErr.message);
+      else row.note = (row.note ? row.note + ' ' : '') + '(A short "let me check" reply goes out by itself.)';
     }
     const { data: saved, error: insErr } = await supabase.from('wa_drafts').insert(row).select().single();
     if (insErr) throw new Error('wa_drafts: ' + insErr.message);
-    console.log(`Agent draft (${row.status}, ${row.category}${row.needs_arpit ? ', needs Arpit' : ''}${row.auto_at ? ', auto' : ''}) → ${phone} · $${row.cost_usd}`);
+    console.log(`Agent draft (${row.status}, ${row.category}${row.needs_arpit ? ', needs Arpit' : ''}${row.auto_at ? ', auto' : ''}${hold ? ', holding reply' : ''}) → ${phone} · $${row.cost_usd}`);
     if (onDraftHook && saved && !opts.force) { try { onDraftHook(saved, live.name); } catch (e) {} }
     return { ok: true, draft: saved };
   } catch (e) {
@@ -595,7 +619,8 @@ async function testHandler(req, res) {
     const hist = '[' + fmt(Date.now()) + '] Them: ' + text;
     const { out } = await callClaude(live, hist);
     res.json({ ok: true, reply: String(out.reply || '').trim(), needs_reply: !!out.needs_reply, needs_arpit: !!out.needs_arpit,
-      note: String(out.note_for_arpit || '').trim(), category: out.category, safe: isSafe(out, true) });
+      note: String(out.note_for_arpit || '').trim(), category: out.category, safe: isSafe(out, true),
+      holding: out.needs_arpit ? holdingOk(out) : '' });
   } catch (e) { res.status(500).json({ error: 'Test failed: ' + e.message }); }
 }
 
