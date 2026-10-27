@@ -1899,19 +1899,28 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
         // WhatsApp receipt with the invoice PDF on top (fee_receipt template).
         // Railway WA_INVOICE_DOCS=on turns it on. Only for a fresh invoice, so a
         // replayed webhook never sends a second receipt. Never blocks the webhook.
+        // Goes to every number of the student (both parents get the fee link and
+        // reminders, so both see it is paid) plus the number that paid, once each.
         try {
           const docsOn = String(process.env.WA_INVOICE_DOCS || '').trim().toLowerCase() === 'on';
-          const toPhone = payerPhone || student?.phone || payment.contact || null;
-          if (docsOn && invoice && invoice.invoiceId && toPhone) {
+          const toPhones = [];
+          for (const raw of [payerPhone, student?.phone].concat(Array.isArray(student?.extra_phones) ? student.extra_phones : [])) {
+            const n = whatsapp.normalizePhone(raw);
+            if (n && !toPhones.includes(n)) toPhones.push(n);
+          }
+          if (!toPhones.length && whatsapp.normalizePhone(payment.contact)) toPhones.push(whatsapp.normalizePhone(payment.contact));
+          if (docsOn && invoice && invoice.invoiceId && toPhones.length) {
             const { data: invRow } = await supabase.from('invoices').select('pdf_path').eq('id', invoice.invoiceId).maybeSingle();
             const doc = await invoiceDocLink(supabase, invRow);
             if (doc) {
               const amt = symbol + Number(amountMajor).toLocaleString(isINR ? 'en-IN' : 'en-US', { maximumFractionDigits: 2 });
               const what = classes ? (classes === 1 ? '1 class' : `${classes} classes`) : 'your classes';
               const first = String(studentName || '').trim().split(/\s+/)[0] || 'there';
-              const r = await whatsapp.sendTemplate(toPhone, 'fee_receipt', [first, amt, what], { document: doc, invoiceId: invoice.invoiceId });
-              if (!r.ok) {
-                await supabase.from('notifications').insert({ type: 'warning', message: `⚠️ WhatsApp receipt to ${studentName} (${feeId}) failed: ${r.error}. The invoice email still went.`, read: false });
+              for (const toPhone of toPhones) {
+                const r = await whatsapp.sendTemplate(toPhone, 'fee_receipt', [first, amt, what], { document: doc, invoiceId: invoice.invoiceId });
+                if (!r.ok) {
+                  await supabase.from('notifications').insert({ type: 'warning', message: `⚠️ WhatsApp receipt to ${studentName} on +${toPhone} (${feeId}) failed: ${r.error}. The invoice email still went.`, read: false });
+                }
               }
             }
           }
