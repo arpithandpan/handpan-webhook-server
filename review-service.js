@@ -77,7 +77,23 @@ async function gather(days) {
     fixed_by_itself: fixes.length, errors_seen: errors.reduce((a, e) => a + (e.count || 0), 0)
   };
   const agentSet = await getJson('agent', {});
-  return { asks, errors, fixes, week, notes: String(agentSet.notes || '') };
+  return { asks, errors, fixes, week, prev_week: await prevWeek(days), notes: String(agentSet.notes || '') };
+}
+
+// The same numbers for the window just before, so the dashboard can show ↑ / ↓ next to each.
+// Only counts, nothing goes to Claude from here.
+async function prevWeek(days) {
+  try {
+    const a = since(days * 2), b = since(days);
+    const [cls, trials, studs, drafts] = await Promise.all([
+      rows('class_log', x => x.select('id').gte('class_date', a.slice(0, 10)).lt('class_date', b.slice(0, 10))),
+      rows('trials', x => x.select('id').gte('created_at', a).lt('created_at', b)),
+      rows('students', x => x.select('id').gte('join_date', a.slice(0, 10)).lt('join_date', b.slice(0, 10))),
+      rows('wa_drafts', x => x.select('id, needs_arpit').gte('created_at', a).lt('created_at', b))
+    ]);
+    const fixes = (await getJson('health_fixes', [])).filter(f => f.at >= a && f.at < b);
+    return { classes: cls.length, trials_booked: trials.length, new_students: studs.length, agent_drafts: drafts.length, agent_passed_to_you: drafts.filter(d => d.needs_arpit).length, fixed_by_itself: fixes.length };
+  } catch (e) { return null; }
 }
 
 // ── 2. ASK CLAUDE ──
@@ -144,7 +160,7 @@ async function run(opts = {}) {
     const { out, cost_usd } = await askClaude(data);
     const report = {
       at: new Date().toISOString(), days: opts.days || 7, manual: !!opts.manual, cost_usd,
-      week: data.week, summary: out.summary || '',
+      week: data.week, prev_week: data.prev_week || null, summary: out.summary || '',
       new_questions: (out.new_questions || []).slice(0, 8),
       teach_agent: (out.teach_agent || []).slice(0, 5).map((f, i) => ({ id: 'f' + Date.now().toString(36) + i, ...f, state: 'new' })),
       errors: (out.errors || []).slice(0, 8),
