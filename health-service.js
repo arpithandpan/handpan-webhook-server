@@ -24,6 +24,9 @@ const VERSION = 'health-7';
 const SERVICE_EVERY = 5 * 60 * 1000;
 const DATA_EVERY = 30 * 60 * 1000;
 const REALERT_MS = 6 * 3600 * 1000;
+const SVC_DOWN_AFTER = 3;            // failed service checks in a row before it counts as down
+const QUIET_AFTER_FIX_MS = 6 * 3600 * 1000;   // the same problem coming back within this time does not alert again
+const svcFails = {};
 const DIGEST_HHMM = '08:30';
 
 let supabase = null, deps = {};
@@ -193,7 +196,9 @@ async function checkServices() {
     const k = process.env.RAZORPAY_KEY_ID, s = process.env.RAZORPAY_KEY_SECRET;
     if (!k || !s) return setService('rzp', 'Payments (Razorpay)', 'warn', 'Not set up on the server');
     try {
-      const r = await timed(fetch('https://api.razorpay.com/v1/payments?count=1', { headers: { Authorization: 'Basic ' + Buffer.from(k + ':' + s).toString('base64') } }));
+      // Razorpay's API is sometimes slow from Railway. Give it 20 s and one retry before calling it a failure.
+      const hit = () => timed(fetch('https://api.razorpay.com/v1/payments?count=1', { headers: { Authorization: 'Basic ' + Buffer.from(k + ':' + s).toString('base64') } }), 20000);
+      let r; try { r = await hit(); } catch (e1) { await new Promise(res => setTimeout(res, 3000)); r = await hit(); }
       if (!r.ok) throw new Error('HTTP ' + r.status);
       setService('rzp', 'Payments (Razorpay)', 'ok', 'Connected');
     } catch (e) { setService('rzp', 'Payments (Razorpay)', 'bad', 'Razorpay is not answering: ' + e.message); }
@@ -224,9 +229,14 @@ async function checkServices() {
   })());
   await Promise.allSettled(checks);
 
+  // A single failed check is usually a network blip between Railway and the service. A service only
+  // counts as down after 3 failed checks in a row (about 15 minutes); before that it shows as a
+  // quiet warning on System health and sends nothing.
   for (const s of Object.values(state.services)) {
     const key = 'svc:' + s.key;
-    if (s.status === 'bad') setIssue(key, 'bad', s.label + ' is down', s.detail, null, 'service', s.label);
+    svcFails[s.key] = s.status === 'bad' ? (svcFails[s.key] || 0) + 1 : 0;
+    if (s.status === 'bad' && svcFails[s.key] >= SVC_DOWN_AFTER) setIssue(key, 'bad', s.label + ' is down', s.detail + ' (' + svcFails[s.key] + ' checks in a row)', null, 'service', s.label);
+    else if (s.status === 'bad') setIssue(key, 'warn', s.label + ' is slow to answer', s.detail + '. Checking again in 5 minutes.', null, 'service', s.label);
     else delete state.issues[key];
   }
 
@@ -521,6 +531,8 @@ async function alertTransitions() {
     if (i.level !== 'bad') continue;
     if (snoozed[i.key] && new Date(snoozed[i.key]).getTime() > now) continue;
     const memo = alertMemo[i.key];
+    // Back again soon after it was fixed: reopen quietly, no new alert (stops a stream when something flaps).
+    if (memo && memo.clearedAt && now - memo.clearedAt < QUIET_AFTER_FIX_MS) { delete memo.clearedAt; memo.quiet = true; changed = true; continue; }
     if (!memo || now - memo.sentAt > REALERT_MS) {
       await notifyRow('warning', '🔴 ' + i.title + '. ' + i.detail);
       alertMemo[i.key] = { level: i.level, sentAt: now, title: i.title, name: i.name };
@@ -528,11 +540,14 @@ async function alertTransitions() {
     }
   }
   for (const key of Object.keys(alertMemo)) {
+    const m = alertMemo[key];
     if (!state.issues[key] || state.issues[key].level !== 'bad') {
-      const m = alertMemo[key];
-      delete alertMemo[key]; changed = true;
-      const body = m.name ? '✅ ' + m.name + ' is working again.' : '✅ Sorted: ' + (m.title || 'an earlier problem') + '.';
-      if (deps.push) deps.push.send('alert', { title: 'Studio', body, tag: 'health-' + key, url: '/pages/dashboard#sec=health' });
+      if (!m.clearedAt) {
+        m.clearedAt = now; changed = true;
+        if (m.quiet) continue;   // it already flapped once: no second "working again" ping
+        const body = m.name ? '✅ ' + m.name + ' is working again.' : '✅ Sorted: ' + (m.title || 'an earlier problem') + '.';
+        if (deps.push) deps.push.send('alert', { title: 'Studio', body, tag: 'health-' + key, url: '/pages/dashboard#sec=health' });
+      } else if (now - m.clearedAt > QUIET_AFTER_FIX_MS) { delete alertMemo[key]; changed = true; }
     }
   }
   if (changed) await saveJson('health_alerts', alertMemo);
