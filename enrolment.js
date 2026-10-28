@@ -608,6 +608,22 @@ async function declineHandler(req, res) {
 // until Arpit taps "Send weekly link". Needs trials.attended_at + trials.followup
 // (enrol2.sql); without them this quietly does nothing.
 const FOLLOWUP_MIN = 10, FOLLOWUP_WINDOW = 24 * HOUR;
+// After a trial the weekly classes link goes out by itself, 3 h after Zoom says it ended,
+// never at night in their time (9 PM to 9 AM waits for 10 AM). Arpit can stop it from Today
+// ("Don't send") or send it straight away. AUTO_TRIAL_INVITE=off switches the auto part off.
+const AUTO_DELAY = 3 * HOUR, AUTO_MAX_AGE = 3 * DAY;
+// Only trials from the day this went live: older follow-ups Arpit left alone stay manual.
+const AUTO_FROM = Date.parse('2026-10-28T12:00:00Z');
+function autoOn() { return templateOn() && !!whatsapp && String(process.env.AUTO_TRIAL_INVITE || 'on').trim().toLowerCase() !== 'off'; }
+function autoSendAt(t) {
+  const tz = t.tz && validTz(t.tz) ? t.tz : IST;
+  const at = new Date(t.attended_at).getTime() + AUTO_DELAY;
+  const p = partsIn(at, tz), h = Number(p.hhmm.slice(0, 2));
+  if (h >= 21) return zonedToUtc(addDays(p.ymd, 1), '10:00', tz);
+  if (h < 9) return zonedToUtc(p.ymd, '10:00', tz);
+  return at;
+}
+function sendAtText(ms) { return nice(ms, IST).replace(/^\w+ \d+ \w+, /, '') + ' IST'; }
 async function onTrialAttended(meetingId, minutes) {
   try {
     if (!meetingId || Number(minutes) < FOLLOWUP_MIN) return;
@@ -617,15 +633,22 @@ async function onTrialAttended(meetingId, minutes) {
     if (open && open.length) return;
     const { error: e2 } = await supabase.from('trials').update({ followup: 'due', attended_at: new Date().toISOString() }).eq('id', t.id).is('followup', null);
     if (e2) { console.error('trial follow-up:', e2.message); return; }
-    pushArpit(firstName(t.full_name) + "'s trial is done", 'Stayed ' + Math.round(minutes) + ' min. Send the weekly classes link?', 'trialdone-' + t.id);
+    if (autoOn()) {
+      const { data: full } = await supabase.from('trials').select('tz, attended_at').eq('id', t.id).maybeSingle();
+      const at = autoSendAt(full || { attended_at: new Date().toISOString() });
+      const day = partsIn(at, IST).ymd === partsIn(Date.now(), IST).ymd ? '' : ' tomorrow';
+      pushArpit(firstName(t.full_name) + "'s trial is done", 'Stayed ' + Math.round(minutes) + ' min. The weekly classes link goes to ' + firstName(t.full_name) + ' by itself at ' + sendAtText(at) + day + '. Open Today to stop it.', 'trialdone-' + t.id);
+    } else pushArpit(firstName(t.full_name) + "'s trial is done", 'Stayed ' + Math.round(minutes) + ' min. Send the weekly classes link?', 'trialdone-' + t.id);
   } catch (e) { console.error('trial follow-up failed:', e.message); }
 }
 async function followups() {
   try {
     const since = new Date(Date.now() - FOLLOWUP_WINDOW).toISOString();
-    const { data, error } = await supabase.from('trials').select('id, full_name, has_handpan, attended_min, attended_at, start_at').eq('followup', 'due').gte('attended_at', since).order('attended_at', { ascending: true });
+    const { data, error } = await supabase.from('trials').select('id, full_name, has_handpan, attended_min, attended_at, start_at, tz').eq('followup', 'due').gte('attended_at', since).order('attended_at', { ascending: true });
     if (error) return [];
-    return (data || []).map(t => ({ trialId: t.id, name: t.full_name, minutes: t.attended_min, hasHandpan: t.has_handpan || null, at: t.attended_at, startAt: t.start_at }));
+    const auto = autoOn();
+    return (data || []).map(t => ({ trialId: t.id, name: t.full_name, minutes: t.attended_min, hasHandpan: t.has_handpan || null, at: t.attended_at, startAt: t.start_at,
+      sendAt: auto && t.attended_at ? new Date(autoSendAt(t)).toISOString() : null }));
   } catch (e) { return []; }
 }
 async function dismissFollowupHandler(req, res) {
@@ -686,7 +709,34 @@ async function expire(row, why) {
   }
   return why;
 }
+// Sends the weekly classes link for trials whose time has come. One row at a time is
+// claimed (due → sending) so two runs can never send twice.
+async function autoInvites() {
+  if (!autoOn()) return;
+  const since = new Date(Math.max(Date.now() - AUTO_MAX_AGE, AUTO_FROM)).toISOString();
+  const { data, error } = await supabase.from('trials').select('id, full_name, tz, attended_at, status, student_id').eq('followup', 'due').gte('attended_at', since);
+  if (error) { if (!/does not exist/i.test(error.message)) console.error('auto invite:', error.message); return; }
+  for (const t of (data || [])) {
+    try {
+      if (t.student_id || ['converted', 'dropped', 'cancelled'].includes(t.status)) continue;
+      if (Date.now() < autoSendAt(t)) continue;
+      const { data: got } = await supabase.from('trials').update({ followup: 'sending' }).eq('id', t.id).eq('followup', 'due').select('id');
+      if (!got || !got.length) continue;
+      let r = null, err = '';
+      try { r = await invite({ trialId: t.id, send: true }); } catch (e) { err = e.message; }
+      if (r && r.whatsapp === 'sent') {
+        await notify('info', '📨 The weekly classes link went to ' + t.full_name + ' on WhatsApp by itself, 3 hours after the trial.');
+      } else {
+        err = err || (r && r.whatsapp) || 'not sent';
+        await supabase.from('trials').update({ followup: 'failed' }).eq('id', t.id);
+        await notify('warning', '⚠️ Could not send the weekly classes link to ' + t.full_name + ' (' + err + '). Send it from Students → Trials or your own WhatsApp.');
+        pushArpit('Weekly link not sent to ' + firstName(t.full_name), String(err).slice(0, 120), 'trialauto-' + t.id);
+      }
+    } catch (e) { console.error('auto invite ' + t.id + ':', e.message); }
+  }
+}
 async function tick() {
+  await autoInvites().catch(e => console.error('auto invites:', e.message));
   const { data, error } = await supabase.from('enrol_requests').select('*').in('status', HOLD);
   if (error) { if (!/does not exist/i.test(error.message)) console.error('enrol worker:', error.message); return; }
   const now = Date.now();
@@ -728,7 +778,7 @@ async function tick() {
 let _timer = null, _busy = false;
 function startWorker() {
   if (_timer) return;
-  console.log('Enrolment: worker on (every 10 min), WhatsApp invite template ' + (templateOn() ? 'on' : 'off'));
+  console.log('Enrolment: worker on (every 10 min), WhatsApp invite template ' + (templateOn() ? 'on' : 'off') + ', auto invite after trials ' + (autoOn() ? 'on' : 'off'));
   const run = async () => { if (_busy) return; _busy = true; try { await tick(); } catch (e) { console.error('enrol tick:', e.message); } finally { _busy = false; } };
   setTimeout(run, 90 * 1000);
   _timer = setInterval(run, 10 * MIN);
@@ -736,5 +786,5 @@ function startWorker() {
 
 module.exports = {
   init, startWorker, getHandler, requestHandler, startHandler, onTrialAttended, dismissFollowupHandler, acceptHandler, planHandler, releaseHandler, inviteHandler, listHandler, approveHandler, offerHandler, declineHandler, onFeePaid, invite, weeklySlots,
-  _test: { priceFor, plansFor, slotFrom, nextOccurrence, partsIn, tick }
+  _test: { priceFor, plansFor, slotFrom, nextOccurrence, partsIn, tick, autoSendAt, autoInvites }
 };
