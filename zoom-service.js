@@ -270,7 +270,7 @@ function liveEntry(o) {
   const id = String(o.id || '');
   let m = LIVE.get(id);
   if (!m || (o.uuid && m.uuid && m.uuid !== o.uuid && m.endedAt)) {
-    m = { meetingId: id, uuid: o.uuid || null, topic: o.topic || '', startedAt: null, endedAt: null, hostIn: false, people: new Map(), bothSince: null };
+    m = { meetingId: id, uuid: o.uuid || null, topic: o.topic || '', startedAt: null, endedAt: null, hostIn: false, people: new Map(), bothSince: null, emptySince: null };
     LIVE.set(id, m);
   }
   if (o.uuid) m.uuid = o.uuid;
@@ -280,6 +280,10 @@ function liveEntry(o) {
 function liveRecalc(m, at) {
   const both = m.hostIn && [...m.people.values()].some(p => p.n > 0);
   if (both && !m.bothSince) m.bothSince = at;
+  // Once a class has really happened, note the moment the room empties (or only one side is left).
+  // The dashboard treats a room that stays like that as "class done", even if Zoom's "ended" never comes.
+  if (both) m.emptySince = null;
+  else if (m.bothSince && !m.emptySince) m.emptySince = at;
 }
 function liveEvent(body) {
   const ev = body.event || '';
@@ -288,7 +292,7 @@ function liveEvent(body) {
   if (!o.id) return;
   const now = new Date(body.event_ts || Date.now()).toISOString();
   const m = liveEntry(o);
-  if (ev === 'meeting.started') { m.startedAt = o.start_time || now; m.endedAt = null; return; }
+  if (ev === 'meeting.started') { m.startedAt = o.start_time || now; m.endedAt = null; m.emptySince = null; return; }
   if (ev === 'meeting.ended') { m.endedAt = o.end_time || now; m.hostIn = false; m.people.clear(); return; }
   const pt = o.participant || {};
   // Waiting in the lobby because the host has not started the meeting yet.
@@ -302,12 +306,15 @@ function liveEvent(body) {
     m.endedAt = null;
     return;
   }
+  // Zoom often sends the "left" events a few seconds after "meeting ended". Those must not reopen
+  // the meeting (that kept a finished class showing as running). Only a real join reopens it.
+  if (m.endedAt && ev !== 'meeting.participant_joined') return;
   if (!m.startedAt) m.startedAt = now;
   m.endedAt = null;
   const at = (ev === 'meeting.participant_joined' ? pt.join_time : pt.leave_time) || now;
   if (isHostish(pt, o.host_id)) {
     m.hostIn = ev === 'meeting.participant_joined';
-    if (m.hostIn) liveRecalc(m, at);
+    liveRecalc(m, at);
     return;
   }
   // One person can join on two devices or rejoin, so key by name/email, and
@@ -323,6 +330,7 @@ function liveEvent(body) {
   } else {
     cur.n -= 1;
     if (cur.n <= 0) m.people.delete(key); else m.people.set(key, cur);
+    liveRecalc(m, at);
   }
 }
 function liveList() {
@@ -333,7 +341,7 @@ function liveList() {
     if (!m.endedAt && m.startedAt && Date.now() - new Date(m.startedAt).getTime() > 6 * 3600e3) { LIVE.delete(id); continue; }
     out.push({
       meetingId: m.meetingId, topic: m.topic, startedAt: m.startedAt, endedAt: m.endedAt,
-      hostIn: m.hostIn, bothSince: m.bothSince,
+      hostIn: m.hostIn, bothSince: m.bothSince, emptySince: m.emptySince,
       people: [...m.people.values()].map(p => ({ name: p.name, since: p.since, lobby: !!p.lobby }))
     });
   }
