@@ -1325,9 +1325,20 @@ app.post('/api/create-fee-order', express.json(), async (req, res) => {
 // "which month works for you" prompt. Always source: 'Website' here — the
 // dashboard's manual-entry form writes to Supabase directly like every
 // other section does, it doesn't go through this endpoint.
-app.post('/api/waitlist', express.json(), async (req, res) => {
+// Website enquiries: performance bookings and the contact form (enquiries.js)
+const enquiries = require('./enquiries');
+enquiries.init(supabase);
+app.post('/api/enquiry', express.json({ limit: '16kb' }), enquiries.handler);
+
+// Waitlist: light spam guard (honeypot + 8 per 10 min per IP)
+const _wlHits = new Map();
+app.post('/api/waitlist', express.json({ limit: '8kb' }), async (req, res) => {
   try {
-    const { name, phone, email, preferredMonth } = req.body || {};
+    const { name, phone, email, preferredMonth, website } = req.body || {};
+    if (website) return res.json({ id: 'WL-000' });
+    const _ip = String(req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim();
+    const _now = Date.now(), _list = (_wlHits.get(_ip) || []).filter(t => _now - t < 600000); _list.push(_now); _wlHits.set(_ip, _list);
+    if (_list.length > 8) return res.status(429).json({ error: 'Too many tries. Please wait a few minutes.' });
 
     if (!name || !phone) {
       return res.status(400).json({ error: 'Missing required fields' });

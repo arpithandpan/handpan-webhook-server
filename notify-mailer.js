@@ -54,6 +54,7 @@ function channelFor(n) {
     || /joined only \d+ min/i.test(msg)
     || /Upcoming class/i.test(msg)
     || /New trial booked/i.test(msg)
+    || /New (performance enquiry|message) from/i.test(msg)   // website enquiries (enquiries.js)
     || /logged from Zoom|Booked trial attended|Trial from Zoom/i.test(msg)   // 27 Oct: attendance after each class
     || /via My (classes|bookings):/i.test(msg)
     || /expired|didn.t pay|didn.t answer/i.test(msg);   // a held weekly time was released
