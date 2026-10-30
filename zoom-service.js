@@ -554,27 +554,48 @@ async function renewalCheck() {
   return { done: out };
 }
 
-// Log one class. Skips if the student already has any class on that date.
-// First class of a brand new student (nothing paid, nothing logged) is a free trial.
-async function logClass({ student, classDate, minutes, meetingUuid, how }) {
-  const { data: sameDay } = await supabase.from('class_log').select('id')
-    .eq('student_id', student.id).eq('class_date', classDate).limit(1);
-  if (sameDay && sameDay.length) return { skipped: 'already_logged' };
+// Log one class.
+// v257: a class is FREE only when we know it was a trial: the meeting belongs to
+// a trial booked on the website, or its topic says "trial". There is no more
+// guessing from "nothing paid and nothing logged yet", which marked a new
+// student's first real class as a trial (Godwyn, 28 Oct). The trial a student
+// took before they joined is added to their history by syncTrialHistory().
+// Same-day rule: a paid class is skipped only when that day already has a PAID
+// class, so a trial row on the same date never hides the first real class.
+// A free class is skipped when that day has anything at all.
+async function insertLog(row) {
+  let { error } = await supabase.from('class_log').insert(row);
+  // trial_id needs class_log_trial.sql. Without it, log the class anyway.
+  if (error && row.trial_id !== undefined && /trial_id/.test(error.message || '')) {
+    const r2 = Object.assign({}, row); delete r2.trial_id;
+    ({ error } = await supabase.from('class_log').insert(r2));
+  }
+  return { error };
+}
+async function markTrialInHistory(trialId) {
+  if (!trialId) return;
+  try { await supabase.from('trials').update({ history_logged_at: new Date().toISOString() }).eq('id', trialId); } catch (e) {}
+}
+async function logClass({ student, classDate, minutes, meetingUuid, how, trial }) {
+  const isFree = !!trial;
+  const { data: sameDay } = await supabase.from('class_log').select('id, is_free')
+    .eq('student_id', student.id).eq('class_date', classDate);
+  const clash = (sameDay || []).filter(r => isFree || !r.is_free);
+  if (clash.length) return { skipped: 'already_logged' };
 
   const paid = await paidClasses(student.id);
   const { data: logs } = await supabase.from('class_log').select('id, is_free').eq('student_id', student.id);
   const allLogs = logs || [];
-  const isFree = paid === 0 && allLogs.length === 0;
   const note = (isFree ? 'Free trial · ' : '') + 'Auto from Zoom · ' + minutes + ' min';
 
-  const { error } = await supabase.from('class_log').insert({
-    student_id: student.id, class_date: classDate, note, is_free: isFree,
-    source: 'zoom', zoom_meeting_uuid: meetingUuid || null
-  });
+  const row = { student_id: student.id, class_date: classDate, note, is_free: isFree, source: 'zoom', zoom_meeting_uuid: meetingUuid || null };
+  if (isFree && trial && trial.id) row.trial_id = String(trial.id);
+  const { error } = await insertLog(row);
   if (error) {
     if (error.code === '23505') return { skipped: 'already_logged' };
     throw new Error('class_log insert failed for ' + student.id + ': ' + error.message);
   }
+  if (isFree && trial && trial.id) await markTrialInHistory(trial.id);
 
   const name = student.full_name || student.id;
   if (isFree) {
@@ -664,8 +685,18 @@ async function processMeeting(m) {
     const plan = planMeeting(people, students, m.topic);
     const logged = [];
 
+    // Is this a trial? A trial booked on the website (its Zoom meeting), or a "trial" topic.
+    let bookedTrial = null;
+    if (m.meeting_id) {
+      try {
+        const { data: bt } = await supabase.from('trials').select('id, student_id').eq('zoom_meeting_id', String(m.meeting_id)).maybeSingle();
+        bookedTrial = bt || null;
+      } catch (e) {}
+    }
+    const trialOf = st => bookedTrial ? { id: bookedTrial.id } : (plan.isTrial ? { id: null } : null);
+
     for (const x of plan.toLog) {
-      const r = await logClass({ student: x.student, classDate, minutes: x.minutes, meetingUuid: m.uuid, how: x.how });
+      const r = await logClass({ student: x.student, classDate, minutes: x.minutes, meetingUuid: m.uuid, how: x.how, trial: trialOf(x.student) });
       logged.push({ student: x.student.id, minutes: x.minutes, how: x.how, ...r });
     }
     for (const l of plan.learn) await learnNames(l.student.id, l.names, l.email);
@@ -741,6 +772,67 @@ async function processMeeting(m) {
   }
 }
 
+// ── 5b. TRIAL → HISTORY ──
+// When a trial person becomes a student (converted in the dashboard, or paid
+// through the weekly-classes link), their trial shows as the first row of their
+// class history: "Free trial" on the trial date. It never counts as a paid
+// class, and the next class is "Class 1".
+// One pass every 10 minutes, so it catches conversions made anywhere. Each
+// trial is handled once (trials.history_logged_at), so a row Arpit deletes is
+// never put back. Needs class_log_trial.sql; without it this quietly does nothing.
+// Rules:
+//   • only trials that happened: not cancelled, not a no-show, date not in the future
+//   • a free row already on the trial date (±1 day, time zones) → that row is the
+//     trial, it just gets linked
+//   • older free rows that came from the old guess ("Free trial · Auto from Zoom"
+//     on a later date) are NOT changed. Arpit gets one note to check them.
+let _trialSyncWarned = false;
+function addDaysYmd(ymd, n) { const d = new Date(ymd + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); }
+async function syncTrialHistory() {
+  if (!supabase) return { ran: false };
+  const out = { added: 0, linked: 0, skipped: 0 };
+  try {
+    const { data: trs, error } = await supabase.from('trials')
+      .select('id, full_name, student_id, status, trial_date, start_at, history_logged_at')
+      .not('student_id', 'is', null).is('history_logged_at', null).limit(50);
+    if (error) {
+      if (!_trialSyncWarned) { console.log('Trial history sync off (run class_log_trial.sql):', error.message); _trialSyncWarned = true; }
+      return { ran: false, error: error.message };
+    }
+    const today = istDate();
+    for (const t of trs || []) {
+      const day = t.trial_date ? String(t.trial_date).slice(0, 10) : (t.start_at ? istDate(t.start_at) : null);
+      const happened = day && day <= today && !['cancelled', 'no_show'].includes(String(t.status || ''));
+      if (!happened) {
+        // Never happened (or no date): nothing to add. Mark it so it is not checked again,
+        // unless it is a future booking that may still happen.
+        if (!(day && day > today && t.status === 'booked')) { await markTrialInHistory(t.id); out.skipped++; }
+        continue;
+      }
+      const { data: logs } = await supabase.from('class_log').select('id, class_date, is_free, note, trial_id').eq('student_id', t.student_id);
+      const rows = logs || [];
+      if (rows.some(r => r.trial_id && String(r.trial_id) === String(t.id))) { await markTrialInHistory(t.id); continue; }
+      const near = rows.find(r => r.is_free && !r.trial_id && r.class_date >= addDaysYmd(day, -1) && r.class_date <= addDaysYmd(day, 1));
+      if (near) {
+        await supabase.from('class_log').update({ trial_id: String(t.id) }).eq('id', near.id);
+        out.linked++;
+      } else {
+        const { error: insErr } = await insertLog({ student_id: t.student_id, class_date: day, note: 'Free trial', is_free: true, source: 'trial', trial_id: String(t.id) });
+        if (insErr && insErr.code !== '23505') { console.error('trial history insert failed:', t.id, insErr.message); continue; }
+        out.added++;
+      }
+      await markTrialInHistory(t.id);
+      // Rows from the old guess: a later class marked "Free trial · Auto from Zoom".
+      const guessed = rows.filter(r => r.is_free && r.class_date > addDaysYmd(day, 1) && /^Free trial · Auto from Zoom/.test(String(r.note || '')));
+      if (guessed.length) {
+        await notify('warning', `🔎 ${t.full_name || t.student_id}: the class on ${guessed.map(r => prettyDate(r.class_date)).join(', ')} was logged as a free trial, but their trial was on ${prettyDate(day)}. If it was a regular class, open their Classes and choose "Count as paid class".`);
+      }
+    }
+    if (out.added || out.linked) console.log('Trial history: added', out.added, 'linked', out.linked);
+  } catch (e) { console.error('trial history sync failed:', e.message); }
+  return { ran: true, ...out };
+}
+
 // ── 6. WORKER ──
 let _running = false, _lastRun = null, _lastError = null;
 async function processPending() {
@@ -776,6 +868,8 @@ function startWorker() {
   setInterval(() => syncMeetings().catch(e => console.error('zoom sync error:', e.message)), SYNC_EVERY_MS);
   console.log('Renewal check: ' + (autoFeeRequestsOn() ? 'ON (every hour)' : 'off (AUTO_FEE_REQUESTS not on)'));
   setTimeout(() => renewalCheck(), 3 * 60 * 1000);
+  setTimeout(() => syncTrialHistory(), 2 * 60 * 1000);
+  setInterval(() => syncTrialHistory(), 10 * 60 * 1000);
   setInterval(() => renewalCheck(), 60 * 60 * 1000);
 }
 
@@ -956,7 +1050,7 @@ async function resolveUnmatched(id, studentId) {
 
   const results = [];
   for (const it of items) {
-    const r = await logClass({ student, classDate: it.class_date, minutes: it.minutes, meetingUuid: it.meeting_uuid, how: 'picked in dashboard' });
+    const r = await logClass({ student, classDate: it.class_date, minutes: it.minutes, meetingUuid: it.meeting_uuid, how: 'picked in dashboard', trial: isTrialTopic(it.topic) ? { id: null } : null });
     await supabase.from('zoom_unmatched').update({ status: 'resolved', student_id: student.id, resolved_at: new Date().toISOString() }).eq('id', it.id);
     results.push({ id: it.id, classDate: it.class_date, ...r });
   }
@@ -964,6 +1058,6 @@ async function resolveUnmatched(id, studentId) {
 }
 
 module.exports = {
-  init, setTrialHook, zoomApi, webhookHandler, liveHandler, startWorker, renewalCheck, processPending, resolveUnmatched, status, syncMeetings,
-  _test: { liveEvent, liveList, LIVE, processMeeting, cleanParticipants, planMeeting, buildIndex, matchPerson, studentsInTopic, isTrialTopic, encodeUuid, istDate, normName, hmac, MIN_MINUTES, TRIAL_MIN_MINUTES }
+  init, setTrialHook, zoomApi, webhookHandler, syncTrialHistory, liveHandler, startWorker, renewalCheck, processPending, resolveUnmatched, status, syncMeetings,
+  _test: { logClass, liveEvent, liveList, LIVE, processMeeting, cleanParticipants, planMeeting, buildIndex, matchPerson, studentsInTopic, isTrialTopic, encodeUuid, istDate, normName, hmac, MIN_MINUTES, TRIAL_MIN_MINUTES }
 };
