@@ -788,10 +788,49 @@ async function processMeeting(m) {
 //     on a later date) are NOT changed. Arpit gets one note to check them.
 let _trialSyncWarned = false;
 function addDaysYmd(ymd, n) { const d = new Date(ymd + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); }
+// v258: a trial person who was added as a student by hand ("Add Student", not
+// "Convert") is not linked to their trial. Link them when it is certain:
+//   • the trial happened (not cancelled / no-show, date not in the future)
+//   • its phone (last 10 digits) or email matches EXACTLY ONE active student
+//   • that student joined no more than 7 days before the trial (so an existing
+//     student who booked a trial for a friend with their own number is never linked)
+// Arpit gets a note for every link, so a wrong one is easy to spot and undo.
+const digits10 = v => String(v || '').replace(/\D/g, '').slice(-10);
+async function linkTrialsByContact() {
+  const { data: open, error } = await supabase.from('trials')
+    .select('id, full_name, phone, phone_dial, email, contact, status, trial_date, start_at')
+    .is('student_id', null).limit(200);
+  if (error || !open || !open.length) return 0;
+  const { data: studs } = await supabase.from('students').select('id, full_name, phone, email, extra_phones, archived, join_date, created_at');
+  const live = (studs || []).filter(s => !s.archived);
+  const today = istDate();
+  let n = 0;
+  for (const t of open) {
+    const day = t.trial_date ? String(t.trial_date).slice(0, 10) : (t.start_at ? istDate(t.start_at) : null);
+    if (!day || day > today || ['cancelled', 'no_show'].includes(String(t.status || ''))) continue;
+    const ph = digits10(t.phone || (/@/.test(t.contact || '') ? '' : t.contact));
+    const em = normEmail(t.email || (/@/.test(t.contact || '') ? t.contact : ''));
+    if ((!ph || ph.length < 8) && !em) continue;
+    const hits = live.filter(s => {
+      const phones = [s.phone].concat(Array.isArray(s.extra_phones) ? s.extra_phones : []).map(digits10).filter(x => x.length >= 8);
+      return (ph && ph.length >= 8 && phones.includes(ph)) || (em && normEmail(s.email) === em);
+    });
+    if (hits.length !== 1) continue;
+    const s = hits[0];
+    const joined = String(s.join_date || s.created_at || '').slice(0, 10);
+    if (joined && joined < addDaysYmd(day, -7)) continue;
+    const { error: upErr } = await supabase.from('trials').update({ student_id: s.id, converted_at: new Date().toISOString() }).eq('id', t.id).is('student_id', null);
+    if (upErr) { console.error('trial link failed:', t.id, upErr.message); continue; }
+    n++;
+    await notify('info', `🔗 Linked ${t.full_name || 'a trial'}'s trial (${prettyDate(day)}) to student ${s.full_name || s.id}, same ${ph && ph.length >= 8 ? 'phone' : 'email'}. It now shows in their class history. If this is wrong, edit the trial in Students → Trials.`);
+  }
+  return n;
+}
 async function syncTrialHistory() {
   if (!supabase) return { ran: false };
-  const out = { added: 0, linked: 0, skipped: 0 };
+  const out = { added: 0, linked: 0, skipped: 0, matched: 0 };
   try {
+    try { out.matched = await linkTrialsByContact(); } catch (e) { console.error('trial contact link failed:', e.message); }
     const { data: trs, error } = await supabase.from('trials')
       .select('id, full_name, student_id, status, trial_date, start_at, history_logged_at')
       .not('student_id', 'is', null).is('history_logged_at', null).limit(50);
