@@ -66,6 +66,26 @@ function cleanPrefs(p) {
 function istMinutes(d) { return require('./studio-time').parts(d.getTime()).minutes; }
 function inQuiet(now) { const m = istMinutes(now); return m >= QUIET_FROM || m < QUIET_TO; }
 
+// ── HISTORY (v266) ──
+// The last 100 connect / disconnect / failure events, in app_settings 'push_log'.
+// Shown in the dashboard under Notification settings → History, so a dropped
+// phone connection can be traced to when and after what it happened.
+let logQueue = Promise.resolve();
+function logEvent(ev) {
+  if (!supabase) return;
+  const row = Object.assign({ at: new Date().toISOString() }, ev);
+  console.log('Push history:', row.event, row.label || '', row.error || '');
+  logQueue = logQueue.then(async () => {
+    try {
+      const { data } = await supabase.from('app_settings').select('value').eq('key', 'push_log').maybeSingle();
+      const list = (data && Array.isArray(data.value)) ? data.value : [];
+      list.push(row);
+      await supabase.from('app_settings').upsert({ key: 'push_log', value: list.slice(-100) }, { onConflict: 'key' });
+    } catch (e) { console.error('push log failed:', e.message); }
+  });
+}
+const clip = (v, n) => String(v == null ? '' : v).replace(/[\u0000-\u001f]/g, ' ').slice(0, n);
+
 // ── SEND ──
 // payload: { title, body, tag, url, badge, renotify }
 async function send(kind, payload) {
@@ -92,8 +112,10 @@ async function send(kind, payload) {
           // The device unsubscribed or the app was removed.
           try { await supabase.from('push_subscriptions').delete().eq('id', s.id); } catch (err) {}
           console.log('Push: removed expired subscription', s.id);
+          logEvent({ event: 'Apple/Google said this device stopped working (' + code + '), removed', label: s.label || '' });
         } else {
           console.error('Push send failed (' + (code || e.message) + ')');
+          if (!s.fail_count) logEvent({ event: 'send failed', label: s.label || '', error: clip(code || e.message, 80) });
           supabase.from('push_subscriptions').update({ fail_count: (Number(s.fail_count) || 0) + 1 }).eq('id', s.id).then(() => {}, () => {});
         }
       }
@@ -180,6 +202,7 @@ async function subscribeHandler(req, res) {
     } else {
       const { error } = await supabase.from('push_subscriptions').insert(row);
       if (error) throw new Error(error.message);
+      logEvent({ event: 'new device connected', label: row.label || '' });
     }
     res.json({ ok: true, prefs: row.prefs });
   } catch (e) {
@@ -206,6 +229,7 @@ async function prefsHandler(req, res) {
 
 async function unsubscribeHandler(req, res) {
   try {
+    logEvent({ event: 'device removed from the app' });
     await supabase.from('push_subscriptions').delete().eq('endpoint', String(req.body?.endpoint || ''));
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -217,4 +241,19 @@ async function testHandler(req, res) {
   res.json({ ok: true, sent: n });
 }
 
-module.exports = { init, send, onWhatsApp, onDraft, onNotification, keyHandler, subscribeHandler, prefsHandler, unsubscribeHandler, testHandler, _test: { cleanPrefs, inQuiet } };
+// POST /api/push/event { event, label, ver, perm, error } → the dashboard reports what it saw on the phone
+async function eventHandler(req, res) {
+  const b = req.body || {};
+  logEvent({ event: clip(b.event, 120) || 'event', label: clip(b.label, 60), ver: clip(b.ver, 12), perm: clip(b.perm, 12), error: clip(b.error, 160) || undefined });
+  res.json({ ok: true });
+}
+// GET /api/push/log → { log, devices }
+async function logHandler(req, res) {
+  try {
+    const { data } = await supabase.from('app_settings').select('value').eq('key', 'push_log').maybeSingle();
+    const { data: subs } = await supabase.from('push_subscriptions').select('label, last_ok_at, fail_count');
+    res.json({ ok: true, log: (data && Array.isArray(data.value)) ? data.value : [], devices: (subs || []).map(x => ({ label: x.label, last_ok_at: x.last_ok_at, fail_count: x.fail_count })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+}
+
+module.exports = { init, send, eventHandler, logHandler, onWhatsApp, onDraft, onNotification, keyHandler, subscribeHandler, prefsHandler, unsubscribeHandler, testHandler, _test: { cleanPrefs, inQuiet } };
