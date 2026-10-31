@@ -1550,6 +1550,8 @@ app.post('/api/push/subscribe', requireAdmin, express.json({ limit: '16kb' }), (
 app.post('/api/push/prefs', requireAdmin, express.json({ limit: '8kb' }), (req, res) => push.prefsHandler(req, res));
 app.post('/api/push/unsubscribe', requireAdmin, express.json({ limit: '8kb' }), (req, res) => push.unsubscribeHandler(req, res));
 app.post('/api/push/test', requireAdmin, (req, res) => push.testHandler(req, res));
+app.post('/api/push/event', requireAdmin, express.json({ limit: '4kb' }), (req, res) => push.eventHandler(req, res));
+app.get('/api/push/log', requireAdmin, (req, res) => push.logHandler(req, res));
 // WhatsApp agent drafts (agent-service.js)
 app.get('/api/agent/drafts', requireAdmin, (req, res) => agent.listHandler(req, res));
 app.post('/api/agent/drafts/:id/send', requireAdmin, express.json({ limit: '32kb' }), (req, res) => agent.sendHandler(req, res));
