@@ -130,7 +130,41 @@ function packageLabel(classes, month) {
 // Returns { ok, id } or { ok:false, error }.
 // opts.document = { link, filename } puts a PDF in the template's Document
 // header (the template must have been approved with a Document header).
+// ── PICTURE VERSIONS (v266+) ──
+// A few first-contact messages have a second, approved version with a picture on top.
+// They switch on only when the Railway variable names the approved template, e.g.
+//   WA_IMG_TRIAL  = trial_confirmation_img
+//   WA_IMG_INVITE = weekly_classes_invite_img
+// Same body and buttons as the original. If Meta refuses the picture version, or it fails
+// on delivery, the original text version is sent instead, so the student always gets it.
+const IMG_VERSIONS = {
+  trial_confirmation: { env: 'WA_IMG_TRIAL', image: 'https://arpitpandey.com/images/wa/wa-trial.jpg' },
+  weekly_classes_invite: { env: 'WA_IMG_INVITE', image: 'https://arpitpandey.com/images/wa/wa-weekly.jpg' }
+};
+const imgPending = new Map();   // wa message id of a picture send → how to resend it as text
+function imgVersion(templateName, opts) {
+  const v = IMG_VERSIONS[templateName];
+  if (!v || (opts && (opts.noImage || opts.document))) return null;
+  const name = String(process.env[v.env] || '').trim();
+  return name ? { name, image: v.image } : null;
+}
+
 async function sendTemplate(toPhone, templateName, bodyParams, opts) {
+  const iv = imgVersion(templateName, opts);
+  if (iv) {
+    const r = await sendTemplateRaw(toPhone, iv.name, bodyParams, Object.assign({}, opts, { image: { link: iv.image } }));
+    if (r.ok) {
+      imgPending.set(r.id, { toPhone, templateName, bodyParams, opts, at: Date.now() });
+      for (const [k, v] of imgPending) if (Date.now() - v.at > 3600000) imgPending.delete(k);
+      return r;
+    }
+    console.error(`WA picture version ${iv.name} refused (${r.error}), sending ${templateName} instead`);
+    return sendTemplateRaw(toPhone, templateName, bodyParams, Object.assign({}, opts, { noImage: true }));
+  }
+  return sendTemplateRaw(toPhone, templateName, bodyParams, opts);
+}
+
+async function sendTemplateRaw(toPhone, templateName, bodyParams, opts) {
   if (!configured()) return { ok: false, error: 'WhatsApp prod env vars missing' };
   const to = normalizePhone(toPhone);
   if (!to) return { ok: false, error: 'No usable phone number' };
@@ -150,6 +184,10 @@ async function sendTemplate(toPhone, templateName, bodyParams, opts) {
           name: templateName,
           language: { code: TEMPLATE_LANG },
           components: [
+            ...(opts && opts.image && opts.image.link ? [{
+              type: 'header',
+              parameters: [{ type: 'image', image: { link: opts.image.link } }]
+            }] : []),
             ...(opts && opts.document && opts.document.link ? [{
               type: 'header',
               parameters: [{ type: 'document', document: { link: opts.document.link, filename: opts.document.filename || 'Invoice.pdf' } }]
@@ -270,6 +308,16 @@ async function applyStatus(st) {
     const err = next === 'failed' ? (st.errors?.[0]?.title || st.errors?.[0]?.message || 'failed') : null;
     const when = st.timestamp ? new Date(Number(st.timestamp) * 1000).toISOString() : new Date().toISOString();
     await supabase.from('wa_messages').update({ status: next, status_at: when, ...(err ? { error: err } : {}) }).eq('id', row.id);
+    // a picture version that failed on delivery: send the plain text version once
+    const pend = next === 'failed' && imgPending.get(st.id);
+    if (pend) {
+      imgPending.delete(st.id);
+      const again = await sendTemplateRaw(pend.toPhone, pend.templateName, pend.bodyParams, Object.assign({}, pend.opts, { noImage: true }));
+      await notify(again.ok ? 'info' : 'warning', again.ok
+        ? '🖼️ The picture version of ' + pend.templateName + ' failed (' + err + '), so the text version was sent instead.'
+        : '⚠️ ' + pend.templateName + ' could not be sent (' + err + ', then ' + again.error + '). Send it from your own WhatsApp.');
+    }
+    if (next === 'delivered' || next === 'read') imgPending.delete(st.id);
   } catch (e) { console.error('WA status update failed:', e.message); }
 }
 
@@ -1076,4 +1124,4 @@ function startWorker() {
   timer = setInterval(tick, TICK_MS);
 }
 
-module.exports = { init, setHooks, sendReply, reactHandler, status, startWorker, processPending, sendTemplate, normalizePhone, verifyWebhook, incomingHandler, replyHandler, replyTemplateStatus, reopenHandler, mediaHandler, sendMediaHandler, _test: { planScheduleOccurrences, zonedToUtc, tzOffsetMin } };
+module.exports = { init, setHooks, sendReply, reactHandler, status, startWorker, processPending, sendTemplate, normalizePhone, verifyWebhook, incomingHandler, replyHandler, replyTemplateStatus, reopenHandler, mediaHandler, sendMediaHandler, _test: { planScheduleOccurrences, zonedToUtc, tzOffsetMin, applyStatus } };
