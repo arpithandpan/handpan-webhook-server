@@ -40,6 +40,11 @@ const IGNORE_EMAILS = ['arpitbam@gmail.com', 'arpithandpan@gmail.com', 'ankitasi
   .concat(envList('ZOOM_IGNORE_EMAILS')).map(normEmail);
 const IGNORE_NAMES = ['Arpit Pandey', 'Arpit', 'Ankita Sinha', 'Ankita', 'iPad (4)']
   .concat(envList('ZOOM_IGNORE_NAMES')).map(normName);
+// v264: first words that mean "this is the host, not a student". Matching the first word catches
+// display-name variants like "Arpit Pandey Handpan", "Arpit | iPad", "Ankita (host)" that the exact
+// list above misses. Add more via the ZOOM_HOST_FIRST env var (comma separated).
+const HOST_FIRST = ['arpit', 'ankita']
+  .concat(envList('ZOOM_HOST_FIRST')).map(normName).filter(Boolean);
 
 let supabase = null;
 function init(client) { supabase = client; }
@@ -259,12 +264,18 @@ async function webhookHandler(req, res) {
 const LIVE = new Map();              // meeting id → state
 const LIVE_KEEP_MS = 30 * 60 * 1000; // ended meetings stay 30 min for "Class done"
 
+// v264: Zoom only marks the host reliably when Arpit joins signed into the account that owns the
+// meeting. Joining with a display name like "Arpit Pandey Handpan" or from a device means pt.id no
+// longer equals host_id and the email can be hidden, so the exact-name list missed him and the Today
+// card stayed stuck on "waiting". Match the first word of the name too, which covers every "Arpit ..."
+// / "Ankita ..." variant without matching any student.
 function isHostish(pt, hostId) {
   if (!pt) return false;
   if (hostId && pt.id && pt.id === hostId) return true;
   if (pt.email && IGNORE_EMAILS.includes(normEmail(pt.email))) return true;
   const nn = normName(pt.user_name);
-  return !!(nn && IGNORE_NAMES.includes(nn));
+  if (nn && IGNORE_NAMES.includes(nn)) return true;
+  return !!(nn && HOST_FIRST.includes(nn.split(' ')[0]));
 }
 function liveEntry(o) {
   const id = String(o.id || '');
@@ -278,7 +289,11 @@ function liveEntry(o) {
   return m;
 }
 function liveRecalc(m, at) {
-  const both = m.hostIn && [...m.people.values()].some(p => p.n > 0);
+  // v264: both sides are in when the host and a student are both inside, OR when two or more real
+  // people are inside — a safety net for the times Zoom doesn't flag Arpit as the host (he still shows
+  // up as a participant). This keeps bothSince / emptySince, and so the "class done" timing, correct.
+  const inside = [...m.people.values()].filter(p => p.n > 0).length;
+  const both = (m.hostIn && inside > 0) || inside >= 2;
   if (both && !m.bothSince) m.bothSince = at;
   // Once a class has really happened, note the moment the room empties (or only one side is left).
   // The dashboard treats a room that stays like that as "class done", even if Zoom's "ended" never comes.
