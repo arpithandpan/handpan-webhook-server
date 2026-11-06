@@ -218,27 +218,35 @@ function shell(inner) {
     '<p style="margin:28px 0 0;font-size:13px;color:#6B5150;">Arpit Pandey · Handpan artist and teacher<br><a href="https://arpitpandey.com" style="color:#500018;">arpitpandey.com</a></p></div></div>';
 }
 function mailFor(kind, student, test) {
-  const first = String(student.full_name || '').trim().split(/\s+/)[0] || 'there';
+  // Payer-aware greeting: when students.payer_name is set (a parent managing a
+  // child's classes), greet the payer and name the student with a possessive.
+  const fn = v => String(v || '').trim().split(/\s+/)[0] || '';
+  const self = fn(student.full_name) || 'there';
+  const rawPayer = String(student.payer_name || '').trim();
+  const hasPayer = !!rawPayer && fn(rawPayer) !== fn(student.full_name);
+  const first = hasPayer ? fn(rawPayer) : self;
+  const poss = hasPayer ? (self + '’s') : 'your';   // "Ananya’s" or "your"
+  const Poss = poss.charAt(0).toUpperCase() + poss.slice(1);
   const tag = test ? '[TEST for ' + (student.full_name || student.id) + '] ' : '';
   if (kind === 'new') return {
-    subject: tag + 'Your weekly handpan class · calendar invite',
-    text: 'Hi ' + first + ', your weekly handpan class is attached as a calendar invite. Add it once and it stays up to date: when a class is moved or skipped, your calendar changes by itself. To move or skip a class: https://arpitpandey.com/my',
-    html: shell('<p style="margin:0 0 14px;font-size:16px;">Hi ' + first + ',</p><p style="margin:0 0 14px;line-height:1.55;">Your weekly handpan class is attached as a calendar invite. Add it once and it stays up to date: when a class is moved or skipped, your calendar changes by itself.</p><p style="margin:0;line-height:1.55;">To move or skip a class: <a href="https://arpitpandey.com/my" style="color:#500018;">arpitpandey.com/my</a></p>')
+    subject: tag + Poss + ' weekly handpan class · calendar invite',
+    text: 'Hi ' + first + ', ' + poss + ' weekly handpan class is attached as a calendar invite. Add it once and it stays up to date: when a class is moved or skipped, the calendar changes by itself. To move or skip a class: https://arpitpandey.com/my',
+    html: shell('<p style="margin:0 0 14px;font-size:16px;">Hi ' + first + ',</p><p style="margin:0 0 14px;line-height:1.55;">' + Poss + ' weekly handpan class is attached as a calendar invite. Add it once and it stays up to date: when a class is moved or skipped, the calendar changes by itself.</p><p style="margin:0;line-height:1.55;">To move or skip a class: <a href="https://arpitpandey.com/my" style="color:#500018;">arpitpandey.com/my</a></p>')
   };
   if (kind === 'again') return {
-    subject: tag + 'Your weekly handpan class · calendar invite',
-    text: 'Hi ' + first + ', here is your weekly handpan class calendar invite again. Open it and add it (or tap Yes). If the class is already in your calendar, it just updates the same entry, so nothing shows twice. To move or skip a class: https://arpitpandey.com/my',
-    html: shell('<p style="margin:0 0 14px;font-size:16px;">Hi ' + first + ',</p><p style="margin:0 0 14px;line-height:1.55;">Here is your weekly handpan class calendar invite again. Open it and add it (or tap Yes). If the class is already in your calendar, it just updates the same entry, so nothing shows twice.</p><p style="margin:0;line-height:1.55;">To move or skip a class: <a href="https://arpitpandey.com/my" style="color:#500018;">arpitpandey.com/my</a></p>')
+    subject: tag + Poss + ' weekly handpan class · calendar invite',
+    text: 'Hi ' + first + ', here is ' + poss + ' weekly handpan class calendar invite again. Open it and add it (or tap Yes). If the class is already in the calendar, it just updates the same entry, so nothing shows twice. To move or skip a class: https://arpitpandey.com/my',
+    html: shell('<p style="margin:0 0 14px;font-size:16px;">Hi ' + first + ',</p><p style="margin:0 0 14px;line-height:1.55;">Here is ' + poss + ' weekly handpan class calendar invite again. Open it and add it (or tap Yes). If the class is already in the calendar, it just updates the same entry, so nothing shows twice.</p><p style="margin:0;line-height:1.55;">To move or skip a class: <a href="https://arpitpandey.com/my" style="color:#500018;">arpitpandey.com/my</a></p>')
   };
   if (kind === 'cancel') return {
-    subject: tag + 'Weekly handpan class removed from your calendar',
-    text: 'Hi ' + first + ', this removes your weekly handpan class from your calendar. If this is a mistake, just reply or WhatsApp me.',
-    html: shell('<p style="margin:0 0 14px;font-size:16px;">Hi ' + first + ',</p><p style="margin:0;line-height:1.55;">This removes your weekly handpan class from your calendar. If this looks wrong, just reply or WhatsApp me.</p>')
+    subject: tag + 'Weekly handpan class removed from ' + (hasPayer ? poss : 'your') + ' calendar',
+    text: 'Hi ' + first + ', this removes ' + poss + ' weekly handpan class from the calendar. If this is a mistake, just reply or WhatsApp me.',
+    html: shell('<p style="margin:0 0 14px;font-size:16px;">Hi ' + first + ',</p><p style="margin:0;line-height:1.55;">This removes ' + poss + ' weekly handpan class from the calendar. If this looks wrong, just reply or WhatsApp me.</p>')
   };
   return {
-    subject: tag + 'Calendar update · your handpan classes',
-    text: 'Hi ' + first + ', your class times changed, so here is the updated calendar invite. Your calendar should update by itself.',
-    html: shell('<p style="margin:0 0 14px;font-size:16px;">Hi ' + first + ',</p><p style="margin:0;line-height:1.55;">Your class times changed, so here is the updated calendar invite. Your calendar should update by itself. You can always see your classes at <a href="https://arpitpandey.com/my" style="color:#500018;">arpitpandey.com/my</a>.</p>')
+    subject: tag + 'Calendar update · ' + (hasPayer ? poss : 'your') + ' handpan classes',
+    text: 'Hi ' + first + ', ' + poss + ' class times changed, so here is the updated calendar invite. The calendar should update by itself.',
+    html: shell('<p style="margin:0 0 14px;font-size:16px;">Hi ' + first + ',</p><p style="margin:0;line-height:1.55;">' + Poss + ' class times changed, so here is the updated calendar invite. The calendar should update by itself. You can always see the classes at <a href="https://arpitpandey.com/my" style="color:#500018;">arpitpandey.com/my</a>.</p>')
   };
 }
 

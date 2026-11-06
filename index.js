@@ -1930,7 +1930,7 @@ app.post('/api/webhooks/razorpay', express.raw({ type: 'application/json' }), as
               const what = classes ? (classes === 1 ? '1 class' : `${classes} classes`) : 'your classes';
               const first = String(studentName || '').trim().split(/\s+/)[0] || 'there';
               for (const toPhone of toPhones) {
-                const r = await whatsapp.sendTemplate(toPhone, 'fee_receipt', [first, amt, what], { document: doc, invoiceId: invoice.invoiceId });
+                const r = await whatsapp.sendTemplate(toPhone, 'fee_receipt', whatsapp.guardianize(student, 'fee_receipt', [first, amt, what]), { document: doc, invoiceId: invoice.invoiceId });
                 if (!r.ok) {
                   await supabase.from('notifications').insert({ type: 'warning', message: `⚠️ WhatsApp receipt to ${studentName} on +${toPhone} (${feeId}) failed: ${r.error}. The invoice email still went.`, read: false });
                 }

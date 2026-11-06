@@ -402,20 +402,24 @@ async function approveRow(row, { by } = {}) {
   const tz = row.tz || IST;
   const payUrl = PAY_BASE + encodeURIComponent(feeId);
   const plan = plansFor(price)[row.plan];
-  await mail(row.email, 'Confirmed: your weekly handpan class 🎶',
-    '<p style="margin:0 0 14px;font-size:16px;">Hi ' + esc(firstName(row.full_name)) + ',</p>' +
-    '<p style="margin:0 0 12px;line-height:1.55;">' + (by === 'student' ? 'You’re confirmed for ' : 'I’ve confirmed your weekly class: ') + '<b>' + esc(slotText(r)) + '</b>, ' + esc(plan.label.toLowerCase()) + ' plan (' + plan.classes + ' classes, ' + esc(money(row.amount, price)) + ').</p>' +
-    '<p style="margin:0;line-height:1.55;">Pay to lock the time in. It’s held for you until <b>' + esc(nice(new Date(payBy).getTime(), tz)) + '</b>.</p>' + btn(payUrl, 'Pay ' + money(row.amount, price)) +
-    '<p style="margin:0 0 10px;line-height:1.55;color:#6B5150;font-size:14px;">After paying you’ll get your Zoom link, an invoice and a calendar invite.</p>' +
+  const g = whatsapp.emailGreet(student);
+  const confirmLead = (by === 'student')
+    ? (g.hasPayer ? ('You’ve confirmed ' + esc(g.poss) + ' weekly class: ') : 'You’re confirmed for ')
+    : ('I’ve confirmed ' + esc(g.poss) + ' weekly class: ');
+  await mail(row.email, 'Confirmed: ' + (g.hasPayer ? (g.poss + ' weekly handpan class') : 'your weekly handpan class') + ' 🎶',
+    '<p style="margin:0 0 14px;font-size:16px;">Hi ' + esc(g.hi) + ',</p>' +
+    '<p style="margin:0 0 12px;line-height:1.55;">' + confirmLead + '<b>' + esc(slotText(r)) + '</b>, ' + esc(plan.label.toLowerCase()) + ' plan (' + plan.classes + ' classes, ' + esc(money(row.amount, price)) + ').</p>' +
+    '<p style="margin:0;line-height:1.55;">Pay to lock the time in. It’s held until <b>' + esc(nice(new Date(payBy).getTime(), tz)) + '</b>.</p>' + btn(payUrl, 'Pay ' + money(row.amount, price)) +
+    '<p style="margin:0 0 10px;line-height:1.55;color:#6B5150;font-size:14px;">After paying you’ll get the Zoom link, an invoice and a calendar invite.</p>' +
     '<p style="margin:0;font-size:14px;"><a href="' + linkFor(row) + '" style="color:#500018;">Switch plan or pick a different time</a></p>',
-    'Hi ' + firstName(row.full_name) + ', your weekly class (' + slotText(r) + ') is confirmed. Pay here to lock it in: ' + payUrl);
+    'Hi ' + g.hi + ', ' + (g.hasPayer ? (g.poss + ' weekly class') : 'your weekly class') + ' (' + slotText(r) + ') is confirmed. Pay here to lock it in: ' + payUrl);
   // WhatsApp: "confirmed, pay to lock it in" with a Pay button. If it can't
   // go out, hand the request back to the usual fee_link worker.
   if (confirmOn()) {
     let ok = false;
     if (row.phone) {
       const w = await whatsapp.sendTemplate(row.phone, CONFIRM_TEMPLATE,
-        [firstName(row.full_name), slotText(r), money(row.amount, price), plan.label.toLowerCase() + ' plan (' + plan.classes + ' classes)', nice(new Date(payBy).getTime(), tz) + (tz === IST ? ' IST' : ' (' + tzName(tz) + ')')],
+        whatsapp.guardianize(student, CONFIRM_TEMPLATE, [firstName(row.full_name), slotText(r), money(row.amount, price), plan.label.toLowerCase() + ' plan (' + plan.classes + ' classes)', nice(new Date(payBy).getTime(), tz) + (tz === IST ? ' IST' : ' (' + tzName(tz) + ')')]),
         { buttonUrlParam: feeId }).catch(e => ({ ok: false, error: e.message }));
       ok = !!(w && w.ok);
       if (!ok) console.error('weekly_class_confirmed failed:', w && w.error);
@@ -473,16 +477,17 @@ async function onFeePaid(feeRequestId) {
     await update(row.id, { status: 'paid', paid_at: new Date().toISOString(), slot_id: String(slotId), zoom_meeting_id: meetingId, first_class_at: first ? new Date(first).toISOString() : null });
     // 4. Tell the student.
     const firstTxt = first ? nice(first, tz) + (tz === IST ? ' IST' : ' (' + tzName(tz) + ')') : slotText(row);
-    await mail(row.email, 'You’re in! Your weekly handpan class 🎶',
-      '<p style="margin:0 0 14px;font-size:16px;">Hi ' + esc(firstName(name)) + ',</p>' +
-      '<p style="margin:0 0 12px;line-height:1.55;">Thanks, your payment came through. Your class is every week, <b>' + esc(slotText(row)) + '</b>. First class: <b>' + esc(firstTxt) + '</b>.</p>' +
-      (joinUrl ? '<p style="margin:0 0 6px;line-height:1.55;">Your Zoom link (the same every week):</p>' + btn(joinUrl, 'Join on Zoom') : '<p style="line-height:1.55;">Your Zoom link is on its way.</p>') +
-      '<p style="margin:0;line-height:1.55;">You’ll get a reminder an hour before each class. To move or skip a class: <a href="' + SITE + '/my" style="color:#500018;">arpitpandey.com/my</a></p>',
-      'Hi ' + firstName(name) + ', you are in! Weekly class: ' + slotText(row) + '. First class: ' + firstTxt + '. Zoom: ' + (joinUrl || 'coming soon'));
+    const gp = whatsapp.emailGreet(student || { full_name: name });
+    await mail(row.email, 'You’re in! ' + (gp.hasPayer ? (gp.poss + ' weekly handpan class') : 'Your weekly handpan class') + ' 🎶',
+      '<p style="margin:0 0 14px;font-size:16px;">Hi ' + esc(gp.hi) + ',</p>' +
+      '<p style="margin:0 0 12px;line-height:1.55;">Thanks, the payment came through. ' + (gp.hasPayer ? (esc(gp.poss) + ' class is') : 'Your class is') + ' every week, <b>' + esc(slotText(row)) + '</b>. First class: <b>' + esc(firstTxt) + '</b>.</p>' +
+      (joinUrl ? '<p style="margin:0 0 6px;line-height:1.55;">' + (gp.hasPayer ? 'The' : 'Your') + ' Zoom link (the same every week):</p>' + btn(joinUrl, 'Join on Zoom') : '<p style="line-height:1.55;">The Zoom link is on its way.</p>') +
+      '<p style="margin:0;line-height:1.55;">A reminder goes out an hour before each class. To move or skip a class: <a href="' + SITE + '/my" style="color:#500018;">arpitpandey.com/my</a></p>',
+      'Hi ' + gp.hi + ', ' + (gp.hasPayer ? (gp.poss + ' weekly class is set') : 'you are in') + '! Weekly class: ' + slotText(row) + '. First class: ' + firstTxt + '. Zoom: ' + (joinUrl || 'coming soon'));
     if (portal && portal.linkForStudent && whatsapp && row.phone) {
       try {
         const link = await portal.linkForStudent(row.student_id);
-        if (link && link.url) await whatsapp.sendTemplate(row.phone, 'my_classes_link', [firstName(name), link.url]);
+        if (link && link.url) await whatsapp.sendTemplate(row.phone, 'my_classes_link', whatsapp.guardianize(student || { full_name: name }, 'my_classes_link', [firstName(name), link.url]));
       } catch (e) { console.error('enrol my-link WhatsApp failed:', e.message); }
     }
     await notify('payment', '🎉 ' + name + ' is enrolled: ' + DAYS[row.slot_weekday].slice(0, 3) + ' ' + time12(row.slot_time) + ' IST weekly, first class ' + (first ? nice(first, IST) + ' IST' : '?') + '.' +

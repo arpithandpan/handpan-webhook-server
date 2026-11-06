@@ -68,7 +68,7 @@ async function affected(s, e) {
   const fromYmd = addDays(istYmd(s), -1), toYmd = addDays(istYmd(e), 1);
   const [sch, st, ex, tr] = await Promise.all([
     supabase.from('class_schedule').select('*').eq('active', true),
-    supabase.from('students').select('id, full_name, email, extra_emails, phone, archived, status'),
+    supabase.from('students').select('id, full_name, payer_name, email, extra_emails, phone, archived, status'),
     supabase.from('class_exceptions').select('*').gte('original_date', addDays(fromYmd, -14)).lte('original_date', addDays(toYmd, 14)),
     supabase.from('trials').select('id, full_name, start_at, duration_min, status, email').eq('status', 'booked')
       .gte('start_at', new Date(s - DAY).toISOString()).lte('start_at', new Date(e + DAY).toISOString())
@@ -161,25 +161,26 @@ async function tellStudents(byStudent, students, kind) {
     const tz = list[0].tz;
     const lines = list.map(c => dayText(c.start, tz) + ' at ' + timeText(c.start, tz) + (tz === IST ? ' IST' : ' (' + tzName(tz) + ')'));
     const link = await myLink(sid);
+    const g = (whatsapp && whatsapp.emailGreet) ? whatsapp.emailGreet(s) : { hi: firstName(s.full_name), poss: 'your', hasPayer: false };
     let m;
     if (kind === 'cancel') {
-      m = await mail(emailsOf(s), list.length === 1 ? 'Your handpan class on ' + dayText(list[0].start, tz) + ' is cancelled' : 'Some of your handpan classes are cancelled',
-        shell('<p style="margin:0 0 14px;font-size:16px;">Hi ' + esc(firstName(s.full_name)) + ',</p>' +
-          '<p style="margin:0 0 12px;line-height:1.55;">I’m not available then, so ' + (list.length === 1 ? 'this class is' : 'these classes are') + ' cancelled:</p>' +
+      m = await mail(emailsOf(s), list.length === 1 ? (g.poss.charAt(0).toUpperCase() + g.poss.slice(1)) + ' handpan class on ' + dayText(list[0].start, tz) + ' is cancelled' : 'Some of ' + (g.hasPayer ? g.poss : 'your') + ' handpan classes are cancelled',
+        shell('<p style="margin:0 0 14px;font-size:16px;">Hi ' + esc(g.hi) + ',</p>' +
+          '<p style="margin:0 0 12px;line-height:1.55;">I’m not available then, so ' + (g.hasPayer ? (esc(g.poss) + ' ') : '') + (list.length === 1 ? 'class is' : 'classes are') + ' cancelled:</p>' +
           '<p style="margin:0 0 12px;line-height:1.7;"><b>' + lines.map(esc).join('<br>') + '</b></p>' +
           '<p style="margin:0;line-height:1.55;">' + (list.length === 1 ? 'It won’t' : 'They won’t') + ' be counted. You can book a make-up class at any free time this month.</p>' +
-          btn(link, 'Pick a make-up time') + '<p style="margin:0;line-height:1.55;color:#6B5150;font-size:14px;">Sorry for the change. Your calendar updates by itself.</p>'),
-        'Hi ' + firstName(s.full_name) + ', I am not available then, so these classes are cancelled: ' + lines.join('; ') + '. They will not be counted. Book a make-up: ' + link);
+          btn(link, 'Pick a make-up time') + '<p style="margin:0;line-height:1.55;color:#6B5150;font-size:14px;">Sorry for the change. The calendar updates by itself.</p>'),
+        'Hi ' + g.hi + ', I am not available then, so ' + (g.hasPayer ? (g.poss + ' classes are') : 'these classes are') + ' cancelled: ' + lines.join('; ') + '. They will not be counted. Book a make-up: ' + link);
       if (waOn() && whatsapp && s.phone) {
-        await whatsapp.sendTemplate(s.phone, 'class_cancelled_by_arpit', [firstName(s.full_name), lines.join(', ')]).catch(() => null);
+        await whatsapp.sendTemplate(s.phone, 'class_cancelled_by_arpit', whatsapp.guardianize(s, 'class_cancelled_by_arpit', [firstName(s.full_name), lines.join(', ')])).catch(() => null);
       }
     } else {
-      m = await mail(emailsOf(s), 'Good news: your handpan class is back on',
-        shell('<p style="margin:0 0 14px;font-size:16px;">Hi ' + esc(firstName(s.full_name)) + ',</p>' +
-          '<p style="margin:0 0 12px;line-height:1.55;">My plans changed, so ' + (list.length === 1 ? 'this class is' : 'these classes are') + ' back on as usual:</p>' +
+      m = await mail(emailsOf(s), 'Good news: ' + (g.hasPayer ? g.poss : 'your') + ' handpan class is back on',
+        shell('<p style="margin:0 0 14px;font-size:16px;">Hi ' + esc(g.hi) + ',</p>' +
+          '<p style="margin:0 0 12px;line-height:1.55;">My plans changed, so ' + (g.hasPayer ? (esc(g.poss) + ' ') : '') + (list.length === 1 ? 'class is' : 'classes are') + ' back on as usual:</p>' +
           '<p style="margin:0 0 12px;line-height:1.7;"><b>' + lines.map(esc).join('<br>') + '</b></p>' +
-          '<p style="margin:0;line-height:1.55;">Same Zoom link. If it doesn’t suit you any more, you can move or skip it on your page.</p>' + btn(link, 'See my classes')),
-        'Hi ' + firstName(s.full_name) + ', these classes are back on: ' + lines.join('; ') + '. Same Zoom link. ' + link);
+          '<p style="margin:0;line-height:1.55;">Same Zoom link. If it doesn’t suit any more, you can move or skip it on the page.</p>' + btn(link, 'See classes')),
+        'Hi ' + g.hi + ', ' + (g.hasPayer ? (g.poss + ' classes are') : 'these classes are') + ' back on: ' + lines.join('; ') + '. Same Zoom link. ' + link);
     }
     results.push({ studentId: sid, email: m.ok ? 'sent' : m.error });
   }
@@ -245,7 +246,7 @@ async function removeHandler(req, res) {
     const { data: rows, error } = await supabase.from('class_exceptions').select('*').eq('block_id', id);
     if (error) throw new Error(error.message);
     const [{ data: studs }, { data: sch }] = await Promise.all([
-      supabase.from('students').select('id, full_name, email, extra_emails, phone, archived'),
+      supabase.from('students').select('id, full_name, payer_name, email, extra_emails, phone, archived'),
       supabase.from('class_schedule').select('*').eq('active', true)
     ]);
     const students = Object.fromEntries((studs || []).map(x => [x.id, x]));

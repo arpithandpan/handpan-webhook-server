@@ -355,6 +355,58 @@ function firstName(full) {
   return String(full || '').trim().split(/\s+/)[0] || 'there';
 }
 
+// ── PAYER / GUARDIAN ──
+// A student can have a different person as their payer and point of contact
+// (e.g. a child whose parent manages everything). When students.payer_name is
+// set — the dashboard's "Payer Name (if someone else pays)" field — every
+// message greets that person and names the student in the body, so it is always
+// clear which student it is about, even when the parent has their own classes
+// on the same phone or email.
+// KID_SLOT[template] = [paramIndex, mode]: where/how to weave the student's own
+// first name. 'for' → "4 classes for Ananya"; 'paren' → "7:00 PM (Ananya)".
+const KID_SLOT = {
+  fee_link:                 [1, 'for'],
+  payment_reminder:         [1, 'for'],
+  fee_receipt:              [2, 'for'],
+  class_reminder_v2:        [1, 'paren'],
+  class_reminder_v3:        [1, 'paren'],
+  class_changed:            [1, 'paren'],
+  class_cancelled_by_arpit: [1, 'paren'],
+  weekly_class_confirmed:   [1, 'paren']
+};
+function guardianize(student, templateName, params) {
+  const guardian = student && String(student.payer_name || '').trim();
+  if (!guardian || !Array.isArray(params) || !params.length) return params;
+  const out = params.slice();
+  out[0] = firstName(guardian);                       // greet the contact / payer
+  const kid = firstName(student.full_name);
+  const slot = KID_SLOT[templateName];
+  if (kid && slot) {
+    const [i, mode] = slot;
+    const cur = out[i] == null ? '' : String(out[i]);
+    if (cur.trim() && !cur.includes(kid)) {
+      out[i] = mode === 'for' ? `${cur} for ${kid}` : `${cur} (${kid})`;
+    }
+  }
+  return out;
+}
+// Email greeting counterpart of guardianize. Emails are free-form, so instead
+// of a slot map it returns the pieces a greeting needs:
+//   hi      → first name to greet (the payer when set, else the student)
+//   poss    → possessive for the class ("Ananya’s" when a payer is set, else "your")
+//   student → the student's own first name
+//   hasPayer→ true when a different payer is managing this student
+// Example (payer set): "Hi Anurag," + "I’ve confirmed " + poss ("Ananya’s") + " weekly class".
+function emailGreet(student) {
+  const rawPayer = String((student && student.payer_name) || '').trim();
+  const self = firstName((student && student.full_name) || '');
+  if (rawPayer) {
+    const sName = (self && self !== 'there') ? self : '';
+    return { hi: firstName(rawPayer), poss: sName ? (sName + '’s') : 'your', student: sName, hasPayer: true };
+  }
+  return { hi: self, poss: 'your', student: self, hasPayer: false };
+}
+
 // ── STAMP A TIMESTAMP COLUMN ON A REQUEST ──
 async function stamp(requestId, column) {
   const { error } = await supabase.from('fee_requests')
@@ -549,9 +601,10 @@ function allPhones(student) {
 async function sendToAllPhones(student, templateName, params) {
   const phones = allPhones(student);
   if (!phones.length) return { ok: false, error: 'No usable phone number' };
+  const finalParams = guardianize(student, templateName, params);
   let ok = false, lastError = '';
   for (const ph of phones) {
-    const r = await sendTemplate(ph, templateName, params);
+    const r = await sendTemplate(ph, templateName, finalParams);
     if (r.ok) ok = true; else lastError = r.error;
   }
   return ok ? { ok: true } : { ok: false, error: lastError };
@@ -1124,4 +1177,4 @@ function startWorker() {
   timer = setInterval(tick, TICK_MS);
 }
 
-module.exports = { init, setHooks, sendReply, reactHandler, status, startWorker, processPending, sendTemplate, normalizePhone, verifyWebhook, incomingHandler, replyHandler, replyTemplateStatus, reopenHandler, mediaHandler, sendMediaHandler, _test: { planScheduleOccurrences, zonedToUtc, tzOffsetMin, applyStatus } };
+module.exports = { init, setHooks, sendReply, reactHandler, status, startWorker, processPending, sendTemplate, normalizePhone, verifyWebhook, incomingHandler, replyHandler, replyTemplateStatus, reopenHandler, mediaHandler, sendMediaHandler, guardianize, emailGreet, firstName, _test: { planScheduleOccurrences, zonedToUtc, tzOffsetMin, applyStatus, guardianize, emailGreet } };

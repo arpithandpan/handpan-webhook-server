@@ -565,20 +565,22 @@ async function confirmToStudent(ctx, token, was, nowText) {
   const s = ctx.student;
   const out = { whatsapp: false, email: false };
   if (templatesOn() && whatsapp && s.phone) {
-    const r = await whatsapp.sendTemplate(s.phone, 'class_changed', [firstName(s.full_name), was, nowText]).catch(() => null);
+    const r = await whatsapp.sendTemplate(s.phone, 'class_changed', whatsapp.guardianize(s, 'class_changed', [firstName(s.full_name), was, nowText])).catch(() => null);
     out.whatsapp = !!(r && r.ok);
   }
   if (s.email) {
+    const g = (whatsapp && whatsapp.emailGreet) ? whatsapp.emailGreet(s) : { hi: firstName(s.full_name), poss: 'your', hasPayer: false };
     const r = await sendMail({
       to: s.email,
-      subject: 'Your handpan class was changed',
+      subject: (g.hasPayer ? (g.poss.charAt(0).toUpperCase() + g.poss.slice(1)) : 'Your') + ' handpan class was changed',
       html: mailShell(`
-        <h1 style="margin:0 0 14px;font-size:20px;color:#500018;font-weight:600;">Done, ${esc(firstName(s.full_name))}</h1>
+        <h1 style="margin:0 0 14px;font-size:20px;color:#500018;font-weight:600;">Done, ${esc(g.hi)}</h1>
+        ${g.hasPayer ? `<p style="margin:0 0 10px;line-height:1.6;">${esc(g.poss)} class has been updated.</p>` : ''}
         <p style="margin:0 0 6px;"><strong style="color:#500018;">Was:</strong> ${esc(was)}</p>
         <p style="margin:0 0 18px;"><strong style="color:#500018;">Now:</strong> ${esc(nowText)}</p>
-        <p style="margin:0 0 20px;line-height:1.6;">Your Zoom link stays the same.</p>
+        <p style="margin:0 0 20px;line-height:1.6;">The Zoom link stays the same.</p>
         <p style="margin:0;"><a href="${esc(linkFor(token))}" style="display:inline-block;background:#500018;color:#F5EEE5;text-decoration:none;padding:12px 22px;border-radius:40px;font-weight:600;">Open My bookings</a></p>`),
-      text: `Your handpan class was changed. Was: ${was}. Now: ${nowText}. Your Zoom link stays the same. My bookings: ${linkFor(token)}`
+      text: `${g.hasPayer ? g.poss + ' handpan class was' : 'Your handpan class was'} changed. Was: ${was}. Now: ${nowText}. The Zoom link stays the same. My bookings: ${linkFor(token)}`
     }).catch(() => ({ ok: false }));
     out.email = !!r.ok;
   }
@@ -625,20 +627,21 @@ async function requestLinkHandler(req, res) {
     if (templatesOn() && whatsapp) {
       const phones = isMail ? [match.phone] : [match.phone].concat(match.extra_phones || []).filter(p => last10(p) === key);
       for (const p of phones.filter(Boolean)) {
-        const r = await whatsapp.sendTemplate(p, 'my_classes_link', [firstName(match.full_name), link.url]).catch(() => null);
+        const r = await whatsapp.sendTemplate(p, 'my_classes_link', whatsapp.guardianize(match, 'my_classes_link', [firstName(match.full_name), link.url])).catch(() => null);
         if (r && r.ok) waOk = true;
       }
     }
     if (match.email) {
+      const g = (whatsapp && whatsapp.emailGreet) ? whatsapp.emailGreet(match) : { hi: firstName(match.full_name), poss: 'your', hasPayer: false };
       const r = await sendMail({
         to: match.email,
-        subject: 'Your My bookings link',
+        subject: (g.hasPayer ? (g.poss.charAt(0).toUpperCase() + g.poss.slice(1)) : 'Your') + ' My bookings link',
         html: mailShell(`
-          <h1 style="margin:0 0 14px;font-size:20px;color:#500018;font-weight:600;">Hi ${esc(firstName(match.full_name))}</h1>
-          <p style="margin:0 0 20px;line-height:1.6;">Here is your personal link. It has your schedule, Zoom link and payments, and you can move a class from there.</p>
+          <h1 style="margin:0 0 14px;font-size:20px;color:#500018;font-weight:600;">Hi ${esc(g.hi)}</h1>
+          <p style="margin:0 0 20px;line-height:1.6;">Here is the personal link for ${g.hasPayer ? esc(g.poss) + ' classes' : 'your classes'}. It has the schedule, Zoom link and payments, and you can move a class from there.</p>
           <p style="margin:0 0 20px;"><a href="${esc(link.url)}" style="display:inline-block;background:#500018;color:#F5EEE5;text-decoration:none;padding:12px 22px;border-radius:40px;font-weight:600;">Open My bookings</a></p>
-          <p style="margin:0;font-size:13px;line-height:1.6;color:#6B5150;">This link is just for you, so please don't share it.</p>`),
-        text: `Hi ${firstName(match.full_name)}, here is your My bookings link: ${link.url} (just for you, please don't share it).`
+          <p style="margin:0;font-size:13px;line-height:1.6;color:#6B5150;">This link is private, so please don't share it.</p>`),
+        text: `Hi ${g.hi}, here is the My bookings link for ${g.hasPayer ? g.poss + ' classes' : 'your classes'}: ${link.url} (private, please don't share it).`
       }).catch(() => ({ ok: false }));
       mailOk = !!r.ok;
     }
@@ -796,7 +799,7 @@ async function requestCodeHandler(req, res) {
         to: match.email,
         subject: code + ' is your login code',
         html: mailShell(`
-          <p style="margin:0 0 8px;">Hi ${esc(firstName(match.full_name))}, your login code is</p>
+          <p style="margin:0 0 8px;">Hi ${esc((whatsapp && whatsapp.emailGreet) ? whatsapp.emailGreet(match).hi : firstName(match.full_name))}, your login code is</p>
           <p style="margin:0 0 18px;font-size:34px;letter-spacing:8px;font-weight:700;color:#500018;">${code}</p>
           <p style="margin:0 0 20px;line-height:1.6;">It works for 10 minutes. Or just tap the button to log in.</p>
           <p style="margin:0 0 20px;"><a href="${esc(url)}" style="display:inline-block;background:#500018;color:#F5EEE5;text-decoration:none;padding:12px 22px;border-radius:40px;font-weight:600;">Log in</a></p>
