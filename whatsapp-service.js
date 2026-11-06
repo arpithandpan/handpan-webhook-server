@@ -598,13 +598,13 @@ function allPhones(student) {
 }
 
 // Send one template to every number of a student. ok if at least one went.
-async function sendToAllPhones(student, templateName, params) {
+async function sendToAllPhones(student, templateName, params, opts) {
   const phones = allPhones(student);
   if (!phones.length) return { ok: false, error: 'No usable phone number' };
   const finalParams = guardianize(student, templateName, params);
   let ok = false, lastError = '';
   for (const ph of phones) {
-    const r = await sendTemplate(ph, templateName, finalParams);
+    const r = await sendTemplate(ph, templateName, finalParams, opts);
     if (r.ok) ok = true; else lastError = r.error;
   }
   return ok ? { ok: true } : { ok: false, error: lastError };
@@ -1177,4 +1177,4 @@ function startWorker() {
   timer = setInterval(tick, TICK_MS);
 }
 
-module.exports = { init, setHooks, sendReply, reactHandler, status, startWorker, processPending, sendTemplate, normalizePhone, verifyWebhook, incomingHandler, replyHandler, replyTemplateStatus, reopenHandler, mediaHandler, sendMediaHandler, guardianize, emailGreet, firstName, _test: { planScheduleOccurrences, zonedToUtc, tzOffsetMin, applyStatus, guardianize, emailGreet } };
+module.exports = { init, setHooks, sendReply, reactHandler, status, startWorker, processPending, sendTemplate, normalizePhone, verifyWebhook, incomingHandler, replyHandler, replyTemplateStatus, reopenHandler, mediaHandler, sendMediaHandler, sendToAllPhones, guardianize, emailGreet, firstName, _test: { planScheduleOccurrences, zonedToUtc, tzOffsetMin, applyStatus, guardianize, emailGreet } };

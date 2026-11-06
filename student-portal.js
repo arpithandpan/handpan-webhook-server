@@ -565,13 +565,13 @@ async function confirmToStudent(ctx, token, was, nowText) {
   const s = ctx.student;
   const out = { whatsapp: false, email: false };
   if (templatesOn() && whatsapp && s.phone) {
-    const r = await whatsapp.sendTemplate(s.phone, 'class_changed', whatsapp.guardianize(s, 'class_changed', [firstName(s.full_name), was, nowText])).catch(() => null);
+    const r = await whatsapp.sendToAllPhones(s, 'class_changed', [firstName(s.full_name), was, nowText]).catch(() => null);
     out.whatsapp = !!(r && r.ok);
   }
   if (s.email) {
     const g = (whatsapp && whatsapp.emailGreet) ? whatsapp.emailGreet(s) : { hi: firstName(s.full_name), poss: 'your', hasPayer: false };
     const r = await sendMail({
-      to: s.email,
+      to: emailList(s),
       subject: (g.hasPayer ? (g.poss.charAt(0).toUpperCase() + g.poss.slice(1)) : 'Your') + ' handpan class was changed',
       html: mailShell(`
         <h1 style="margin:0 0 14px;font-size:20px;color:#500018;font-weight:600;">Done, ${esc(g.hi)}</h1>
@@ -904,12 +904,24 @@ async function adminLinkHandler(req, res) {
 }
 
 // ── MAIL ──
+// All email addresses on a student: main + extra_emails (deduped), e.g. both
+// parents. Pass the result as `to` to send the same mail to everyone.
+function emailList(s) {
+  const out = [];
+  for (const e of [s && s.email].concat(String((s && s.extra_emails) || '').split(/[,;\s]+/))) {
+    const v = String(e || '').trim().toLowerCase();
+    if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v) && !out.includes(v)) out.push(v);
+  }
+  return out;
+}
 async function sendMail({ to, subject, html, text }) {
   if (!RESEND_API_KEY) return { ok: false, error: 'RESEND_API_KEY not set' };
+  const toList = (Array.isArray(to) ? to : String(to || '').split(/[,;\s]+/)).map(x => String(x).trim()).filter(Boolean);
+  if (!toList.length) return { ok: false, error: 'no email' };
   const r = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: { 'Authorization': 'Bearer ' + RESEND_API_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from: 'Arpit Pandey <' + FROM_EMAIL + '>', to: [to], subject, html, text, reply_to: ARPIT_EMAIL })
+    body: JSON.stringify({ from: 'Arpit Pandey <' + FROM_EMAIL + '>', to: toList, subject, html, text, reply_to: ARPIT_EMAIL })
   });
   if (!r.ok) { const j = await r.json().catch(() => ({})); return { ok: false, error: j.message || ('HTTP ' + r.status) }; }
   return { ok: true };

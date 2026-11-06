@@ -172,7 +172,8 @@ async function tellStudents(byStudent, students, kind) {
           btn(link, 'Pick a make-up time') + '<p style="margin:0;line-height:1.55;color:#6B5150;font-size:14px;">Sorry for the change. The calendar updates by itself.</p>'),
         'Hi ' + g.hi + ', I am not available then, so ' + (g.hasPayer ? (g.poss + ' classes are') : 'these classes are') + ' cancelled: ' + lines.join('; ') + '. They will not be counted. Book a make-up: ' + link);
       if (waOn() && whatsapp && s.phone) {
-        await whatsapp.sendTemplate(s.phone, 'class_cancelled_by_arpit', whatsapp.guardianize(s, 'class_cancelled_by_arpit', [firstName(s.full_name), lines.join(', ')])).catch(() => null);
+        // Fan out to every number on the student (both parents), payer-aware.
+        await whatsapp.sendToAllPhones(s, 'class_cancelled_by_arpit', [firstName(s.full_name), lines.join(', ')]).catch(() => null);
       }
     } else {
       m = await mail(emailsOf(s), 'Good news: ' + (g.hasPayer ? g.poss : 'your') + ' handpan class is back on',

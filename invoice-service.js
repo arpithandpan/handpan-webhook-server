@@ -359,7 +359,11 @@ async function invoiceFeePayment(supabase, { feeId, studentName, student, classe
     // The address typed at payment time wins (it may be a parent paying). The
     // student's address on file is copied in, so nothing is lost either way.
     billed: { name: studentName, email: payerEmail || payment.notes?.email || student?.email || null, phone: payerPhone || payment.notes?.phone || student?.phone || payment.contact || null, country: invoiceCountry(student, payerPhone || payment.notes?.phone || payment.contact, (currency || 'INR').toUpperCase()) },
-    cc: student?.email ? [student.email] : [],
+    // CC every email on the student (main + extra_emails), e.g. both parents,
+    // so whoever is managing the account also gets the invoice PDF.
+    cc: [student?.email].concat(String(student?.extra_emails || '').split(/[,;\s]+/))
+      .map(e => String(e || '').trim().toLowerCase())
+      .filter((e, i, a) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) && a.indexOf(e) === i),
     currency,
     paymentDate: todayIST(),
     paymentMode: currency === 'INR' ? 'Razorpay UPI' : 'Razorpay International',

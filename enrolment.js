@@ -170,12 +170,23 @@ function shell(inner) {
     '<p style="margin:28px 0 0;font-size:13px;color:#6B5150;">Arpit Pandey · Handpan artist and teacher<br><a href="' + SITE + '" style="color:#500018;">arpitpandey.com</a></p></div></div>';
 }
 function btn(href, label) { return '<p style="margin:22px 0;"><a href="' + href + '" style="display:inline-block;background:#500018;color:#fff;text-decoration:none;padding:13px 26px;border-radius:40px;font-weight:600;">' + esc(label) + '</a></p>'; }
+// All email addresses on a student: main + extra_emails (deduped), e.g. both
+// parents. Pass the array as `to` to reach everyone.
+function emailList(s) {
+  const out = [];
+  for (const e of [s && s.email].concat(String((s && s.extra_emails) || '').split(/[,;\s]+/))) {
+    const v = String(e || '').trim().toLowerCase();
+    if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v) && !out.includes(v)) out.push(v);
+  }
+  return out;
+}
 async function mail(to, subject, html, text) {
-  if (!RESEND_API_KEY || !to) return { ok: false, error: !to ? 'no email' : 'RESEND_API_KEY not set' };
+  const toList = (Array.isArray(to) ? to : String(to || '').split(/[,;\s]+/)).map(x => String(x).trim()).filter(Boolean);
+  if (!RESEND_API_KEY || !toList.length) return { ok: false, error: !toList.length ? 'no email' : 'RESEND_API_KEY not set' };
   try {
     const r = await fetch('https://api.resend.com/emails', {
       method: 'POST', headers: { Authorization: 'Bearer ' + RESEND_API_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from: 'Arpit Pandey <' + FROM_EMAIL + '>', to: [to], subject, html: shell(html), text, reply_to: ARPIT_EMAIL })
+      body: JSON.stringify({ from: 'Arpit Pandey <' + FROM_EMAIL + '>', to: toList, subject, html: shell(html), text, reply_to: ARPIT_EMAIL })
     });
     if (!r.ok) { const j = await r.json().catch(() => ({})); return { ok: false, error: j.message || ('HTTP ' + r.status) }; }
     return { ok: true };
@@ -406,7 +417,7 @@ async function approveRow(row, { by } = {}) {
   const confirmLead = (by === 'student')
     ? (g.hasPayer ? ('You’ve confirmed ' + esc(g.poss) + ' weekly class: ') : 'You’re confirmed for ')
     : ('I’ve confirmed ' + esc(g.poss) + ' weekly class: ');
-  await mail(row.email, 'Confirmed: ' + (g.hasPayer ? (g.poss + ' weekly handpan class') : 'your weekly handpan class') + ' 🎶',
+  await mail(emailList(student).length ? emailList(student) : row.email, 'Confirmed: ' + (g.hasPayer ? (g.poss + ' weekly handpan class') : 'your weekly handpan class') + ' 🎶',
     '<p style="margin:0 0 14px;font-size:16px;">Hi ' + esc(g.hi) + ',</p>' +
     '<p style="margin:0 0 12px;line-height:1.55;">' + confirmLead + '<b>' + esc(slotText(r)) + '</b>, ' + esc(plan.label.toLowerCase()) + ' plan (' + plan.classes + ' classes, ' + esc(money(row.amount, price)) + ').</p>' +
     '<p style="margin:0;line-height:1.55;">Pay to lock the time in. It’s held until <b>' + esc(nice(new Date(payBy).getTime(), tz)) + '</b>.</p>' + btn(payUrl, 'Pay ' + money(row.amount, price)) +
@@ -418,8 +429,8 @@ async function approveRow(row, { by } = {}) {
   if (confirmOn()) {
     let ok = false;
     if (row.phone) {
-      const w = await whatsapp.sendTemplate(row.phone, CONFIRM_TEMPLATE,
-        whatsapp.guardianize(student, CONFIRM_TEMPLATE, [firstName(row.full_name), slotText(r), money(row.amount, price), plan.label.toLowerCase() + ' plan (' + plan.classes + ' classes)', nice(new Date(payBy).getTime(), tz) + (tz === IST ? ' IST' : ' (' + tzName(tz) + ')')]),
+      const w = await whatsapp.sendToAllPhones(student, CONFIRM_TEMPLATE,
+        [firstName(row.full_name), slotText(r), money(row.amount, price), plan.label.toLowerCase() + ' plan (' + plan.classes + ' classes)', nice(new Date(payBy).getTime(), tz) + (tz === IST ? ' IST' : ' (' + tzName(tz) + ')')],
         { buttonUrlParam: feeId }).catch(e => ({ ok: false, error: e.message }));
       ok = !!(w && w.ok);
       if (!ok) console.error('weekly_class_confirmed failed:', w && w.error);
@@ -478,7 +489,7 @@ async function onFeePaid(feeRequestId) {
     // 4. Tell the student.
     const firstTxt = first ? nice(first, tz) + (tz === IST ? ' IST' : ' (' + tzName(tz) + ')') : slotText(row);
     const gp = whatsapp.emailGreet(student || { full_name: name });
-    await mail(row.email, 'You’re in! ' + (gp.hasPayer ? (gp.poss + ' weekly handpan class') : 'Your weekly handpan class') + ' 🎶',
+    await mail(emailList(student || { email: row.email }).length ? emailList(student || { email: row.email }) : row.email, 'You’re in! ' + (gp.hasPayer ? (gp.poss + ' weekly handpan class') : 'Your weekly handpan class') + ' 🎶',
       '<p style="margin:0 0 14px;font-size:16px;">Hi ' + esc(gp.hi) + ',</p>' +
       '<p style="margin:0 0 12px;line-height:1.55;">Thanks, the payment came through. ' + (gp.hasPayer ? (esc(gp.poss) + ' class is') : 'Your class is') + ' every week, <b>' + esc(slotText(row)) + '</b>. First class: <b>' + esc(firstTxt) + '</b>.</p>' +
       (joinUrl ? '<p style="margin:0 0 6px;line-height:1.55;">' + (gp.hasPayer ? 'The' : 'Your') + ' Zoom link (the same every week):</p>' + btn(joinUrl, 'Join on Zoom') : '<p style="line-height:1.55;">The Zoom link is on its way.</p>') +
@@ -487,7 +498,7 @@ async function onFeePaid(feeRequestId) {
     if (portal && portal.linkForStudent && whatsapp && row.phone) {
       try {
         const link = await portal.linkForStudent(row.student_id);
-        if (link && link.url) await whatsapp.sendTemplate(row.phone, 'my_classes_link', whatsapp.guardianize(student || { full_name: name }, 'my_classes_link', [firstName(name), link.url]));
+        if (link && link.url) await whatsapp.sendToAllPhones(student || { full_name: name, phone: row.phone }, 'my_classes_link', [firstName(name), link.url]);
       } catch (e) { console.error('enrol my-link WhatsApp failed:', e.message); }
     }
     await notify('payment', '🎉 ' + name + ' is enrolled: ' + DAYS[row.slot_weekday].slice(0, 3) + ' ' + time12(row.slot_time) + ' IST weekly, first class ' + (first ? nice(first, IST) + ' IST' : '?') + '.' +
