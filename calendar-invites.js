@@ -221,10 +221,12 @@ function mailFor(kind, student, test) {
   // Payer-aware greeting: when students.payer_name is set (a parent managing a
   // child's classes), greet the payer and name the student with a possessive.
   const fn = v => String(v || '').trim().split(/\s+/)[0] || '';
+  // One name → first name; several ("&", "," or " and ") → kept whole.
+  const greet = v => { const s = String(v || '').trim(); return /[,&]|\sand\s/i.test(s) ? s : fn(s); };
   const self = fn(student.full_name) || 'there';
   const rawPayer = String(student.payer_name || '').trim();
   const hasPayer = !!rawPayer && fn(rawPayer) !== fn(student.full_name);
-  const first = hasPayer ? fn(rawPayer) : self;
+  const first = hasPayer ? greet(rawPayer) : self;
   const poss = hasPayer ? (self + '’s') : 'your';   // "Ananya’s" or "your"
   const Poss = poss.charAt(0).toUpperCase() + poss.slice(1);
   const tag = test ? '[TEST for ' + (student.full_name || student.id) + '] ' : '';

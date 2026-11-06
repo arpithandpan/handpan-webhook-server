@@ -354,6 +354,15 @@ async function pendingWithStudents(filter) {
 function firstName(full) {
   return String(full || '').trim().split(/\s+/)[0] || 'there';
 }
+// Greeting taken from a payer/contact field. One person → first name only, so
+// it stays friendly ("Anurag Gupta" → "Anurag"). Several people, written with
+// "&", "," or " and " → the whole string kept as is ("Anurag & Deepti"), so
+// both are addressed. This is how one student is managed by one or many people.
+function payerGreeting(payer) {
+  const s = String(payer || '').trim();
+  if (!s) return '';
+  return /[,&]|\sand\s/i.test(s) ? s : firstName(s);
+}
 
 // ── PAYER / GUARDIAN ──
 // A student can have a different person as their payer and point of contact
@@ -378,7 +387,7 @@ function guardianize(student, templateName, params) {
   const guardian = student && String(student.payer_name || '').trim();
   if (!guardian || !Array.isArray(params) || !params.length) return params;
   const out = params.slice();
-  out[0] = firstName(guardian);                       // greet the contact / payer
+  out[0] = payerGreeting(guardian);                   // greet the contact / payer (one name or several)
   const kid = firstName(student.full_name);
   const slot = KID_SLOT[templateName];
   if (kid && slot) {
@@ -402,7 +411,7 @@ function emailGreet(student) {
   const self = firstName((student && student.full_name) || '');
   if (rawPayer) {
     const sName = (self && self !== 'there') ? self : '';
-    return { hi: firstName(rawPayer), poss: sName ? (sName + '’s') : 'your', student: sName, hasPayer: true };
+    return { hi: payerGreeting(rawPayer), poss: sName ? (sName + '’s') : 'your', student: sName, hasPayer: true };
   }
   return { hi: self, poss: 'your', student: self, hasPayer: false };
 }
